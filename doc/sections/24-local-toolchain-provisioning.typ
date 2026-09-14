@@ -55,7 +55,7 @@ uv 的文档明确说明 uv 默认*要求*虚拟环境，`uv pip install` 不会
 
 === 能力探测-降级-提示（capability probe 模式）
 
-核心原则：`/home/ebt/.kimi-code/plugins/managed/` 下的已有插件与 SKILL.md 都是*声明式*的，运行时环境千差万别。
+核心原则：`~/.kimi-code/plugins/managed/` 下的已有插件与 SKILL.md 都是*声明式*的，运行时环境千差万别。
 本插件不应在 SKILL.md 里写死「需要 z3」，而应在每次运行开始时产出一份能力快照，再据此选择算法分支。
 
 三个层次的探测，成本递增，只在必要时做：

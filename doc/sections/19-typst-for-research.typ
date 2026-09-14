@@ -1,6 +1,6 @@
 == Typst 用于科研文档的最佳实践
 
-本机实测环境：`typst 0.15.1 (9dfd3a08)`（`/usr/bin/typst`，用 `typst --version` 核实于 2026-09-14）；包查找路径 `/home/ebt/.local/share/typst/packages`、缓存 `~/.cache/typst/packages`，`html`/`bundle`/`a11y-extras` 三个实验特性默认为 off（`typst info` 输出）。官方 0.15.0 发布于 2026-06-15、0.15.1 于 2026-07-17，两个版本条目见 #link("https://typst.app/docs/changelog/0.15.0/")[typst.app changelog]。本机字体 282 项，含 `Noto Sans/Serif CJK SC`、`Source Han Sans/Serif`，中文段落不加任何配置即可编译（实测无 warning），但显式指定字体族可保证排版一致。
+本机实测环境：`typst 0.15.1 (9dfd3a08)`（`/usr/bin/typst`，用 `typst --version` 核实于 2026-09-14）；包查找路径 `~/.local/share/typst/packages`、缓存 `~/.cache/typst/packages`，`html`/`bundle`/`a11y-extras` 三个实验特性默认为 off（`typst info` 输出）。官方 0.15.0 发布于 2026-06-15、0.15.1 于 2026-07-17，两个版本条目见 #link("https://typst.app/docs/changelog/0.15.0/")[typst.app changelog]。本机字体 282 项，含 `Noto Sans/Serif CJK SC`、`Source Han Sans/Serif`，中文段落不加任何配置即可编译（实测无 warning），但显式指定字体族可保证排版一致。
 
 === 项目结构：主文件 + 模板 + 分章
 

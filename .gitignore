@@ -23,5 +23,10 @@ __pycache__/
 # 打包产物
 plugin/dist/
 
+# 本地第三方二进制与 Lean 项目的接线（指向本机路径的软链，对别人是断链）。
+# 用 plugin/scripts/setup-third-party.sh 重建。
+plugin/bin/third-party/
+plugin/lean
+
 # 插件运行时产物
 lab/

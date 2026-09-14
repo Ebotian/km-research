@@ -13,7 +13,7 @@
   [`lake --version`], [`Lake version 5.0.0-src+62eed1d (Lean version 4.33.0-rc1)`],
   [`~/.elan/toolchains`], [`leanprover--lean4---v4.32.2` 与 `leanprover--lean4---v4.33.0-rc1` 两套],
   [`elan show` 的 active toolchain], [`leanprover/lean4:v4.33.1`，resolved from default `stable` —— 该版本并未安装],
-  [`~/.elan/known-projects`], [`/home/ebt/Downloads/emsx/leanproof`],
+  [`~/.elan/known-projects`], [`~/Downloads/emsx/leanproof`],
   [已存在的 mathlib 检出], [`.lake/packages/mathlib`，git rev `79d0395a1825a6264ad5d269e35e60537518955e`，tag `v4.33.0-rc1`，提交日 2026-07-16],
   [mathlib 构建产物], [`.lake/build` 6.5 GB，8,279 个 `.olean`，已可直接 import],
   [mathlib 源码规模], [`Mathlib/` 下 8,268 个 `.lean` 文件，合计 2,280,560 行],
