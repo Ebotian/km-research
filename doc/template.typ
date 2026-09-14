@@ -19,6 +19,7 @@
     number-align: center,
     header: context {
       let hs = query(selector(heading.where(level: 1)).before(here()))
+        .filter(h => h.body != [目录])
       if hs.len() > 0 {
         set text(size: 8pt, fill: luma(130))
         hs.last().body
@@ -88,8 +89,8 @@
     #if date != none [ #text(size: 9.5pt, fill: luma(100), date) ]
   ]
   if abstract != none [
-    v(1.6em)
-    block(
+    #v(1.6em)
+    #block(
       width: 100%,
       inset: 11pt,
       radius: 3pt,
@@ -102,7 +103,7 @@
     ]
   ]
   v(1.6em)
-  outline(title: [目录], indent: auto, depth: 3)
+  outline(title: [目录], indent: auto, depth: 2)
   pagebreak()
   doc
 }
