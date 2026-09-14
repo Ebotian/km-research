@@ -53,9 +53,9 @@ class ToolchainUnpinned(LeanError):
     """目标目录及其祖先均无 lean-toolchain。
 
     这时**绝不能调用** lean/lake：elan 的 default_toolchain = "stable" 会让每次
-    调用都联网解析版本。两轮实测，同一命令在无 lean-toolchain 的目录里分别是
-    5.0 / 3.0 / 5.0 秒与 12.0 / 3.0 / 9.9 秒（后一轮有一次撞上 12 秒上限），
-    定点后是 0.02 秒——**每次都是数秒量级，且哪一次卡住纯看网络**。
+    调用都联网解析版本。三轮实测，同一条 `lake --version` 在无 lean-toolchain 的
+    目录里分别耗 5.0/3.0/5.0、12.0/3.0/9.9、7.4/3.8/1.3 秒——**跨度 1.3 到 12 秒，
+    哪一次卡住纯看网络**（最坏一次撞上 12 秒上限）。定点后是 0.02 秒。
     在离线环境下还会直接卡住。所以这里直接拒绝运行，让调用方报错。
     """
 
@@ -113,7 +113,7 @@ def resolve_project(explicit: str | None = None) -> tuple[str, str]:
         raise ToolchainUnpinned(
             f"{os.path.realpath(cand)} 及其祖先都没有 lean-toolchain。"
             f"拒绝运行：elan 的 default_toolchain = stable 会让每次调用联网解析版本"
-            f"（实测每次数秒且随机，最坏一次 12 秒撞上限），离线时还会卡住。"
+            f"（实测同一命令 1.3–12 秒且随机，最坏一次撞上 12 秒上限），离线时还会卡住。"
             f"在该项目里放一个 lean-toolchain 再试。")
     return os.path.realpath(found[0]), found[1]
 

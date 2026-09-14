@@ -85,10 +85,11 @@ plugin/bin/opl-capabilities --json | grep -A5 lean_project
 
 **必须定点**（项目里要有 `lean-toolchain`），否则 elan 的
 `default_toolchain = "stable"` 会让每次 `lean`/`lake` 调用都联网解析版本。
-本机复测：无 `lean-toolchain` 的目录里 `lake --version` 三次为
-**12002（撞 12 秒上限）/ 3025 / 9935 ms**，定点目录里为 **21 / 20 / 20 ms**——
-差两个数量级，且哪一次卡住纯看网络。`opl-leancheck` 因此**拒绝**在未定点的目录里
-运行（退出码 `2`），而不是替你触发一次工具链下载。
+同一条 `lake --version` 在无 `lean-toolchain` 的目录里实测三轮分别耗
+**5.0/3.0/5.0、12.0/3.0/9.9、7.4/3.8/1.3 秒**（跨度 1.3–12 秒，最坏一次撞上 12 秒
+上限），定点目录里为 **21/20/20 ms**——差两个到三个数量级，且哪一次卡住纯看网络。
+`opl-leancheck` 因此**拒绝**在未定点的目录里运行（退出码 `2`），而不是替你触发一次
+工具链下载。
 `opl-capabilities` 会报 `pinned` / `pinned_fast`（`probe_ms` 超过 1 秒即说明仍在联网）。
 
 本机链的是 `~/Downloads/emsx/leanproof`（`leanprover/lean4:v4.33.0-rc1`，

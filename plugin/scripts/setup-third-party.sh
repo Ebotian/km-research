@@ -101,7 +101,7 @@ fi
 
 # ---------------------------------------------------------------- Lean 项目
 # 插件需要一个*定点 toolchain* 的 Lean 项目：elan 的 default_toolchain = "stable"
-# 会让每次 lean/lake 调用都联网解析版本（实测每次数秒且随机，定点后 0.02 秒）。
+# 会让每次 lean/lake 调用都联网解析版本（实测同一命令 1.3–12 秒且随机，定点后 0.02 秒）。
 # 这里只检查，不替你造——那需要几 GB 的 Mathlib 缓存下载。
 lean_link="$(dirname "$here")/lean"
 if [ -f "$lean_link/lean-toolchain" ]; then
