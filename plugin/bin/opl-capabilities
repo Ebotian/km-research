@@ -34,7 +34,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
-from opl_common import PASS, MISSING, c, die, find_tool, out_json, run, s  # noqa: E402
+from opl_common import PASS, MISSING, c, die, find_tool, out_json, plugin_root, run, s  # noqa: E402
 
 # 可执行文件层。required 层缺任何一个即视为环境不完整；其余层按「存在即启用」降级。
 LAYERS: dict[str, list[tuple[str, str | None]]] = {
@@ -143,6 +143,66 @@ def probe_decompress() -> dict:
     return {"available": True, "path": exe, "functional": "ok", "lines": len(lines)}
 
 
+def probe_lean_project(timeout: float = 30.0) -> dict:
+    """探测 Lean 项目上下文。
+
+    为什么不能只探 `lean --version`：elan 的 `default_toolchain = "stable"` 使每次
+    调用都要联网解析版本。实测在无 `lean-toolchain` 的目录里耗时 5.0 / 3.0 / 5.0 秒
+    （两次撞上 5 秒预算），而在定点 toolchain 的目录里是 0.021 秒——差 250 倍，
+    且哪一次超时纯看网络抖动。所以探测必须在一个*定点*的目录里做，
+    并把「是否定点」本身当成事实报出来。
+    """
+    root = plugin_root()
+    proj = os.environ.get("OPL_LEAN_PROJECT") or os.path.join(root, "lean")
+    info: dict = {
+        "project": proj,
+        "resolved": os.path.realpath(proj) if os.path.exists(proj) else None,
+    }
+    if not os.path.isdir(proj):
+        return info | {"available": False, "error": "no_project",
+                       "hint": "设 OPL_LEAN_PROJECT，或把 Lean 项目链到 <plugin>/lean"}
+
+    tc = os.path.join(proj, "lean-toolchain")
+    if os.path.isfile(tc):
+        try:
+            info["toolchain"] = open(tc, encoding="utf-8").read().strip()
+        except OSError as exc:
+            info["toolchain"] = None
+            info["toolchain_error"] = str(exc)
+        info["pinned"] = bool(info.get("toolchain"))
+    else:
+        info["pinned"] = False
+        info["note"] = ("无 lean-toolchain：elan 每次调用都要联网解析 stable，"
+                        "实测 5.0 / 3.0 / 5.0 秒，定点后 0.021 秒")
+
+    lake = find_tool("lake")
+    if lake is None:
+        return info | {"available": False, "error": "lake_not_found"}
+    t0 = time.monotonic()
+    rc, out, err = run([lake, "--version"], timeout=timeout, cwd=proj)
+    ms = int((time.monotonic() - t0) * 1000)
+    text = (out or err).decode("utf-8", "replace").strip().splitlines()
+    info["lake"] = {
+        "exit": rc,
+        "probe_ms": ms,
+        "version": text[0][:120] if text else "",
+        "error": "probe_timeout" if rc is None else None,
+    }
+    info["available"] = rc == 0
+    # 定点之后 lake 本身应当在毫秒级；超过 1 秒说明仍在联网
+    info["pinned_fast"] = ms < 1000
+
+    ml = os.path.join(proj, ".lake", "packages", "mathlib")
+    if os.path.isdir(ml):
+        # 用代表性产物判断，避免遍历 8000+ 个 .olean
+        marker = os.path.join(ml, ".lake", "build", "lib", "lean", "Mathlib.olean")
+        info["mathlib"] = {"present": True, "built": os.path.isfile(marker),
+                           "marker": marker if os.path.isfile(marker) else None}
+    else:
+        info["mathlib"] = {"present": False}
+    return info
+
+
 def default_interpreters() -> list[str]:
     """默认探测哪几个解释器：显式路径、插件 venv、系统 python3。
 
@@ -229,6 +289,20 @@ def main() -> int:
         tools["decompress"] = info
         c(f"{'decompress':<16} {'proof':<10} {info.get('functional', info.get('error'))}")
 
+    # Lean 层的可用性由*项目上下文*决定，而不是由任意 cwd 下的 `lean --version` 决定：
+    # 只有定点了 toolchain 的目录里才不会联网，见 probe_lean_project 的说明。
+    lean_project = probe_lean_project(args.python_timeout)
+    if "lean" in wanted:
+        if lean_project.get("available"):
+            ms = lean_project.get("lake", {}).get("probe_ms")
+            c(f"{'lean-project':<16} {'lean':<10} ok  {lean_project.get('toolchain','?')}"
+              f"  lake {ms}ms{'' if lean_project.get('pinned_fast') else '  ← 偏慢，疑似仍在联网'}")
+            ml = lean_project.get("mathlib", {})
+            c(f"{'mathlib':<16} {'lean':<10} "
+              f"{'built' if ml.get('built') else ('present_unbuilt' if ml.get('present') else 'absent')}")
+        else:
+            c(f"{'lean-project':<16} {'lean':<10} {lean_project.get('error')}")
+
     interpreters: dict[str, dict] = {}
     py_layers: dict[str, dict] = {}
     if not args.no_python and any(l.startswith("py-") for l in PY_LAYERS):
@@ -264,6 +338,7 @@ def main() -> int:
         "host": {"nproc": os.cpu_count()},
         "probe_ms": int((time.monotonic() - t0) * 1000),
         "tools": tools,
+        "lean_project": lean_project,
         "interpreters": interpreters,
         "py_layers": py_layers,
         "required_missing": required_missing,

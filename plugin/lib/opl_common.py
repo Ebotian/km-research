@@ -75,13 +75,18 @@ def bin_dirs() -> list[str]:
     OPL_BINDIR 显式覆盖 > 插件自身的 bin/ > PATH。
     插件根由 KIMI_PLUGIN_ROOT 注入（调研确认这是平台唯一注入的路径变量）。
     """
+    root = os.environ.get("KIMI_PLUGIN_ROOT") or plugin_root()
     dirs = []
     if os.environ.get("OPL_BINDIR"):
         dirs.append(os.environ["OPL_BINDIR"])
-    if os.environ.get("KIMI_PLUGIN_ROOT"):
-        dirs.append(os.path.join(os.environ["KIMI_PLUGIN_ROOT"], "bin"))
-    dirs.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin"))
+    dirs.append(os.path.join(root, "bin"))
+    dirs.append(os.path.join(root, "bin", "third-party"))
     return dirs
+
+
+def plugin_root() -> str:
+    """插件根目录，由本文件位置反推（`lib/` 的上一级）。"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def find_tool(name: str) -> str | None:
@@ -95,8 +100,10 @@ def find_tool(name: str) -> str | None:
 def probe_version(tool: str, args=("--version",), timeout: float = 5.0) -> dict:
     """探测工具并取其版本。
 
-    超时是硬要求：本机 elan 的 stable 指向未安装版本，裸 `lean --version` 会触发
-    联网下载工具链并挂住。这里把超时当作「不可用」处理，并记录 probe_timeout。
+    超时是硬要求：本机 elan 的 default_toolchain = "stable" 使每次调用都要联网
+    解析版本；无 lean-toolchain 的目录里实测 5.0 / 3.0 / 5.0 秒。这里把超时当作
+    「暂不可用」处理并记录 probe_timeout——注意不要把它缓存成「不存在」，
+    一次网络抖动不该让某一层被永久降级。
     """
     path = find_tool(tool)
     if path is None:
@@ -118,10 +125,17 @@ def probe_version(tool: str, args=("--version",), timeout: float = 5.0) -> dict:
     }
 
 
-def run(cmd: list[str], timeout: float | None = None, stdin: bytes | None = None):
-    """执行子进程，返回 (returncode, stdout, stderr)。超时返回 rc=None。"""
+def run(cmd: list[str], timeout: float | None = None, stdin: bytes | None = None,
+        cwd: str | None = None):
+    """执行子进程，返回 (returncode, stdout, stderr)。超时返回 rc=None。
+
+    `cwd` 是必需能力而非便利：Lean 必须在定点了 `lean-toolchain` 的目录里执行，
+    否则 elan 每次调用都要联网解析 `stable`（实测 5.0 / 3.0 / 5.0 秒，
+    定点后 0.021 秒）。
+    """
     try:
-        p = subprocess.run(cmd, capture_output=True, timeout=timeout, input=stdin)
+        p = subprocess.run(cmd, capture_output=True, timeout=timeout, input=stdin,
+                           cwd=cwd)
     except subprocess.TimeoutExpired:
         return None, b"", b""
     return p.returncode, p.stdout, p.stderr
