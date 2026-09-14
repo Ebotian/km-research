@@ -20,5 +20,8 @@ __pycache__/
 .pyright/
 .ty/
 
+# 打包产物
+plugin/dist/
+
 # 插件运行时产物
 lab/

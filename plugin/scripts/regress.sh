@@ -198,6 +198,38 @@ ok = (d['schema'] == 'opl.evidence/1' and d['verdict'] == 'VERIFIED'
       and len(d['certificate_sha256']) == 64)
 sys.exit(0 if ok else 1)"
 
+# ---------------------------------------------------------------- 清单与技能
+echo "manifest —— 清单必须能被平台正确解析"
+chk "清单是合法 JSON"          0 python3 -c "import json;json.load(open('kimi.plugin.json'))"
+chk "name 匹配平台正则"        0 python3 -c "
+import json, re, sys
+n = json.load(open('kimi.plugin.json'))['name']
+sys.exit(0 if re.fullmatch(r'^[a-z0-9][a-z0-9_-]{0,63}\$', n) else 1)"
+chk "skills 是数组且目录都存在" 0 python3 -c "
+import json, os, sys
+d = json.load(open('kimi.plugin.json'))
+s = d.get('skills')
+ok = (isinstance(s, list) and len(s) > 0
+      and all(os.path.isfile(os.path.join(x.lstrip('./'), 'SKILL.md')) for x in s))
+sys.exit(0 if ok else 1)"
+chk "sessionStart 指向存在的技能" 0 python3 -c "
+import json, os, sys
+d = json.load(open('kimi.plugin.json'))
+sk = d.get('sessionStart', {}).get('skill')
+dirs = [x.strip('./') for x in d.get('skills', [])]
+sys.exit(0 if sk and any(os.path.basename(x) == sk for x in dirs) else 1)"
+chk "未声明 mcpServers（按设计）" 0 python3 -c "
+import json, sys
+sys.exit(0 if 'mcpServers' not in json.load(open('kimi.plugin.json')) else 1)"
+for f in skills/*/SKILL.md; do
+  chk "frontmatter 有 name/description: $(basename $(dirname $f))" 0 python3 -c "
+import re, sys
+t = open('$f').read()
+m = re.match(r'^---\n(.*?)\n---\n', t, re.S)
+fm = m.group(1) if m else ''
+sys.exit(0 if 'name:' in fm and 'description:' in fm else 1)"
+done
+
 # ----------------------------------------------------------------
 printf '\n  通过 %d / 失败 %d\n' "$pass" "$fail"
 [ "$fail" -gt 0 ] && exit 1
