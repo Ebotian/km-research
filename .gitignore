@@ -1,0 +1,16 @@
+# Typst 构建输出
+.typst-check/
+doc/build/
+*.pdf
+
+# Typst 本地包缓存（若要 vendored 依赖包，改用 doc/vendor/ 并解锁该目录）
+doc/vendor/
+
+# 实验运行时产物（插件上线后生成）
+lab/
+
+# 编辑器 / 系统
+.DS_Store
+*.swp
+__pycache__/
+.venv/
