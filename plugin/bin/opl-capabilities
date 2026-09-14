@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""opl-capabilities —— 探测后端能力，产出机器可读的能力快照。
+
+一个职责：把「本机现在有什么」变成可查询的事实，而不是假设。
+不安装任何东西，不修改系统，只做只读探测。
+
+用法：
+    opl-capabilities [--out PATH] [--json] [--layer NAME] [--quiet]
+
+退出码：0 = 必需层齐全；4 = 必需层有缺失。其余见 opl_common。
+stdout：JSON 对象（默认）或单行 `s ...`（--quiet）。
+
+设计要点（都来自本机实测）：
+  * 所有版本探测带硬超时。elan 的 stable 指向未安装版本，裸 `lean --version`
+    会触发联网下载工具链并挂住，必须当「不可用」处理。
+  * `decompress` 除存在性外还要做功能探测：上游 master 在 read_lit 里有一句
+    遗留的 printf，会把每个原始字节混进 stdout，输出不是合法 LRAT。
+    只查 `command -v` 会把它当成可用。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import tempfile
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from opl_common import (PASS, MISSING, c, die, find_tool, out_json, run, s)  # noqa: E402
+
+# 分层：required 层缺任何一个即视为环境不完整；其余层按「存在即启用」降级。
+LAYERS: dict[str, list[tuple[str, str]]] = {
+    "required":    [("python3", "--version"), ("typst", "--version")],
+    "proof":       [("drat-trim", None), ("lrat-check", None)],
+    "lean":        [("lean", "--version"), ("lake", "--version")],
+    "smt":         [("z3", "--version"), ("cvc5", "--version"), ("minisat", None),
+                    ("cryptominisat5", "--version"), ("cadical", "--version"), ("kissat", "--version")],
+    "cas":         [("gp", "--version"), ("fplll", "--version")],
+    "bench":       [("hyperfine", "--version"), ("perf", "--version"),
+                    ("cpupower", "--version"), ("numactl", "--version")],
+    "sandbox":     [("bwrap", "--version"), ("docker", "--version"), ("systemd-run", "--version")],
+    "literature":  [("uv", "--version"), ("git", "--version")],
+}
+
+FIXTURES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "tests", "fixtures")
+
+# 合法 LRAT 行：`<id> d <ids>* 0` 或 `<id> <lits>* 0 <hints>* 0`
+LRAT_LINE = re.compile(r"^\d+ (d( -?\d+)*|( -?\d+)*( 0)?( -?\d+)*) 0$")
+
+
+def probe_decompress() -> dict:
+    """功能探测：decompress 能否产出合法 LRAT。
+
+    仅存在性检查不够——这是本机唯一一个「存在但坏了」的后端。
+    """
+    exe = find_tool("decompress")
+    clrat = os.path.join(FIXTURES, "tiny.clrat")
+    if exe is None:
+        return {"available": False, "error": "not_found"}
+    if not os.path.isfile(clrat):
+        return {"available": True, "path": exe, "functional": "untested",
+                "error": "fixture_missing"}
+    rc, out, _ = run([exe, "-m", clrat], timeout=10.0)
+    if rc is None:
+        return {"available": True, "path": exe, "error": "probe_timeout"}
+    text = out.decode("utf-8", "replace")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    malformed = [ln for ln in lines if not LRAT_LINE.match(ln.strip())]
+    if malformed:
+        return {"available": False, "path": exe, "error": "output_malformed",
+                "detail": (f"{len(malformed)}/{len(lines)} 行不是合法 LRAT；"
+                           f"首个：{malformed[0][:60]!r}。已知上游 bug："
+                           f"decompress.c 的 read_lit 内有一句遗留 printf，"
+                           f"把原始字节混入 stdout"),
+                "functional": "broken"}
+    return {"available": True, "path": exe, "functional": "ok", "lines": len(lines)}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--out", help="把 JSON 写入该路径（默认写 stdout）")
+    ap.add_argument("--json", action="store_true", help="总是输出 JSON 到 stdout")
+    ap.add_argument("--layer", action="append", help="只探测指定层，可重复")
+    ap.add_argument("--timeout", type=float, default=5.0, help="单次版本探测超时秒数")
+    ap.add_argument("--quiet", action="store_true", help="stdout 只输出一行判决")
+    args = ap.parse_args()
+
+    wanted = args.layer or list(LAYERS)
+    unknown = [l for l in wanted if l not in LAYERS]
+    if unknown:
+        die(2, f"未知层：{', '.join(unknown)}；可用层：{', '.join(LAYERS)}")
+
+    t0 = time.monotonic()
+    tools: dict[str, dict] = {}
+    for layer in wanted:
+        for name, varg in LAYERS[layer]:
+            if name in tools:
+                continue
+            info = probe_version_like(name, varg, args.timeout)
+            info["layer"] = layer
+            tools[name] = info
+            state = "ok" if info["available"] else info.get("error", "missing")
+            c(f"{name:<16} {layer:<10} {state}"
+              + (f"  {info.get('version','')[:48]}" if info.get("available") else ""))
+
+    # decompress 需要功能探测而非存在性探测
+    if "proof" in wanted:
+        info = probe_decompress()
+        info["layer"] = "proof"
+        tools["decompress"] = info
+        c(f"{'decompress':<16} {'proof':<10} {info.get('functional', info.get('error'))}")
+
+    required_missing = [n for n, i in tools.items()
+                        if i["layer"] == "required" and not i.get("available")]
+    broken = [n for n, i in tools.items() if i.get("functional") == "broken"]
+
+    snapshot = {
+        "schema": "opl.capabilities/1",
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "host": {"nproc": os.cpu_count()},
+        "probe_ms": int((time.monotonic() - t0) * 1000),
+        "tools": tools,
+        "required_missing": required_missing,
+        "broken": broken,
+        "layers": {l: [n for n, i in tools.items() if i["layer"] == l] for l in wanted},
+    }
+
+    if args.out:
+        out_json(snapshot, args.out)
+    if args.quiet:
+        if required_missing:
+            s("MISSING", ",".join(required_missing))
+            return MISSING
+        s("PASS")
+        return PASS
+    if args.out and not args.json:
+        c("提示：用 --json 可同时把快照打到 stdout")
+    else:
+        out_json(snapshot)
+    if required_missing:
+        c(f"必需层缺失：{', '.join(required_missing)}")
+        return MISSING
+    if broken:
+        c(f"存在但功能异常：{', '.join(broken)}")
+    return PASS
+
+
+def probe_version_like(name: str, varg: str | None, timeout: float) -> dict:
+    """先试 --version，失败则试无参调用并取首行。一律带超时。"""
+    path = find_tool(name)
+    if path is None:
+        return {"available": False, "error": "not_found"}
+    for argv in ([[varg]] if varg else []) + [[]]:
+        t0 = time.monotonic()
+        rc, out, err = run([path, *argv], timeout=timeout)
+        if rc is None:
+            return {"available": False, "path": path, "error": "probe_timeout",
+                    "probe_ms": int((time.monotonic() - t0) * 1000)}
+        text = (out or err).decode("utf-8", "replace").strip()
+        if text:
+            return {"available": True, "path": path,
+                    "version": text.splitlines()[0].strip()[:120],
+                    "probe_ms": int((time.monotonic() - t0) * 1000)}
+    return {"available": True, "path": path, "version": "", "note": "no_version_output"}
+
+
+if __name__ == "__main__":
+    sys.exit(main())

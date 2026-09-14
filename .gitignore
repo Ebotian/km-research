@@ -14,3 +14,6 @@ lab/
 *.swp
 __pycache__/
 .venv/
+
+# 插件运行时产物
+lab/

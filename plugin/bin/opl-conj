@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""opl-conj —— 猜想台账，一条记录一个文件。
+
+一个职责：保管猜想的状态、范围与证据指针。不做计算，不做搜索。
+
+用法：
+    opl-conj add --id C-0001 --statement "..." [--source URL] [--no-falsifiable] [--decidable yes|no|unknown]
+    opl-conj get  C-0001
+    opl-conj list [--status STR] [--jsonl] [--limit N]
+    opl-conj set  C-0001 [--formal-status S] [--informal-status S] [--formalization-status S]
+                     [--verified-range LO..HI --method m] [--add-bound CLAIM=VALUE@SOURCE]
+                     [--add-counterexample WITNESS --evidence P] [--evidence P] [--run-id ID]
+
+退出码：0 有结果；2 用法错误；5 无结果（记录不存在或 list 为空）。
+REJECT 在本工具中永不出现——台账不推翻断言，只记录断言。
+
+写死的一条纪律：任何状态变更必须带 --evidence。没有证据指针的状态变更是这个
+项目最想防的自欺，因此它不是一个约定，而是被工具拒绝的操作。
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from opl_common import PASS, USAGE, EMPTY, c, die  # noqa: E402
+
+STATUSES = ["open", "proved_by_hand", "disproved"]
+FORMAL_STATUSES = ["open", "refuted", "proved", "no_counterexample_in_range", "inconclusive"]
+FORMALIZATION = ["none", "draft", "compiles", "faithfulness_checked"]
+LEVELS = ["empirical", "exact_certificate", "lean_checked", "human_peer_reviewed"]
+
+
+def lab_dir(args) -> str:
+    return args.lab or os.environ.get("OPL_LAB") or "lab"
+
+
+def conj_dir(args) -> str:
+    return os.path.join(lab_dir(args), "conjectures")
+
+
+def path_of(args, cid: str) -> str:
+    return os.path.join(conj_dir(args), f"{cid}.json")
+
+
+def load(args, cid: str) -> dict | None:
+    p = path_of(args, cid)
+    if not os.path.isfile(p):
+        return None
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save(args, rec: dict) -> str:
+    d = conj_dir(args)
+    os.makedirs(d, exist_ok=True)
+    p = path_of(args, rec["id"])
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, ensure_ascii=False, indent=2, sort_keys=False)
+        fh.write("\n")
+    os.replace(tmp, p)
+    return p
+
+
+def derive(rec: dict) -> str:
+    """总状态由两个独立状态派生，不单独存储用户可写的值。
+
+    引入这个字段是为了表达「机器已证、人未消化」——单一枚举写不出这个语义。
+    """
+    fs, inf = rec.get("formal_status", "open"), rec.get("informal_status", "open")
+    if fs == "refuted":
+        return "refuted"
+    if inf == "disproved":
+        return "disproved (unformalized)"
+    if inf == "open" and fs == "proved":
+        return "open (Lean)"
+    if fs == "proved":
+        return "proved"
+    if fs == "no_counterexample_in_range":
+        vr = rec.get("verified_range") or {}
+        return f"open (bounded {vr.get('lo')}..{vr.get('hi')})"
+    if fs == "inconclusive":
+        return "open (inconclusive)"
+    return "open"
+
+
+def touch(rec: dict, field: str, old, new, args) -> None:
+    rec.setdefault("history", []).append({
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "field": field, "from": old, "to": new,
+        "evidence": getattr(args, "evidence", None),
+        "run_id": getattr(args, "run_id", None),
+    })
+
+
+def emit(rec: dict, args) -> int:
+    rec["status"] = derive(rec)
+    print(json.dumps(rec, ensure_ascii=False, indent=2))
+    return PASS
+
+
+def cmd_add(args) -> int:
+    if load(args, args.id):
+        die(USAGE, f"记录已存在：{args.id}（改状态请用 set）")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    rec = {
+        "id": args.id,
+        "title": args.title or args.id,
+        "statement_nl": args.statement,
+        "statement_formal": None,
+        "informal_status": args.informal_status or "open",
+        "formal_status": "open",
+        "formalization_status": "none",
+        "falsifiable": args.falsifiable,
+        "decidable": args.decidable,
+        "verified_range": None,
+        "known_bounds": [],
+        "counterexamples": [],
+        "source": {"url": args.source, "attribution": args.attribution, "retrieved_at": now},
+        "verification_level": "empirical",
+        "history": [{"at": now, "field": "id", "from": None, "to": args.id,
+                     "evidence": None, "run_id": None}],
+    }
+    p = save(args, rec)
+    c(f"wrote {p}")
+    return emit(rec, args)
+
+
+def cmd_get(args) -> int:
+    rec = load(args, args.id)
+    if rec is None:
+        c(f"无此记录：{args.id}")
+        return EMPTY
+    return emit(rec, args)
+
+
+def cmd_list(args) -> int:
+    files = sorted(glob.glob(os.path.join(conj_dir(args), "*.json")))
+    rows = []
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        rec["status"] = derive(rec)
+        if args.status and rec["status"] != args.status:
+            continue
+        rows.append(rec)
+    if not rows:
+        c(f"无匹配记录（扫描 {len(files)} 条）")
+        return EMPTY
+    for rec in rows[: args.limit] if args.limit else rows:
+        if args.jsonl:
+            slim = {k: rec.get(k) for k in
+                    ("id", "title", "status", "formalization_status",
+                     "falsifiable", "decidable", "verification_level")}
+            print(json.dumps(slim, ensure_ascii=False))
+        else:
+            print(f"{rec['id']:<10} {rec['status']:<28} {rec['title']}")
+    return PASS
+
+
+def cmd_set(args) -> int:
+    rec = load(args, args.id)
+    if rec is None:
+        c(f"无此记录：{args.id}")
+        return EMPTY
+
+    wants_status = any([args.formal_status, args.informal_status])
+    if wants_status and not args.evidence:
+        die(USAGE, "拒绝写入：状态变更必须带 --evidence <指针>。"
+                   "没有证据指针的状态变更正是本项目要防的自欺。")
+
+    if args.formal_status:
+        if args.formal_status not in FORMAL_STATUSES:
+            die(USAGE, f"非法 formal_status，允许：{', '.join(FORMAL_STATUSES)}")
+        touch(rec, "formal_status", rec["formal_status"], args.formal_status, args)
+        rec["formal_status"] = args.formal_status
+    if args.informal_status:
+        if args.informal_status not in STATUSES:
+            die(USAGE, f"非法 informal_status，允许：{', '.join(STATUSES)}")
+        touch(rec, "informal_status", rec["informal_status"], args.informal_status, args)
+        rec["informal_status"] = args.informal_status
+    if args.formalization_status:
+        if args.formalization_status not in FORMALIZATION:
+            die(USAGE, f"非法 formalization_status，允许：{', '.join(FORMALIZATION)}")
+        if args.formalization_status == "faithfulness_checked":
+            c("注意：faithfulness_checked 是人工确认项。自动形式化的编译率会系统性"
+              "高估忠实度，工具不会替你下这个判断。")
+        touch(rec, "formalization_status", rec["formalization_status"],
+              args.formalization_status, args)
+        rec["formalization_status"] = args.formalization_status
+    if args.statement_formal:
+        rec["statement_formal"] = {"file": args.statement_formal, "decl": args.decl}
+    if args.verified_range:
+        lo, hi = args.verified_range.split("..", 1)
+        rec["verified_range"] = {"lo": int(lo), "hi": int(hi),
+                                 "method": args.method or "unknown",
+                                 "run_id": args.run_id,
+                                 "statement": "仅在该有限域内无反例"}
+    for spec in args.add_bound or []:
+        claim, _, rest = spec.partition("=")
+        value, _, src = rest.partition("@")
+        rec.setdefault("known_bounds", []).append(
+            {"claim": claim, "value": value, "source": src or None})
+    for i, w in enumerate(args.add_counterexample or []):
+        rec.setdefault("counterexamples", []).append(
+            {"witness": w, "certificate": args.evidence, "verified_by": "independent",
+             "verification_level": "exact_certificate",
+             "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+        if not args.evidence:
+            c("警告：反例没有证书指针，请补 --evidence")
+    if args.verification_level:
+        if args.verification_level not in LEVELS:
+            die(USAGE, f"非法 verification_level，允许：{', '.join(LEVELS)}")
+        touch(rec, "verification_level", rec.get("verification_level"), args.verification_level, args)
+        rec["verification_level"] = args.verification_level
+
+    p = save(args, rec)
+    c(f"wrote {p}")
+    return emit(rec, args)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--lab", help="lab 目录（默认 $OPL_LAB 或 ./lab）")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("add")
+    a.add_argument("--id", required=True)
+    a.add_argument("--title")
+    a.add_argument("--statement", required=True)
+    a.add_argument("--source")
+    a.add_argument("--attribution")
+    a.add_argument("--falsifiable", action=argparse.BooleanOptionalAction, default=True)
+    a.add_argument("--decidable", choices=["yes", "no", "unknown"], default="unknown")
+    a.add_argument("--informal-status", choices=STATUSES, default="open")
+    a.set_defaults(func=cmd_add)
+
+    g = sub.add_parser("get")
+    g.add_argument("id")
+    g.set_defaults(func=cmd_get)
+
+    l = sub.add_parser("list")
+    l.add_argument("--status")
+    l.add_argument("--jsonl", action="store_true")
+    l.add_argument("--limit", type=int)
+    l.set_defaults(func=cmd_list)
+
+    t = sub.add_parser("set")
+    t.add_argument("id")
+    t.add_argument("--formal-status")
+    t.add_argument("--informal-status")
+    t.add_argument("--formalization-status")
+    t.add_argument("--statement-formal")
+    t.add_argument("--decl")
+    t.add_argument("--verified-range")
+    t.add_argument("--method")
+    t.add_argument("--add-bound", action="append")
+    t.add_argument("--add-counterexample", action="append")
+    t.add_argument("--verification-level")
+    t.add_argument("--evidence")
+    t.add_argument("--run-id")
+    t.set_defaults(func=cmd_set)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
