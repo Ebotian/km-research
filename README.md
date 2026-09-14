@@ -2,7 +2,8 @@
 
 为 [Kimi Code](https://moonshotai.github.io/kimi-code/) 制作的开放问题研究插件，代号 **open-problem-lab**。
 
-它的目标很窄：**把「求解器说 UNSAT」变成可被第三方复核的结论**。
+它的目标很窄：**让结论两侧都经得起独立复核**——反例侧把「求解器说 UNSAT」
+变成可被第三方证书复核的结论，证明侧把「命题已证」变成可被独立内核复核的结论。
 为此它不追求功能多，而追求结论可信——判决走退出码，证据落盘，
 缺验证器时硬失败。
 
@@ -42,7 +43,7 @@
 
 `stdout` 只出机器可解析内容（一行 `s <判决>` 或一个 JSON 对象），诊断走 `stderr`。
 
-## 已实现的五个命令与两个技能
+## 已实现的六个命令与四个技能
 
 | 命令 | 一个职责 |
 |---|---|
@@ -51,6 +52,7 @@
 | `opl-encode` | 规格 → CNF / CP-SAT；双后端一致性检查；见证直接求值 |
 | `opl-search` | 跑搜索，产出见证或 DRAT 证明 |
 | `opl-certcheck` | 用独立校验器复核证书 |
+| `opl-leancheck` | 编译 Lean 文件并审计证明状态（公理白名单 + `sorry` 检测） |
 
 （都在 `plugin/bin/` 下；下面出现时按完整路径写。）
 
@@ -63,12 +65,35 @@
 | LPR | [cake_lpr](https://github.com/tanyongkiam/cake_lpr) | 经 [CakeML](https://cakeml.org/) 形式化验证过编译 |
 | Alethe | [carcara](https://github.com/ufmg-smite/carcara)（可选） | Apache-2.0 |
 
-技能：`opl-entry`（总纲与路由）、`opl-refute`（反例搜索五步流程）。
+技能：`opl-entry`（总纲与路由）、`opl-refute`（反例搜索五步流程）、
+`opl-formalize`（命题 → Lean 陈述）、`opl-prove`（Lean 证明的审计与定案）。
 
-`opl-encode` 与 `opl-search` 的逻辑已下沉到 `lib/*.py`（可类型检查、可单测），
-`bin/` 下只做 argv 解析与退出码翻译。另外三个命令（`opl-capabilities`、`opl-conj`、
-`opl-certcheck`）写得更早，逻辑仍在 `bin/` 里——因此**暂时不在类型检查范围内**。
-这是一处已知债务，见文末「已知边界」。
+**六个命令的逻辑全部在 `lib/*.py` 内**（可类型检查、可单测），`bin/` 下只做 argv
+解析与退出码翻译。这是必需的而不是偏好：`bin/` 里的命令没有 `.py` 扩展名，
+是三个类型检查器的共同盲区（`mypy` 报 `Cannot find implementation`、
+`ty` 报 `unresolved-import`），逻辑只要留在那儿就等于没有类型检查。
+
+## 准备 Lean（证明侧）
+
+反例侧只需要上面「准备第三方证明工具」那一步，证明侧还需要一个**定点 toolchain**
+的 Lean 项目：
+
+```bash
+ln -s /path/to/your/lean/project plugin/lean   # 或设 OPL_LEAN_PROJECT
+plugin/bin/opl-capabilities --json | grep -A5 lean_project
+```
+
+**必须定点**（项目里要有 `lean-toolchain`），否则 elan 的
+`default_toolchain = "stable"` 会让每次 `lean`/`lake` 调用都联网解析版本。
+本机复测：无 `lean-toolchain` 的目录里 `lake --version` 三次为
+**12002（撞 12 秒上限）/ 3025 / 9935 ms**，定点目录里为 **21 / 20 / 20 ms**——
+差两个数量级，且哪一次卡住纯看网络。`opl-leancheck` 因此**拒绝**在未定点的目录里
+运行（退出码 `2`），而不是替你触发一次工具链下载。
+`opl-capabilities` 会报 `pinned` / `pinned_fast`（`probe_ms` 超过 1 秒即说明仍在联网）。
+
+本机链的是 `~/Downloads/emsx/leanproof`（`leanprover/lean4:v4.33.0-rc1`，
+Mathlib 已构建 8,279 个 `.olean`）。**那个仓库不含 Lean 项目**——它是指向本机路径
+的软链，对别人是断链，所以已 gitignore，需要你自己接一个。
 
 ## 准备第三方证明工具
 
@@ -132,15 +157,47 @@ plugin/bin/opl-certcheck --formula lab/runs/C-0002/formula.cnf \
 # 退出码 0 且 stdout 为 `s VERIFIED` 才算「该域内无反例」
 ```
 
+### 证明侧：真命题 → `lean_checked`
+
+```bash
+# 1 形式化：写一个 .lean 文件（opl-formalize 技能负责这一步的纪律）
+#   一份真命题的样例见 plugin/tests/fixtures/lean-real.lean
+#   「前 n 个奇数之和等于 n²」，带真正的归纳证明
+
+# 2 登记
+plugin/bin/opl-conj add --id C-0003 --title "前 n 个奇数之和等于 n²" \
+  --statement "1+3+5+…+(2n-1) = n²" --source plugin/tests/fixtures/lean-real.lean
+
+# 3 证明检查 + 独立内核复核：退出码 0 且 stdout 为 `s PROVED`
+#   审计不问「编译过了吗」，而是向内核要公理集合（#print axioms）
+plugin/bin/opl-leancheck --file plugin/tests/fixtures/lean-real.lean \
+  --decl oddSum_eq_sq --evidence-out lab/evidence/C-0003.json
+
+# 4 台账定案
+plugin/bin/opl-conj set C-0003 --formal-status proved \
+  --evidence lab/evidence/C-0003.json --verification-level lean_checked
+```
+
+第 3 步里「证明检查」与「独立内核复核」是同一条命令的两件事：编译告诉你能不能被
+内核接受，而**判决取的是内核报出的公理集合**。
+
+为什么第 2 步不能只看「编译通过」：**`sorry` 与 `native_decide` 都退出 `0`**。
+前者是没证完，后者向逻辑新增一条断言公理（`#print axioms` 会报出
+`<定理名>._native.native_decide.ax_N_M`）。所以判定一律以公理集合是否落在
+`{propext, Classical.choice, Quot.sound}` 内为准——这与 `cake_lpr`、`carcara`
+是同一类陷阱：**工具的退出码不携带我们要的那个区别**。
+
 ## 打包与安装
 
 ```bash
-plugin/scripts/build-zip.sh      # -> plugin/dist/open-problem-lab-<版本>.zip（约 250 KB）
-plugin/scripts/verify-zip.sh     # 解压到干净目录并跑通上面那条链
+plugin/scripts/build-zip.sh      # -> plugin/dist/open-problem-lab-<版本>.zip（约 285 KB）
+plugin/scripts/verify-zip.sh     # 解压到干净目录并跑通两条链（反例侧 + 证明侧）
 ```
 
 包里不含 `carcara`（30 MB）与 `decompress`（上游有 bug）——缺它们时命令会如实报
-`MISSING(4)` 并降级，那正是能力探测的设计行为。
+`MISSING(4)` 并降级，那正是能力探测的设计行为。**包里也不含 Lean 项目**（那是指向
+本机路径的软链，且 Mathlib 有数 GB），所以包内的证明侧链路依赖你自己接一个定点项目；
+缺它时 `opl-leancheck` 报 `2` 或 `4`，并计入 `skip` 而不是 `pass`。
 
 包内含第三方二进制，因此附有 [`plugin/THIRD-PARTY-NOTICES.md`](plugin/THIRD-PARTY-NOTICES.md)：
 drat-trim 的 MIT 与 cake_lpr 的 CakeML 许可都要求随二进制分发时附上条款声明，
@@ -157,13 +214,14 @@ Python 有 `z3`/`sympy`，另一个 venv 有 `cvc5`/`ortools`，两边都缺对�
 plugin/                 插件本体
   kimi.plugin.json      清单（skills 显式列出）
   THIRD-PARTY-NOTICES.md  随包分发的第三方许可声明
-  bin/                  五个命令（含 third-party/，由脚本安装，不入库）
-  lib/                  全部逻辑，可类型检查、可单测
-  skills/               opl-entry · opl-refute
+  bin/                  六个命令（含 third-party/，由脚本安装，不入库）
+  lib/                  全部逻辑（2,228 行），可类型检查、可单测
+  skills/               opl-entry · opl-refute · opl-formalize · opl-prove
   scripts/              typecheck · regress · build-zip · verify-zip
                         setup-third-party · update-third-party-notices · install-hooks
   hooks/pre-commit      提交前：类型检查 + 退出码回归
-  tests/fixtures/       运行时与回归共用的夹具（84 KB）
+  tests/fixtures/       运行时与回归共用的夹具（108 KB）
+  lean                  指向本机 Lean 项目的软链（不入库）
 doc/
   plan/                 设计方案 8 章（790 行）
   sections/             调研附录 24 篇（4565 行）
@@ -175,16 +233,23 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 47 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 69 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
-plugin/scripts/verify-zip.sh     # 17 项：解压到干净目录并跑通整条链
+plugin/scripts/verify-zip.sh     # 32 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
-回归里有三处**故障注入**——故意编坏 CNF 侧、故意让反解码返回错值、故意把
-「无证据改状态」的退出码改掉，断言它们都被检出。负向对照一律用*内容篡改*，
-从不用截断证明：实测截断后 `drat-trim` 仍报 `VERIFIED`（正向传播自己就导出了
-冲突），拿它做验收会得到一个永远通过的假验收。
+回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
+`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `55 通过 / 0 失败 / 14 跳过`），
+`verify-zip.sh` 在同样情形下报 `27 通过 / 0 失败 / 5 跳过`。
+跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
+
+回归里有两处**故障注入**——在*临时副本*上故意编坏 CNF 侧、故意让反解码返回错值，
+断言它们都被检出（真实代码树全程不被碰）。更早还有第三处「故意把『无证据改状态』
+的退出码改掉」，后来被一条直接断言的用例取代了——注入版与直接版覆盖同一档，
+留两个只会让脚本更长。
+负向对照一律用*内容篡改*，从不用截断证明：实测截断后 `drat-trim` 仍报 `VERIFIED`
+（正向传播自己就导出了冲突），拿它做验收会得到一个永远通过的假验收。
 
 类型检查跑三个而不是挑一个，因为实测它们在未注解函数上结论不同：`run()` 还没
 写返回注解时，把三元组按四元组解包，[pyright](https://github.com/microsoft/pyright)
@@ -203,13 +268,26 @@ plugin/scripts/install-hooks.sh  # 挂成提交前钩子
   Glucose42 无效（设成 0 仍照常解完）。超时只能用 `--timeout`（墙钟 + 子进程）。
 - **类型检查有盲区**：`bin/` 下的命令没有 `.py` 扩展名（Unix 可执行文件本该如此），
   于是 `mypy` 报 `Cannot find implementation`、`ty` 报 `unresolved-import`。
-  目前只有 `lib/` 被检查。修法不是改名，而是把剩下三个命令的逻辑也下沉到 `lib/`。
+  修法不是改名，而是把逻辑下沉到 `lib/`——**六个命令现已全部下沉**（`bin/` 合计
+  889 行，只剩 argv 与退出码翻译；逻辑 2,228 行全在 `lib/` 内）。但盲区本身没有消失：
+  往 `bin/` 里新写一段逻辑，它照样不会被任何检查器看到，只能靠自律。
+- **Lean 侧依赖外部项目**：`plugin/lean` 是本机软链，仓库不含那个项目。
+  压缩包因此开箱跑不了证明侧链路（会如实报 `2`/`4` 并降级）。这是刻意的——
+  那是一个 7 GB 的已归档项目，不该进包。
+- **「独立内核复核」目前是公理审计，不是第二内核**：Lean 自带的 `leanchecker`
+  （只跑内核、不跑策略层）没有接进来，因为它要求 `.olean` 落在项目 root 之内，
+  而 `plugin/lean` 按边界约定只读使用，写临时产物进去越界。
+  现用的是 `#print axioms` + 文件级 `hasSorry` 两条互补信道——它们能抓出
+  `sorry`/`native_decide`，但终究是同一个内核给出的答案。
 
 ## 状态
 
-`opl-encode` / `opl-search` 与其下游的证书链已实现并纳入回归；设计方案里的
-Lean 形式化验证、进化式程序搜索、基准统计与报告生成尚未实现（设计见
-`doc/plan/03-toolchain.typ` 的命令清单）。
+已实现并纳入回归：`opl-encode` / `opl-search` 与其下游的证书链（反例侧），
+以及 `opl-leancheck` 与其两个技能（证明侧）。两侧的端到端都固化在
+`plugin/scripts/regress.sh` 与 `verify-zip.sh` 里，不是一次性手跑。
+
+设计方案里尚未实现：进化式程序搜索（M4）、基准与统计（M5）与报告生成，
+命令清单见 `doc/plan/03-toolchain.typ`，里程碑见 `doc/plan/07-roadmap.typ`。
 
 ## 许可
 
