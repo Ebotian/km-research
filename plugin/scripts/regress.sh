@@ -209,6 +209,19 @@ ok = (d['schema'] == 'opl.evidence/1' and d['verdict'] == 'VERIFIED'
       and d['verification_level'] == 'exact_certificate'
       and len(d['certificate_sha256']) == 64)
 sys.exit(0 if ok else 1)"
+# 字段冻结：证据记录是审计的凭据，字段名与集合必须稳定。下沉重构（bin -> lib）
+# 曾让这里面临「字段悄悄改名/丢失」的风险，而只看单个字段的检查抓不到。
+# 冻结整个顶层键集，任何漂移都会红。
+chk "证据记录字段冻结"            0 python3 -c "
+import json, sys
+FROZEN = {'schema', 'backend', 'format', 'formula', 'formula_sha256',
+          'certificate', 'certificate_sha256', 'certificate_bytes',
+          'parse_complete', 'parsed_bytes', 'duration_ms', 'checked_at',
+          'checker_messages', 'verdict', 'verification_level'}
+got = set(json.load(open('$work/e2e/lab/evidence/E-2.json')))
+if got != FROZEN:
+    print('新增:', sorted(got - FROZEN), '丢失:', sorted(FROZEN - got), file=sys.stderr)
+sys.exit(0 if got == FROZEN else 1)"
 
 # ---------------------------------------------------------------- 清单与技能
 echo "manifest —— 清单必须能被平台正确解析"
