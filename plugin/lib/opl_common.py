@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+from typing import Never
 
 PASS, REJECT, USAGE, UNKNOWN, MISSING, EMPTY = 0, 1, 2, 3, 4, 5
 
@@ -47,7 +48,7 @@ def s(verdict: str, reason: str | None = None) -> None:
     print(f"s {verdict}" if reason is None else f"s {verdict} {reason}")
 
 
-def die(code: int, msg: str, **extra) -> "NoReturn":  # noqa: F821
+def die(code: int, msg: str, **extra) -> Never:
     """以指定退出码结束。extra 以 JSON 写到 stdout，便于管道下游消费失败原因。"""
     if msg:
         c(msg)
@@ -126,7 +127,7 @@ def probe_version(tool: str, args=("--version",), timeout: float = 5.0) -> dict:
 
 
 def run(cmd: list[str], timeout: float | None = None, stdin: bytes | None = None,
-        cwd: str | None = None):
+        cwd: str | None = None) -> tuple[int | None, bytes, bytes]:
     """执行子进程，返回 (returncode, stdout, stderr)。超时返回 rc=None。
 
     `cwd` 是必需能力而非便利：Lean 必须在定点了 `lean-toolchain` 的目录里执行，

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# pre-commit 钩子：提交前跑类型检查 + 退出码契约回归。
+#
+# 两样都跑，是因为它们抓的不是同一类错：
+#   typecheck  抓 arity、None、Literal 穷尽性这类静态契约
+#   regress    抓选项顺序、\r 破坏正则、过滤逻辑这类只有实跑才暴露的错
+# 实测本次会话的 5 个 bug，类型只可能抓到 1 个，其余靠回归矩阵。
+# 合计约 1.3 秒 —— 快到没有理由不做。
+#
+# 本文件由 git config core.hooksPath 指向（见 scripts/install-hooks.sh）。
+# 绕过：git commit --no-verify（仅在你确知后果时）。
+set -uo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+plugin=$(dirname "$here")
+
+echo "── pre-commit ──────────────────────────────────────────" >&2
+
+"$plugin/scripts/typecheck.sh" || {
+  echo "" >&2
+  echo "类型检查未通过，提交被拒。" >&2
+  echo "修好上面的错误再提交；确要绕过用 git commit --no-verify。" >&2
+  exit 1
+}
+
+echo "" >&2
+"$plugin/scripts/regress.sh" || {
+  echo "" >&2
+  echo "退出码契约回归未通过，提交被拒。" >&2
+  echo "判据在 scripts/regress.sh 的期望值里；先看 FAIL 那一行再改代码。" >&2
+  exit 1
+}
+
+echo "── 通过，放行提交 ──────────────────────────────────────" >&2
+exit 0

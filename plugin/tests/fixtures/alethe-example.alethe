@@ -1,0 +1,5 @@
+(
+(assume a0 a)
+(assume a1 (! (not a) :named @p_1))
+(step t0 (cl) :rule resolution :premises (a0 a1))
+)
