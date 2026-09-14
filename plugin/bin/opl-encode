@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""opl-encode —— 把有限域约束规格编码成模型。薄壳：逻辑在 lib/opl_encode.py。
+
+一个职责：规格 → 模型。它不解规格语义（那是 lib/opl_spec），也不跑搜索
+（那是 opl-search）。
+
+用法：
+    opl-encode --spec S.json --to cnf   [--out F.cnf]     # 不需求解器
+    opl-encode --spec S.json --to cpsat [--out F.json]    # 需要 ortools
+    opl-encode --spec S.json --check-consistency          # 需要 pysat + ortools
+    opl-encode --spec S.json --eval-witness W.json        # 不需求解器
+
+退出码：0 成功 / 1 结论矛盾或见证不成立 / 2 规格或参数错、编码代价超限 /
+        3 后端 unknown / 4 缺求解器库。详见 lib/opl_common.py 的契约说明。
+
+`--to cnf` 与 `--eval-witness` 不碰求解器，因此在缺 pysat/ortools 的解释器下
+也能跑——需要求解器的路径才触发解释器解析与重执行。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+
+from opl_common import (PASS, REJECT, UNKNOWN, MISSING, USAGE,  # noqa: E402
+                        MissingBackend, c, ensure_modules, out_json, s)
+from opl_spec import Spec, SpecError, load_witness  # noqa: E402
+import opl_encode  # noqa: E402
+from opl_encode import EncodeError, SolverMissing  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--spec", required=True, help="规格 JSON 路径")
+    ap.add_argument("--to", choices=["cnf", "cpsat"], help="编码目标")
+    ap.add_argument("--out", help="写出模型到该路径（默认写 stdout）")
+    ap.add_argument("--check-consistency", action="store_true",
+                    help="两种独立编码各求解一次并交叉验证见证")
+    ap.add_argument("--eval-witness", help="用规格直接求值一份见证（与编码器无关）")
+    ap.add_argument("--sat-backend", default="glucose42",
+                    help="PySAT 求解器名（默认 glucose42：它能出可复核的 DRAT）")
+    ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    modes = [bool(args.to), args.check_consistency, bool(args.eval_witness)]
+    if sum(modes) != 1:
+        c("需要且只需要 --to / --check-consistency / --eval-witness 之一")
+        return USAGE
+
+    try:
+        spec = Spec.load(args.spec)
+    except SpecError as exc:
+        c(str(exc))
+        return USAGE
+    c(f"规格 {spec.name}：{len(spec.variables)} 变量 {len(spec.constraints)} 约束，"
+      f"搜索空间 {spec.search_space}")
+
+    if args.eval_witness:
+        return do_eval_witness(spec, args)
+    if args.check_consistency:
+        return do_consistency(spec, args)
+    return do_encode(spec, args)
+
+
+# ---------------------------------------------------------------- 纯编码（无求解器）
+
+
+def do_encode(spec: Spec, args) -> int:
+    try:
+        if args.to == "cnf":
+            cnf = opl_encode.to_cnf(spec)
+            text = cnf.to_dimacs()
+            meta = {"target": "cnf", "nvars": cnf.nvars, "nclauses": len(cnf.clauses),
+                    "tuples_visited": cnf.tuples_visited}
+        else:
+            # CP-SAT 模型的「编码」就是它自身；这里只做可构建性检查并回报规模。
+            model, cpvars = opl_encode.build_cpsat(spec)
+            text = json.dumps(spec.to_dict(), ensure_ascii=False, indent=2) + "\n"
+            meta = {"target": "cpsat", "nvars": len(cpvars),
+                    "constraints": len(spec.constraints)}
+    except EncodeError as exc:
+        c(str(exc))
+        return USAGE
+    except SolverMissing as exc:
+        c(str(exc))
+        s("MISSING", "ortools")
+        return MISSING
+    except MissingBackend as exc:
+        c(str(exc))
+        s("MISSING", "python-modules")
+        return MISSING
+
+    if args.out:
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        c(f"wrote {args.out}")
+    if args.json:
+        out_json(meta | {"out": args.out})
+    else:
+        s("ENCODED", f"{args.to} {meta}")
+    return PASS
+
+
+# ---------------------------------------------------------------- 见证直接求值
+
+
+def do_eval_witness(spec: Spec, args) -> int:
+    try:
+        assign = load_witness(args.eval_witness)
+    except SpecError as exc:
+        c(str(exc))
+        return USAGE
+    ok, why = spec.eval(assign)
+    if ok:
+        s("WITNESS_OK", f"{len(assign)} 个变量全部满足 {len(spec.constraints)} 条约束")
+        return PASS
+    # 见证不成立 = 断言被推翻，不是「无法判定」。
+    s("WITNESS_BAD", why or "")
+    return REJECT
+
+
+# ---------------------------------------------------------------- 双后端一致性
+
+
+def do_consistency(spec: Spec, args) -> int:
+    """两条独立编码各解一遍，并交叉验证彼此的见证。
+
+    只比 SAT/UNSAT 是不够的：两条路径可能都判 sat，但其中一个的见证其实不满足
+    规格——那同样是编码错误，而且更隐蔽。所以这里对每个 sat 结论都拿 *规格的
+    直接求值* 复核一遍（那是与两个编码器都无关的第三条路径）。
+    """
+    # 求解器只在 venv 里，而本命令的 shebang 是系统 python3。在这里换解释器：
+    # ensure_modules 会 os.execv 到能 import 它们的解释器，失败则抛 MissingBackend。
+    try:
+        ensure_modules(["pysat", "ortools"])
+    except MissingBackend as exc:
+        c(str(exc))
+        s("MISSING", "pysat,ortools")
+        return MISSING
+
+    try:
+        cnf = opl_encode.to_cnf(spec)
+    except EncodeError as exc:
+        c(str(exc))
+        return USAGE
+    c(f"CNF 侧：{cnf.nvars} 变量 {len(cnf.clauses)} 子句，"
+      f"枚举 {cnf.tuples_visited} 个作用域元组")
+
+    try:
+        sat_verdict, sat_model = opl_encode.solve_cnf(cnf, backend=args.sat_backend)
+    except (SolverMissing, MissingBackend) as exc:
+        c(str(exc))
+        s("MISSING", "pysat")
+        return MISSING
+    c(f"SAT 侧（{args.sat_backend}）-> {sat_verdict}")
+
+    try:
+        cp_verdict, cp_assign = opl_encode.solve_cpsat(spec, timeout_s=args.timeout)
+    except (SolverMissing, MissingBackend) as exc:
+        c(str(exc))
+        s("MISSING", "ortools")
+        return MISSING
+    c(f"CP 侧（ortools CP-SAT）-> {cp_verdict}")
+
+    report: dict = {"spec": spec.name, "cnf": {"nvars": cnf.nvars, "nclauses": len(cnf.clauses)},
+                    "sat": {"backend": args.sat_backend, "verdict": sat_verdict},
+                    "cpsat": {"verdict": cp_verdict}}
+
+    if "unknown" in (sat_verdict, cp_verdict):
+        c("有一个后端给出 unknown，无法比较")
+        s("UNKNOWN", f"sat={sat_verdict} cpsat={cp_verdict}")
+        return UNKNOWN
+
+    if sat_verdict != cp_verdict:
+        c(f"两条独立编码结论矛盾：SAT 说 {sat_verdict}，CP 说 {cp_verdict}。")
+        c("这是编码错误的信号。先查线性约束的元组枚举与 one-hot 恰一约束。")
+        report["verdict"] = "INCONSISTENT"
+        if args.json:
+            out_json(report)
+        s("INCONSISTENT", f"sat={sat_verdict} cpsat={cp_verdict}")
+        return REJECT
+
+    # 结论一致，再用规格直接求值交叉验证见证。
+    checked: dict[str, bool] = {}
+    if sat_verdict == "sat":
+        if sat_model is None:
+            c("SAT 侧判 sat 却没给模型")
+            return UNKNOWN
+        try:
+            assign = cnf.decode(sat_model)
+        except EncodeError as exc:
+            # decode 报错意味着模型里某变量有两个真文字 —— one-hot 被破坏，
+            # 那是编码错误，不是「无解」。绝不能让它崩栈当作没发生。
+            c(f"CNF 侧模型无法还原成整数赋值：{exc}")
+            c("这说明 one-hot 编码被破坏——是编码错误。")
+            report |= {"verdict": "SAT_MODEL_UNDECODABLE", "reason": str(exc),
+                       "raw_model": sat_model}
+            if args.json:
+                out_json(report)
+            s("INCONSISTENT", f"模型无法还原：{exc}")
+            return REJECT
+        ok, why = spec.eval(assign)
+        checked["sat_witness"] = ok
+        if not ok:
+            c(f"SAT 侧的见证不满足规格：{why}")
+            c("编码与规格不一致——这是编码错误，不是「无解」。")
+            report |= {"verdict": "SAT_WITNESS_INVALID", "reason": why, "assignment": assign}
+            if args.json:
+                out_json(report)
+            s("INCONSISTENT", f"sat 见证不成立：{why}")
+            return REJECT
+        report["sat_assignment"] = assign
+    if cp_verdict == "sat":
+        if cp_assign is None:
+            c("CP 侧判 sat 却没给赋值")
+            return UNKNOWN
+        ok, why = spec.eval(cp_assign)
+        checked["cpsat_witness"] = ok
+        if not ok:
+            c(f"CP 侧的见证不满足规格：{why}")
+            report |= {"verdict": "CPSAT_WITNESS_INVALID", "reason": why}
+            if args.json:
+                out_json(report)
+            s("INCONSISTENT", f"cpsat 见证不成立：{why}")
+            return REJECT
+        report["cpsat_assignment"] = cp_assign
+
+    report |= {"verdict": "CONSISTENT", "witness_checked": checked}
+    if args.json:
+        out_json(report)
+    s("CONSISTENT", f"两个后端同为 {sat_verdict}，见证经规格直接求值复核")
+    return PASS
+
+
+if __name__ == "__main__":
+    sys.exit(main())

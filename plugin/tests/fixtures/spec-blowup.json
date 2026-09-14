@@ -1,0 +1,1 @@
+{"name": "blowup", "vars": [{"name": "x0", "lo": 0, "hi": 999}, {"name": "x1", "lo": 0, "hi": 999}, {"name": "x2", "lo": 0, "hi": 999}, {"name": "x3", "lo": 0, "hi": 999}, {"name": "x4", "lo": 0, "hi": 999}], "constraints": [{"kind": "linear", "terms": [[1, "x0"], [1, "x1"], [1, "x2"], [1, "x3"], [1, "x4"]], "op": "<=", "rhs": 100}]}

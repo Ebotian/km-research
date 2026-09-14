@@ -100,6 +100,30 @@ chk "list 无匹配"            5 $BIN/opl-conj list --status proved
 echo "capabilities —— 必需层"
 chk "必需层齐全"             0 $BIN/opl-capabilities --layer required --quiet
 
+# ---------------------------------------------------------------- 编码
+echo "encode —— 规格到模型，双后端互相证伪"
+chk "纯编码到 CNF（不需求解器）" 0 $BIN/opl-encode --spec $FIX/spec-pc43.json --to cnf --out "$work/e.cnf"
+chk "见证成立"                0 $BIN/opl-encode --spec $FIX/spec-pc23.json --eval-witness $FIX/spec-pc23-witness.json
+chk "见证不成立"              1 $BIN/opl-encode --spec $FIX/spec-pc43.json --eval-witness $FIX/spec-pc23-witness.json
+chk "双后端一致（UNSAT）"     0 $BIN/opl-encode --spec $FIX/spec-pc43.json --check-consistency
+chk "双后端一致（SAT）"       0 $BIN/opl-encode --spec $FIX/spec-pc23.json --check-consistency
+chk "编码代价超限（拒绝而非静默）" 2 $BIN/opl-encode --spec $FIX/spec-blowup.json --to cnf
+
+# M1 第一条验收的牙齿：故意编坏 CNF 侧，「不一致」必须被检出。
+# 在*临时副本*上注入，真实代码树全程不被碰——避免脚本中途被杀而留下坏代码。
+mkdir -p "$work/probe/bin"
+cp -r "$plugin/lib" "$work/probe/lib"
+cp "$BIN/opl-encode" "$work/probe/bin/"
+python3 - "$work/probe/lib/opl_encode.py" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "    for combo in itertools.product(*assigns):"
+assert old in s, "注入锚点没找到"
+open(p, "w").write(s.replace(old, "    return  # ← 注入：不生成任何 linear 禁止子句\n" + old, 1))
+PY
+chk "编坏 CNF 侧后能检出不一致" 1 "$work/probe/bin/opl-encode" --spec $FIX/spec-pc43.json --check-consistency
+
 # ----------------------------------------------------------------
 printf '\n  通过 %d / 失败 %d\n' "$pass" "$fail"
 [ "$fail" -gt 0 ] && exit 1
