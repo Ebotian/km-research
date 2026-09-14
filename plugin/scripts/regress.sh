@@ -160,6 +160,44 @@ open(p, "w").write(s.replace(
 PY
 chk "反解码出错时报 1（不伪报成功）" 1 "$work/probe2/bin/opl-search" --spec $FIX/spec-pc23.json
 
+# ---------------------------------------------------------------- 端到端五步
+echo "端到端 —— 登记 → 编码 → 搜索 → 独立复核 → 台账定案"
+export OPL_LAB="$work/e2e/lab"
+mkdir -p "$work/e2e"
+chk "1 登记猜想"              0 $BIN/opl-conj add --id E-1 --title "PC(2,3) 可满足性" \
+    --statement "3 个洞容得下 2 只鸽子，每只独占一个洞" --source $FIX/spec-pc23.json
+chk "2 编码并双后端互相证伪"   0 $BIN/opl-encode --spec $FIX/spec-pc23.json --check-consistency
+chk "3 搜索（sat 侧，出见证）" 0 $BIN/opl-search --spec $FIX/spec-pc23.json \
+    --cnf-out "$work/e2e/m.cnf" --witness-out "$work/e2e/witness.json"
+chk "4 独立复核见证"          0 $BIN/opl-encode --spec $FIX/spec-pc23.json \
+    --eval-witness "$work/e2e/witness.json"
+chk "5 台账定案"              0 $BIN/opl-conj set E-1 --formal-status refuted \
+    --evidence "$work/e2e/witness.json" --verification-level exact_certificate
+chk "终态与证据指针正确"       0 python3 -c "
+import json, subprocess, os, sys
+# 注意：status 是*派生*字段，按设计不落盘——必须向工具要，不能从文件里读。
+f = json.load(open('$work/e2e/lab/conjectures/E-1.json'))
+out = subprocess.run(['$BIN/opl-conj', 'get', 'E-1'], capture_output=True, text=True,
+                     env={**os.environ, 'OPL_LAB': '$work/e2e/lab'})
+derived = json.loads(out.stdout)['status']
+ok = (derived == 'refuted' and f['formal_status'] == 'refuted'
+      and f['verification_level'] == 'exact_certificate'
+      and any(h['evidence'] for h in f['history']))
+sys.exit(0 if ok else 1)"
+
+# unsat 侧：证明 -> 独立复核 -> 证据记录落盘
+chk "3b 搜索（unsat 侧，出证明）" 0 $BIN/opl-search --spec $FIX/spec-pc43.json \
+    --cnf-out "$work/e2e/u.cnf" --proof-out "$work/e2e/u.drat"
+chk "4b 复核证明并落证据记录"     0 $BIN/opl-certcheck --formula "$work/e2e/u.cnf" \
+    --cert "$work/e2e/u.drat" --evidence-out "$work/e2e/lab/evidence/E-2.json"
+chk "证据记录字段正确"            0 python3 -c "
+import json, sys
+d = json.load(open('$work/e2e/lab/evidence/E-2.json'))
+ok = (d['schema'] == 'opl.evidence/1' and d['verdict'] == 'VERIFIED'
+      and d['verification_level'] == 'exact_certificate'
+      and len(d['certificate_sha256']) == 64)
+sys.exit(0 if ok else 1)"
+
 # ----------------------------------------------------------------
 printf '\n  通过 %d / 失败 %d\n' "$pass" "$fail"
 [ "$fail" -gt 0 ] && exit 1

@@ -15,5 +15,10 @@ lab/
 __pycache__/
 .venv/
 
+# 类型检查器缓存（dev 依赖的产物，不进仓库）
+.mypy_cache/
+.pyright/
+.ty/
+
 # 插件运行时产物
 lab/

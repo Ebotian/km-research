@@ -1,0 +1,31 @@
+{
+  "name": "open-problem-lab",
+  "version": "0.1.0",
+  "description": "本地工具链，协助攻击开放问题：猜想台账、有限域约束的双后端编码、反例搜索、以及可被独立复核的证明证书（DRAT / LRAT / LPR / Alethe）。判决走退出码，证据落盘，缺失验证器时硬失败。",
+  "keywords": [
+    "open-problem",
+    "counterexample",
+    "sat",
+    "smt",
+    "proof-checking",
+    "formal-verification",
+    "research"
+  ],
+  "author": {
+    "name": "EBT"
+  },
+  "license": "MIT",
+  "skills": [
+    "./skills/opl-entry/",
+    "./skills/opl-refute/"
+  ],
+  "sessionStart": {
+    "skill": "opl-entry"
+  },
+  "interface": {
+    "displayName": "Open Problem Lab",
+    "shortDescription": "开放问题算法研究：反例搜索、证书独立复核、猜想台账",
+    "longDescription": "把「求解器说 UNSAT」变成可被第三方复核的结论。命令在插件目录的 bin/ 下，每个只做一件事，判决走退出码（0 通过 / 1 推翻 / 2 用法 / 3 未知 / 4 缺后端 / 5 空结果），证据落成文件。UNKNOWN 与 UNSAT 在退出码上就不可能混淆——这是本插件要防的头号错误。",
+    "developerName": "EBT"
+  }
+}
