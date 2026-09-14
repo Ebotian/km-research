@@ -14,7 +14,7 @@
   "author": {
     "name": "EBT"
   },
-  "license": "MIT",
+  "license": "AGPL-3.0",
   "skills": [
     "./skills/opl-entry/",
     "./skills/opl-refute/"
