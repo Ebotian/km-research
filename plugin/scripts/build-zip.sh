@@ -47,7 +47,7 @@ mkdir -p "$root"
 echo "打包 $name v$ver -> $out_dir"
 
 # ---- 随包文件（不含 bin/third-party 与 lean）
-for item in kimi.plugin.json skills lib tests scripts hooks; do
+for item in kimi.plugin.json THIRD-PARTY-NOTICES.md skills lib tests scripts hooks; do
   [ -e "$item" ] || continue
   cp -r "$item" "$root/"
   echo "  + $item"
@@ -88,6 +88,12 @@ fi
 # 运行时代理依赖检查：能力探测要读它
 if [ ! -f "$root/tests/fixtures/tiny.clrat" ]; then
   echo "打包失败：缺 tests/fixtures/tiny.clrat —— 能力探测会静默退化" >&2
+  exit 1
+fi
+# 许可合规：包里有第三方二进制（含 cake_lpr/BSD-3 与 drat-trim/MIT），
+# 两者都要求随二进制分发时附上声明。缺了它这个包就不该发出去。
+if [ ! -f "$root/THIRD-PARTY-NOTICES.md" ]; then
+  echo "打包失败：缺 THIRD-PARTY-NOTICES.md —— 包内含需随附声明的第三方二进制" >&2
   exit 1
 fi
 

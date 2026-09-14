@@ -1,6 +1,6 @@
 # kimi-research
 
-为 Kimi Code 制作的开放问题研究插件，代号 **open-problem-lab**。
+为 [Kimi Code](https://moonshotai.github.io/kimi-code/) 制作的开放问题研究插件，代号 **open-problem-lab**。
 
 它的目标很窄：**把「求解器说 UNSAT」变成可被第三方复核的结论**。
 为此它不追求功能多，而追求结论可信——判决走退出码，证据落盘，
@@ -14,10 +14,11 @@
 
 - **形式化鸿沟**：自动形式化的编译率会系统性高估语义忠实度——陈述自动形式化的
   语义正确率约 76%，而「Lean 编译通过」看不出那 24%。
-- **验证器缺位**：AI Scientist v1 的复现研究观察到 42% 实验因编码错误失败、
-  多篇生成论文含幻觉数值。
-- **伪报成功**：Erdős 问题的公开案例里，某次「AI 自主解决」经复核降级为独立
-  重发现；另一次「解决 10 个问题」经查是误报，因为站点的 `open` 标签不保证最新。
+- **验证器缺位**：[AI Scientist](https://github.com/SakanaAI/AI-Scientist) v1 的
+  复现研究观察到 42% 实验因编码错误失败、多篇生成论文含幻觉数值。
+- **伪报成功**：[Erdős Problems](https://www.erdosproblems.com/) 的公开案例里，
+  某次「AI 自主解决」经复核降级为独立重发现；另一次「解决 10 个问题」经查是误报，
+  因为站点的 `open` 标签不保证最新。
 
 三者的公共对策是同一条：**让独立验证器对结论拥有否决权**。
 
@@ -53,8 +54,14 @@
 
 （都在 `plugin/bin/` 下；下面出现时按完整路径写。）
 
-证书格式与检查器（均实测通过）：`DRAT`→drat-trim，`LRAT`→lrat-check，
-`LPR`→cake_lpr（CakeML 形式化验证过），`Alethe`→carcara（可选）。
+证书格式与检查器（均实测通过）：
+
+| 格式 | 检查器 | 上游 |
+|---|---|---|
+| DRAT | [drat-trim](https://github.com/marijnheule/drat-trim) | Marijn Heule，MIT |
+| LRAT | lrat-check | 同上仓库 |
+| LPR | [cake_lpr](https://github.com/tanyongkiam/cake_lpr) | 经 [CakeML](https://cakeml.org/) 形式化验证过编译 |
+| Alethe | [carcara](https://github.com/ufmg-smite/carcara)（可选） | Apache-2.0 |
 
 技能：`opl-entry`（总纲与路由）、`opl-refute`（反例搜索五步流程）。
 
@@ -74,14 +81,16 @@ plugin/scripts/setup-third-party.sh --with-carcara   # 另加 Alethe 检查器�
 
 脚本里含两处实测得来的必要修补：
 
-- `drat-trim` 上游 Makefile 用 `-std=c99`，而那会置 `__STRICT_ANSI__`、glibc 于是
-  隐藏 `getc_unlocked`；GCC 14 起隐式声明是硬错误，原样 `make` 编译不过。
-  补 `-D_DEFAULT_SOURCE`（保留 `c99`）。
-- `decompress` 上游有 bug（`read_lit` 内遗留 `printf`，输出不是合法 LRAT），
-  脚本明确跳过而不是装个坏的。
+- [drat-trim](https://github.com/marijnheule/drat-trim) 上游 Makefile 用 `-std=c99`，
+  而那会置 `__STRICT_ANSI__`、glibc 于是隐藏 `getc_unlocked`；GCC 14 起隐式声明是
+  硬错误，原样 `make` 编译不过。补 `-D_DEFAULT_SOURCE`（保留 `c99`）。
+- `decompress`（同仓库）上游有 bug：`read_lit` 内遗留 `printf`，输出不是合法 LRAT。
+  脚本明确跳过，而不是装个坏的。
 
-求解器（`pysat` / `ortools` / `cvc5`）走一个 venv，命令在运行时会自动解析并切换
-解释器——不需要把 shebang 写死到某个绝对路径。
+求解器走一个 venv，命令在运行时会自动解析并切换解释器——不需要把 shebang 写死到
+某个绝对路径。它们分别是 [PySAT](https://github.com/pysathq/pysat)（内置
+Glucose42 / Lingeling）、[OR-Tools](https://github.com/google/or-tools) 的 CP-SAT，
+以及 [cvc5](https://github.com/cvc5/cvc5)。
 
 ## 快速上手：五步闭环
 
@@ -133,6 +142,11 @@ plugin/scripts/verify-zip.sh     # 解压到干净目录并跑通上面那条链
 包里不含 `carcara`（30 MB）与 `decompress`（上游有 bug）——缺它们时命令会如实报
 `MISSING(4)` 并降级，那正是能力探测的设计行为。
 
+包内含第三方二进制，因此附有 [`plugin/THIRD-PARTY-NOTICES.md`](plugin/THIRD-PARTY-NOTICES.md)：
+drat-trim 的 MIT 与 cake_lpr 的 CakeML 许可都要求随二进制分发时附上条款声明，
+该文件由 `scripts/update-third-party-notices.sh` **从上游源码目录原样拼入**并做一致性
+校对，不靠手抄。`build-zip.sh` 缺了它直接拒绝出包。
+
 `capabilities.json` 里的 `split_brain` 字段值得一提：它会检测「没有任何单一
 解释器同时满足某一组依赖」的情况。这不是假想的——本项目就踩过一次（系统
 Python 有 `z3`/`sympy`，另一个 venv 有 `cvc5`/`ortools`，两边都缺对方）。
@@ -142,16 +156,18 @@ Python 有 `z3`/`sympy`，另一个 venv 有 `cvc5`/`ortools`，两边都缺对�
 ```
 plugin/                 插件本体
   kimi.plugin.json      清单（skills 显式列出）
+  THIRD-PARTY-NOTICES.md  随包分发的第三方许可声明
   bin/                  五个命令（含 third-party/，由脚本安装，不入库）
   lib/                  全部逻辑，可类型检查、可单测
   skills/               opl-entry · opl-refute
-  scripts/              typecheck · regress · build-zip · verify-zip · setup-third-party
+  scripts/              typecheck · regress · build-zip · verify-zip
+                        setup-third-party · update-third-party-notices · install-hooks
   hooks/pre-commit      提交前：类型检查 + 退出码回归
   tests/fixtures/       运行时与回归共用的夹具（84 KB）
 doc/
   plan/                 设计方案 8 章（790 行）
   sections/             调研附录 24 篇（4565 行）
-  main.typ              合稿入口，typst 编译出 175 页
+  main.typ              合稿入口，[Typst](https://typst.app/) 编译出 175 页
 ```
 
 ## 验证方式
@@ -161,6 +177,7 @@ doc/
 ```bash
 plugin/scripts/regress.sh        # 47 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
+plugin/scripts/verify-zip.sh     # 17 项：解压到干净目录并跑通整条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
@@ -170,8 +187,9 @@ plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 冲突），拿它做验收会得到一个永远通过的假验收。
 
 类型检查跑三个而不是挑一个，因为实测它们在未注解函数上结论不同：`run()` 还没
-写返回注解时，把三元组按四元组解包，`pyright` 抓到了而 `mypy` 与 `ty` 沉默。
-单一检查器会漏。
+写返回注解时，把三元组按四元组解包，[pyright](https://github.com/microsoft/pyright)
+抓到了而 [mypy](https://github.com/python/mypy) 与
+[ty](https://github.com/astral-sh/ty) 沉默。单一检查器会漏。
 
 ## 已知边界
 
@@ -195,7 +213,7 @@ Lean 形式化验证、进化式程序搜索、基准统计与报告生成尚未
 
 ## 许可
 
-AGPL-3.0，见 [LICENSE](LICENSE)。
+本项目为 AGPL-3.0，见 [LICENSE](LICENSE)。
 
-仓库不含第三方二进制；`scripts/setup-third-party.sh` 会从各自的上游仓库
-克隆与构建（`drat-trim` 为 MIT，`carcara` 为 Apache-2.0）。
+仓库不含第三方二进制；`scripts/setup-third-party.sh` 会从各自的上游仓库克隆与
+构建，随包分发时的许可声明见 [`plugin/THIRD-PARTY-NOTICES.md`](plugin/THIRD-PARTY-NOTICES.md)。

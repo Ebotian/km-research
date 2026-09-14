@@ -42,6 +42,9 @@ chk "清单在根"        0 test -f "$root/kimi.plugin.json"
 chk "两个技能都在"    0 test -f "$root/skills/opl-entry/SKILL.md" -a -f "$root/skills/opl-refute/SKILL.md"
 chk "无残留软链"      0 test -z "$(find "$root" -type l)"
 chk "运行时夹具在位"  0 test -f "$root/tests/fixtures/tiny.clrat"
+chk "第三方许可声明在位" 0 test -f "$root/THIRD-PARTY-NOTICES.md"
+chk "声明含 drat-trim 条款" 0 grep -qF "Permission is hereby granted, free of charge" "$root/THIRD-PARTY-NOTICES.md"
+chk "声明含 cake_lpr 条款" 0 grep -qF "CakeML is free software" "$root/THIRD-PARTY-NOTICES.md"
 
 echo "包内第三方后端（不设 OPL_BINDIR，靠插件根解析）"
 for b in drat-trim lrat-check; do
