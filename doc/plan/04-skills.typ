@@ -6,7 +6,7 @@
 
 - *description 只写触发条件与症状，绝不写步骤摘要*。否则模型照描述走而不读正文——这是「技能描述太泛导致不触发」与「描述即流程导致正文被跳过」两种失效的共同根源。
 - *三层渐进披露加硬预算*。系统提示只放技能名、描述与路径（实测插件技能归入 `Extra` 段）；正文按需注入，单文件正文压在 500 行以内；深材料（定理库索引、基准套件参数、反例构造手册）放同级 `references/`，可执行脚本放同级 `scripts/`。*资源不被正文显式引用等于不存在*。
-- *确定性逻辑不进技能*。凡是脚本能做的（形式化检查、跑分、结果解析）都放 `scripts/` 或 `MCP`，技能只写判据。
+- *确定性逻辑不进技能*。凡是脚本能做的（形式化检查、跑分、结果解析）都放 `bin/` 下的命令或同级 `scripts/`，技能只写判据。
 
 技能名一律带 `opl-` 前缀。原因是实测优先级为 内置 0 小于 插件 5 小于 `Extra` 10 小于 用户 20 小于 项目 30，即插件技能会被同名项目或用户技能静默覆盖。
 
@@ -51,9 +51,11 @@
   table.header([*字段*], [*取值与理由*]),
   [`skills`], [`["./skills/opl-entry/", "./skills/opl-formalize/", ...]`。必须显式列出：省略该字段会进入 root-skill-only 模式，只认根 `SKILL.md`],
   [`sessionStart`], [`{skill: "opl-entry"}`。参照 `superpowers` 的真实用法],
-  [`mcpServers.lab`], [`{command: "node", args: ["./bin/opl-mcp.mjs"], cwd: "./"}`。路径靠 `./` 与 `realpath` 解析],
+  [`mcpServers`], [*本项目不声明*。能力以 `bin/` 下的可执行文件提供，不注册 `MCP` 服务器；仅当某些环境确需 `MCP` 入口时才加一个 0 到 2 个工具的薄适配层],
 )
 
-调研确认清单内*没有任何* `${PLUGIN_ROOT}` 类占位符，运行期只注入环境变量 `KIMI_PLUGIN_ROOT` 与 `KIMI_CODE_HOME`（仅 hook 进程与 stdio `MCP` 服务器）。也不存在官方 JSON Schema 校验（`$schema` 指向的地址实测返回官网页面而非 schema），`name` 字段是唯一必填且唯一致命项，其余字段问题一律降级为诊断。
+清单不声明 `mcpServers`，因此 `bin/` 下的命令靠 `KIMI_PLUGIN_ROOT` 定位（插件自身用 `OPL_BINDIR` 覆盖，便于测试）。权限上不需要 `MCP` 工具名，直接用 `ToolName(arg-pattern)` 形式的规则约束命令行，例如按前缀 allow 或 deny `Bash(opl-*)`。
+
+调研确认清单内*没有任何* `${PLUGIN_ROOT}` 类占位符，运行期只注入环境变量 `KIMI_PLUGIN_ROOT` 与 `KIMI_CODE_HOME`。也不存在官方 JSON Schema 校验（`$schema` 指向的地址实测返回官网页面而非 schema），`name` 字段是唯一必填且唯一致命项，其余字段问题一律降级为诊断。
 
 因此本项目不使用 Claude 生态的 `hooks/hooks.json` 形态。Kimi 的 hooks 是扁平数组 `{event, matcher, command, timeout}`，且为 fail-open（非零退出、超时、崩溃均放行），只能用于告警，不能充当安全边界。真实约束应写进权限规则的静态拒绝项。

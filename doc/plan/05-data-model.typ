@@ -119,3 +119,34 @@
 )
 
 血缘去重必须防「迁移副本再次迁移」这类环路：调研记录了 183 个后代拷贝的事故，拷贝数会呈指数增长，且同源代码落入同一格点后被反复丢弃，白烧评估预算。去重做两重——归一化代码哈希做精确去重，评估结果按行为签名（逐测试得分元组）复用，避免重复评估。
+
+=== 证据记录
+
+证书复核产出一份独立的证据记录（`opl.evidence/1`），一条记录一个文件，落在 `lab/evidence/<id>.json`。它由 `opl-certcheck --evidence-out` 生成，并由 `opl-conj set --evidence` 以指针方式引用——两者的接口就是文件路径，不需要共享代码。
+
+```json
+{
+  "schema": "opl.evidence/1",
+  "backend": "drat-trim",
+  "format": "drat",
+  "formula": "/abs/path/uuf-100-1.cnf",
+  "formula_sha256": "…",
+  "certificate": "/abs/path/uuf-100-1.drat",
+  "certificate_sha256": "…",
+  "certificate_bytes": 17019,
+  "parsed_bytes": null,
+  "parse_complete": null,
+  "duration_ms": 21,
+  "verdict": "VERIFIED",
+  "verification_level": "exact_certificate",
+  "checked_at": "2026-09-14T17:35:00+08:00"
+}
+```
+
+`parse_complete` 是这份记录里最值得看的字段，它回答「证书是否被完整读入」：`true` 表示校验器自报读入的字节数与文件一致；`false` 表示不完整，此时任何 `NOT VERIFIED` 都不可信，记录里的 `verdict` 会被改写成 `UNKNOWN`；`null` 表示该后端不提供这个信息（例如 `drat-trim` 只在部分模式下打印字节数），此时不予推断。
+
+=== 纯文本作为真源
+
+台账与证据都是「一记录一文件」的纯文本，`SQLite` 只用作可重建的派生索引（程序库与血缘）。因此：删掉数据库不丢信息；台账可以直接进版本控制；记录可以被 `diff`、`grep`、`jq` 与任何既有 Unix 工具消费，插件不需要为此提供专门的查询接口。
+
+大产物走另一条路：`lab/runs/` 与 `lab/programs/` 里的一切都只留路径与校验和，不入版本控制。这解掉了「台账要不要入 git」这个待决问题——文字证据入，运行产物不入。

@@ -21,7 +21,7 @@
 
 #include "plan/01-overview.typ"
 #include "plan/02-architecture.typ"
-#include "plan/03-mcp-tools.typ"
+#include "plan/03-toolchain.typ"
 #include "plan/04-skills.typ"
 #include "plan/05-data-model.typ"
 #include "plan/06-verification.typ"

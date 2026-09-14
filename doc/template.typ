@@ -18,8 +18,11 @@
     numbering: "1",
     number-align: center,
     header: context {
-      let hs = query(selector(heading.where(level: 1)).before(here()))
-        .filter(h => h.body != [目录])
+      // 用页号筛选而非 before(here())：章标题位于自身页面的顶部，而页眉在此页
+      // 内容之前布局，所以 before(here()) 看不到它，会在每章首页显示上一章的名字。
+      let page-num = here().page()
+      let hs = query(selector(heading.where(level: 1)))
+        .filter(h => h.body != [目录] and h.location().page() <= page-num)
       if hs.len() > 0 {
         set text(size: 8pt, fill: luma(130))
         hs.last().body
