@@ -4,18 +4,39 @@
 
 下表每一条都来自本机实测，不是假设。
 
+=== 本轮实测的环境基线
+
+#table(
+  columns: (auto, 1fr),
+  table.header([*层*], [*实测可用*]),
+  [必需], [`python3` 3.14.7、`typst` 0.15.1],
+  [证明], [`drat-trim`、`lrat-check`（`decompress` 存在但功能异常）],
+  [Lean], [Lean 4.33.1、Lake 5.0.0],
+  [SMT], [`z3` 4.16.0、`minisat`、`cryptominisat5`],
+  [CAS], [`PARI/GP` 2.17.4、`fplll` 5.5.0],
+  [基准], [`hyperfine` 1.20.0、`perf` 7.2.5、`cpupower` 7.2.5、`numactl` 2.0.19],
+  [沙箱], [`bwrap` 0.12.0、Docker 29.8.0、systemd 261],
+  [Python], [项目 venv（3.14.7）13 个模块全满足；系统 `python3` 只看得到 8 个],
+  [仍缺], [`cadical`、`kissat`（官方源无，可由 PySAT 内建的 `CaDiCaL195` / `Glucose42` 顶上）；`cvc5` 作库可用但无命令行],
+)
+
+=== 降级与对策
+
 #table(
   columns: (auto, 1fr, 1fr),
   table.header([*风险*], [*实测现状*], [*对策*]),
-  [求解器缺失],
-  [`z3`、`cvc5` 未安装；`python3` 无 `pip` 模块且有 `EXTERNALLY-MANAGED`],
-  [能力探测 + 降级为穷举或启发式搜索，并*明确宣告不可解*。提示语二选一：`pacman -S` 或 `uv venv` 加 `uv pip install`],
+  [求解器与库的可用性不一致],
+  [`z3` 已装（pacman），`cvc5` / `ortools` / `python-sat` 只在 venv 里（PyPI），`cadical` / `kissat` 两边都没有],
+  [能力探测同时覆盖*可执行文件与 Python 模块*，并按解释器分别探。库型后端（如 `cvc5`）只进模块层，不放进可执行文件层——否则会报 `not_found` 让消费者误判为不可用],
+  [Python 依赖分裂],
+  [曾出现系统 3.14 有 `z3`/`sympy`、另一 venv（基于 uv 下载的 3.12）有 `cvc5`/`ortools`，*没有任何单一解释器同时看得见两者*。这是最隐蔽的一类故障：每一侧单独看都正常],
+  [venv 必须基于系统解释器（`home = /usr/bin`）才能让 `--system-site-packages` 指向 pacman 的 site-packages；`opl-capabilities` 新增 `split_brain` 字段，当某一层没有任何解释器能同时满足时报警并列出各缺什么],
   [CAS 重依赖],
   [`pacman -Sp sagemath` 需拉 112 个包共 460.2 MiB（其中 `gap` 单项 229 MiB）],
   [整类 CAS 能力标为可选重依赖，仅在探测到已安装时启用，不作为自动安装目标],
-  [Lean 工具链],
-  [elan 的 `stable` 指向未安装版本，裸 `lean` 触发联网下载],
-  [调用前断言存在 `lean-toolchain`；必要时用 `~/.elan/toolchains/<tc>/bin/lean` 绝对路径绕过 shim],
+  [Lean 工具链未定点],
+  [elan 的 `default_toolchain = "stable"` 使每次 `lean` / `lake` 调用都要联网解析版本。实测在无 `lean-toolchain` 的目录里耗时 5.0 / 3.0 / 5.0 秒（两次撞上 5 秒预算）；同目录放入 `lean-toolchain` 后是 0.022 / 0.021 / 0.021 秒，用 `~/.elan/toolchains/<tc>/bin/` 绝对路径同样是 0.02 秒。*差 250 倍*，且哪一次超时纯看网络抖动],
+  [调用前断言存在 `lean-toolchain`，或用 toolchain 绝对路径绕过 shim。探测超时只应标为「暂不可用」而不应缓存为「不存在」，否则一次网络抖动会让 Lean 层被永久降级],
   [内存与 CPU 无限制],
   [`ulimit -a` 的 cpu time 与 virtual memory 全为 `unlimited`；`/tmp` 是 16 GiB tmpfs],
   [默认走 `systemd-run --user --scope`；沙箱内挂独立 tmpfs，避免写 `/tmp` 吃内存],
