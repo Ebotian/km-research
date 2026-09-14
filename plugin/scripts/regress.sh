@@ -95,6 +95,16 @@ export OPL_LAB="$work/lab"
 chk "add"                    0 $BIN/opl-conj add --id R-1 --statement "测试陈述"
 chk "无证据改状态（拒绝写入）" 2 $BIN/opl-conj set R-1 --formal-status refuted
 chk "带证据改状态"           0 $BIN/opl-conj set R-1 --formal-status refuted --evidence "$work/ev.json"
+# 锁住一个修掉的真 bug：旧代码在*没有* --evidence 时也写死 verified_by=independent
+# 与 verification_level=exact_certificate，只打一句 stderr 警告——那是在数据里
+# 断言一次从未做过的独立复核。
+chk "加反例（无证据）"       0 $BIN/opl-conj set R-1 --add-counterexample "n=40"
+chk "无证据的反例不得声称独立复核" 0 python3 -c "
+import json, sys
+c = json.load(open('$work/lab/conjectures/R-1.json'))['counterexamples'][0]
+ok = (c['verified_by'] == 'UNVERIFIED' and c['verification_level'] == 'empirical'
+      and c['certificate'] is None)
+sys.exit(0 if ok else 1)"
 chk "取不存在的记录"         5 $BIN/opl-conj get R-404
 chk "list 无匹配"            5 $BIN/opl-conj list --status proved
 
