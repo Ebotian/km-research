@@ -147,7 +147,8 @@ def main() -> int:
     ap.add_argument("cert_pos", nargs="?")
     ap.add_argument("--formula")
     ap.add_argument("--cert")
-    ap.add_argument("--format", default="auto", choices=["auto", "drat", "lrat", "clrat", "lpr"])
+    ap.add_argument("--format", default="auto",
+                    choices=["auto", "drat", "lrat", "clrat", "lpr", "alethe"])
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--evidence-out")
@@ -172,10 +173,12 @@ def main() -> int:
 
     fmt, why = args.format, "由 --format 指定"
     if fmt == "auto":
-        # 先看扩展名：`.lpr` 与 LRAT 的行语法相同，sniff 分辨不出来，而两者
-        # 该走不同的检查器——`.lpr` 交给经形式化验证的 cake_lpr。
+        # 先看扩展名：`.lpr` 与 LRAT 行语法相同，Alethe 是 Lisp 括号式，两者
+        # sniff 都分辨不出来，而它们该走各自的检查器。
         if cert.endswith(".lpr"):
             fmt, why = "lpr", "扩展名为 .lpr"
+        elif cert.endswith((".alethe", ".alethe.txt")):
+            fmt, why = "alethe", "扩展名为 .alethe"
         else:
             fmt, why = sniff(unpacked)
     if fmt == "unknown":
@@ -233,6 +236,21 @@ def main() -> int:
         # cake_lpr 不提供「是否读完整份证明」的自述，故不推断完整性。
         parsed_ok = None
 
+    elif fmt == "alethe":
+        # Carcara 检查 SMT 的 Alethe 证明（cvc5 产出）。它的 stdout 只有一个词：
+        #   valid   -> 每一步都验证通过
+        #   holey   -> 有洞，部分步骤未验证。*也退出 0*，绝不等于通过
+        #   invalid -> 证明无效
+        exe = find_tool("carcara")
+        if exe is None:
+            return die_missing("carcara", args)
+        backend = "carcara"
+        rc, log, _ = check(exe, ["check", unpacked, formula], args.timeout)
+        if rc is None:
+            return die_unknown("carcara 超时", args, backend, extra)
+        # 判决由下方 verdict 块从这三个词里读；退出码不携带 valid/holey 之别。
+        parsed_ok = None
+
     elif fmt == "clrat":
         dec, lrat = find_tool("decompress"), find_tool("lrat-check")
         if dec is None or lrat is None:
@@ -277,6 +295,21 @@ def main() -> int:
             verdict = "NOT VERIFIED"
         else:
             verdict = None
+    elif fmt == "alethe":
+        # carcara 的 stdout 是 valid / holey / invalid 三者之一，退出码不区分它们。
+        tok = re.search(r"^(valid|holey|invalid)\b", log, re.M)
+        tok = tok.group(1) if tok else None
+        if tok == "holey":
+            # 有洞 = 部分验证：cvc5 对某些理论引理只吐 `:rule hole`，检查器无法核。
+            # 它既不构成通过，也不构成推翻，因此绝不许升格为 exact_certificate。
+            return die_unknown(
+                "carcara 判定 holey：证明含未验证的步骤（洞）。"
+                "这既不通过也不推翻，UNKNOWN 是唯一诚实的结论",
+                args, backend, extra | {"carcara_verdict": "holey"})
+        if tok is None:
+            return die_unknown(f"carcara 未给出可识别判决（rc={rc}）", args, backend, extra)
+        verdict = "VERIFIED" if tok == "valid" else "NOT VERIFIED"
+        parsed_ok = True
     else:
         m = VERDICT_RE.search(log)
         verdict = m.group(1) if m else None

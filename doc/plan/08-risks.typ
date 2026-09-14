@@ -70,6 +70,9 @@
   [`cake_lpr` 用退出码撒谎],
   [它是 CakeML 编译、经形式化验证的 LPR 检查器，信任等级高于 `drat-trim`（后者是未经验证的 C 程序）。但*退出码恒为 0*：空证明、非法提示号、截断证明全都返回 0。判决只在文本里——通过时 stdout 出 `s VERIFIED UNSAT`，拒绝时 stdout 为空、stderr 出 `c Checking failed at line: N. Reason: ...`。若照搬 `drat-trim` 的「读退出码」写法，会把无效证明判成通过],
   [`opl-certcheck` 对 `lpr` 路径不读退出码：有 `s VERIFIED` 判通过，无判决行但有 `c ` 诊断判拒绝，两者皆无判 `UNKNOWN`（绝不猜）。拒绝原因写进证据记录的 `checker_messages`。这类「包装第三方工具时必须逐个确认其判决信道」是通用教训——退出码、stdout、stderr 三者谁说话，每个工具都要实测],
+  [`carcara` 的 `holey` 是个中间判决],
+  [`carcara` 检查 SMT 的 Alethe 证明（cvc5 产出），stdout 只吐一个词：`valid` / `holey` / `invalid`。前两者*都退出 0*，只有 `invalid` 是 1。`holey` 表示证明含未验证的步骤——根源是 cvc5 对某些理论引理只吐 `:rule hole`（实测 QF_LIA 的证明里有 12 处），并非检查器能力不足。若按「exit 0 = 通过」集成，含洞的证明会被升格为 `exact_certificate`],
+  [`holey` 映射到 `UNKNOWN`（退出码 `3`）而*不是*通过：它既不构成通过也不构成推翻，而证据阶梯里没有「部分验证」这一级，所以只能停在无法判定。实测纯命题与 UF 推理（`valid`）与含算术引理的（`holey`）判然有别——想拿到 SMT 侧的 `exact_certificate`，必须限制在 cvc5 不吐洞的理论里],
 )
 
 == 方法论风险
