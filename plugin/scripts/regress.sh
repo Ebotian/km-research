@@ -292,6 +292,32 @@ chk "文件不存在 -> 2"                2 $BIN/opl-leancheck --file "$work/nop
 # 命题有没有被读进去，也跟 Lean 装没装无关：坏的 .lean 不该拖到 300 秒超时才报。
 chk "文件不存在（非 .lean）-> 2"      2 $BIN/opl-leancheck --file "$work/nope.txt"
 
+# ------------------------------------- M3 第三条：Mathlib 里已有的*已知定理*
+# 上面五项验的是判定分支，6a–6g 验的是「我们的链路能承载一个真命题」；这一组验的是
+# 第三件事：Mathlib 够不够得着，以及审计器对**已存在的定理**给出的结论对不对。
+# 这一条必须用 Mathlib（而不是 Init），否则证明不了那条导入路径真的通了——
+# 所以它单独一组，代价是 import Mathlib 约 2.1 秒，且只在 Lean 可用时跑。
+echo "leancheck（Mathlib 已知定理）—— 已知定理 + 公理白名单"
+if [ "$lean_ready" != 1 ]; then
+  skip=$((skip + 2))
+  printf '  skip  %-46s 缺 lake 或 plugin/lean（无定点 toolchain）\n' "已知定理两项"
+else
+  # Euclid 的素数无穷定理。判据是「通过验证」**且**「公理落在白名单内」——
+  # 光看退出码等于没验白名单那半句。
+  chk "已知定理（Mathlib）-> 0" 0 $BIN/opl-leancheck \
+      --file $FIX/lean-mathlib-known.lean --evidence-out "$work/E-known.json"
+  chk "公理集合 ⊆ 白名单（三条全中）" 0 python3 -c "
+import json, sys
+d = json.load(open('$work/E-known.json'))
+got = set(d['axioms']['Nat.exists_infinite_primes'])
+ok = (d['verdict'] == 'proved' and d['verification_level'] == 'lean_checked'
+      and got <= set(d['axiom_whitelist'])
+      and got == {'propext', 'Classical.choice', 'Quot.sound'})
+if not ok:
+    print('  实际：', sorted(got), file=sys.stderr)
+sys.exit(0 if ok else 1)"
+fi
+
 # ------------------------------------------------- 端到端（证明侧）：真命题 -> lean_checked
 # 上面五项验的是判定分支，用的都是 `True := trivial` 这类玩具命题。它们能证明
 # 「分支走对了」，证明不了「这条链路能承载一个真命题」。这一段补后者：一个真命题
