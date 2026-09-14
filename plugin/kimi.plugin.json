@@ -17,7 +17,9 @@
   "license": "AGPL-3.0",
   "skills": [
     "./skills/opl-entry/",
-    "./skills/opl-refute/"
+    "./skills/opl-refute/",
+    "./skills/opl-formalize/",
+    "./skills/opl-prove/"
   ],
   "sessionStart": {
     "skill": "opl-entry"

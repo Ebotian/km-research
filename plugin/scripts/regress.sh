@@ -223,6 +223,16 @@ sys.exit(0 if sk and any(os.path.basename(x) == sk for x in dirs) else 1)"
 chk "未声明 mcpServers（按设计）" 0 python3 -c "
 import json, sys
 sys.exit(0 if 'mcpServers' not in json.load(open('kimi.plugin.json')) else 1)"
+# 反向检查：磁盘上每个技能目录都必须出现在清单里。漏列一个，它就静默不加载——
+# 而正向检查（列出的都存在于磁盘）抓不到这种情况。
+chk "磁盘上的技能目录都已在清单列出" 0 python3 -c "
+import glob, json, os, sys
+listed = {os.path.normpath(x) for x in json.load(open('kimi.plugin.json')).get('skills', [])}
+on_disk = {os.path.normpath(p) for p in glob.glob('./skills/*/')}
+missing = on_disk - listed
+if missing:
+    print('  未列出：', ', '.join(sorted(missing)))
+sys.exit(0 if not missing else 1)"
 for f in skills/*/SKILL.md; do
   chk "frontmatter 有 name/description: $(basename $(dirname $f))" 0 python3 -c "
 import re, sys

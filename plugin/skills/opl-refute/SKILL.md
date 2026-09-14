@@ -8,6 +8,12 @@ description: 当需要为一个猜想寻找反例时；当需要排除某个有�
 这个技能只做一件事——把一个**有限域上的判定问题**走成一条可复核的结论链。
 任何一步的结论都不许跳过独立复核。
 
+```bash
+# 下文用 $OPL 指代插件的 bin 目录。agent 的 cwd 是用户工作区，不是插件目录，
+# 所以 `bin/opl-…` 这种写法会找不到命令——正确写法是 `$OPL/opl-…`。
+OPL="${KIMI_PLUGIN_ROOT:-<插件根>}/bin"
+```
+
 ## 先想清楚：你的猜想能不能写成这个形状
 
 本工具链处理的是**有限域约束规格**：找出一个满足全部约束的赋值。
@@ -42,14 +48,14 @@ description: 当需要为一个猜想寻找反例时；当需要排除某个有�
 ### 1. 登记
 
 ```bash
-bin/opl-conj add --id C-0001 --title "短标题" \
+$OPL/opl-conj add --id C-0001 --title "短标题" \
   --statement "自然语言陈述，含全部前提" --source "<出处 URL 或文献>"
 ```
 
 ### 2. 编码，并让两条独立路径互相证伪
 
 ```bash
-bin/opl-encode --spec lab/C-0001.spec.json --check-consistency
+$OPL/opl-encode --spec lab/C-0001.spec.json --check-consistency
 ```
 
 这一步把规格分别编成手写 CNF 与 CP-SAT 模型，各解一遍。**退出码 `1` 表示两条编码
@@ -61,7 +67,7 @@ bin/opl-encode --spec lab/C-0001.spec.json --check-consistency
 ### 3. 搜索
 
 ```bash
-bin/opl-search --spec lab/C-0001.spec.json \
+$OPL/opl-search --spec lab/C-0001.spec.json \
   --cnf-out lab/runs/C-0001/formula.cnf \
   --witness-out lab/runs/C-0001/witness.json \
   --proof-out lab/runs/C-0001/proof.drat \
@@ -78,7 +84,7 @@ bin/opl-search --spec lab/C-0001.spec.json \
 ### 4a. 复核见证（sat 侧）
 
 ```bash
-bin/opl-encode --spec lab/C-0001.spec.json --eval-witness lab/runs/C-0001/witness.json
+$OPL/opl-encode --spec lab/C-0001.spec.json --eval-witness lab/runs/C-0001/witness.json
 ```
 
 退出码 `0` 才算反例成立。这条路径是**规格的直接求值**，与任何编码器无关——
@@ -87,7 +93,7 @@ bin/opl-encode --spec lab/C-0001.spec.json --eval-witness lab/runs/C-0001/witnes
 ### 4b. 复核证明（unsat 侧）
 
 ```bash
-bin/opl-certcheck --formula lab/runs/C-0001/formula.cnf \
+$OPL/opl-certcheck --formula lab/runs/C-0001/formula.cnf \
   --cert lab/runs/C-0001/proof.drat \
   --evidence-out lab/evidence/C-0001.json
 ```
@@ -98,7 +104,7 @@ bin/opl-certcheck --formula lab/runs/C-0001/formula.cnf \
 ### 5. 定案
 
 ```bash
-bin/opl-conj set C-0001 --formal-status refuted \
+$OPL/opl-conj set C-0001 --formal-status refuted \
   --evidence lab/evidence/C-0001.json --verification-level exact_certificate
 ```
 

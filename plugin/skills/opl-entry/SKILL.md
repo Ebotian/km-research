@@ -5,8 +5,14 @@ description: 会话开始的总纲与路由。当任务涉及攻击一个猜想�
 
 # open-problem-lab 总纲
 
-本插件是一套本地工具链，命令在插件目录的 `bin/` 下（环境变量 `KIMI_PLUGIN_ROOT`
-指向插件根时可写 `"$KIMI_PLUGIN_ROOT/bin/opl-…"`；若它未注入，先定位插件目录）。
+本插件是一套本地工具链。**命令不在工作区里**——agent 的 cwd 是用户工作区，而命令在
+插件目录的 `bin/` 下，所以写 `bin/opl-…` 会 `No such file or directory`。先定位一次：
+
+```bash
+# 下文用 $OPL 指代插件的 bin 目录
+OPL="${KIMI_PLUGIN_ROOT:-<插件根>}/bin"
+```
+
 所有命令共用一套接口约定，先记住它——**判决走退出码，不走文本**：
 
 | 码 | 判决 | 含义 |
@@ -40,16 +46,19 @@ description: 会话开始的总纲与路由。当任务涉及攻击一个猜想�
 
 | 命令 | 一个职责 |
 |---|---|
-| `bin/opl-capabilities` | 探测后端，产出 `capabilities.json`。含 Python 模块探测与解释器分裂检测 |
-| `bin/opl-conj` | 猜想台账。一题一文件；**状态变更必须带 `--evidence`**，否则拒绝写入 |
-| `bin/opl-encode` | 规格 → CNF / CP-SAT；双后端一致性检查；见证直接求值 |
-| `bin/opl-search` | 跑搜索，产出见证或 DRAT 证明 |
-| `bin/opl-certcheck` | 用独立校验器复核证书（drat-trim / lrat-check / cake_lpr / carcara） |
+| `opl-capabilities` | 探测后端，产出 `capabilities.json`。含 Python 模块探测与解释器分裂检测 |
+| `opl-conj` | 猜想台账。一题一文件；**状态变更必须带 `--evidence`**，否则拒绝写入 |
+| `opl-encode` | 规格 → CNF / CP-SAT；双后端一致性检查；见证直接求值 |
+| `opl-search` | 跑搜索，产出见证或 DRAT 证明 |
+| `opl-certcheck` | 用独立校验器复核证书（drat-trim / lrat-check / cake_lpr / carcara） |
+| `opl-leancheck` | 编译 Lean 文件并审计证明状态（公理白名单 + sorry 检测） |
+
+（都在 `$OPL` 下——即插件的 `bin/`。调用时写 `$OPL/opl-…`。）
 
 ## 动手之前先探测一次
 
 ```bash
-bin/opl-capabilities --out lab/capabilities.json
+$OPL/opl-capabilities --out lab/capabilities.json
 ```
 
 它会告诉你哪些后端可用、哪些**存在但坏了**（`decompress` 就是一处已知的上游 bug）、
