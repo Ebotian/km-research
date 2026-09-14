@@ -289,6 +289,66 @@ if [ "$lean_ready" = 1 ]; then
 fi
 # 与 Lean 是否安装无关的一条：文件不存在必须在任何 Lean 检查之前就报 2。
 chk "文件不存在 -> 2"                2 $BIN/opl-leancheck --file "$work/nope.lean"
+# 命题有没有被读进去，也跟 Lean 装没装无关：坏的 .lean 不该拖到 300 秒超时才报。
+chk "文件不存在（非 .lean）-> 2"      2 $BIN/opl-leancheck --file "$work/nope.txt"
+
+# ------------------------------------------------- 端到端（证明侧）：真命题 -> lean_checked
+# 上面五项验的是判定分支，用的都是 `True := trivial` 这类玩具命题。它们能证明
+# 「分支走对了」，证明不了「这条链路能承载一个真命题」。这一段补后者：一个真命题
+# 走完 形式化 → 证明检查 → 独立内核复核 → 台账定案，终态落在 lean_checked。
+#
+# 关于「独立内核复核」：Lean 的出口码不携带我们要的那个区别（sorry 与
+# native_decide 都退出 0），所以这一步不采信「编译通过」，而是向*内核*要公理集合
+# ——`#print axioms` 是对环境里内核级声明属性的查询，与编译是否成功是两回事。
+# 这正是能抓出 sorry / native_decide 的那条信道。
+echo "端到端（证明侧）—— 形式化 → 证明检查 → 独立内核复核 → 台账定案"
+if [ "$lean_ready" != 1 ]; then
+  # 跳过与通过是两件事：这几项*没跑*，必须如实计入 skip。
+  skip=$((skip + 7))
+  printf '  skip  %-46s 缺 lake 或 plugin/lean（无定点 toolchain）\n' "证明侧端到端七项"
+else
+  chk "6a 形式化：真命题就位（且非玩具）" 0 python3 -c "
+import sys
+# 注释里会提到 sorry / native_decide（那是在解释为什么避开它们），所以必须先
+# 去掉注释行再判——否则检查会被自己的说明文字绊倒。
+code = '\n'.join(l for l in open('$FIX/lean-real.lean')
+                 if not l.lstrip().startswith('--'))
+# 是玩具命题（True/trivial）或走了 sorry/native_decide，就不配当「真命题链路」的载体。
+ok = ('theorem oddSum_eq_sq' in code and 'True' not in code
+      and 'trivial' not in code and 'sorry' not in code
+      and 'native_decide' not in code)
+sys.exit(0 if ok else 1)"
+  chk "6b 证明检查 + 产出证据记录"  0 $BIN/opl-leancheck --file $FIX/lean-real.lean \
+      --decl oddSum_eq_sq --evidence-out "$work/e2e/lab/evidence/E-3.json"
+  chk "6c 证据记录判为 lean_checked" 0 python3 -c "
+import json, sys
+d = json.load(open('$work/e2e/lab/evidence/E-3.json'))
+ok = (d['schema'] == 'opl.evidence/1' and d['kind'] == 'lean_audit'
+      and d['verdict'] == 'proved' and d['verification_level'] == 'lean_checked'
+      and d['sorries'] == [] and d['errors'] == []
+      and set(d['axioms']['oddSum_eq_sq']) <= set(d['axiom_whitelist']))
+if not ok:
+    print(json.dumps(d, ensure_ascii=False)[:400], file=sys.stderr)
+sys.exit(0 if ok else 1)"
+  chk "6d 命题的具体实例独立重算"  0 python3 -c "
+import sys
+# 防的是语义错配：形式化写对了、编译也过了，但命题*不是*我们以为的那个。
+# 用另一条完全不同的代码路径（Python 累加）重算 n=100 的具体实例。
+n = 100
+sys.exit(0 if sum(2 * i + 1 for i in range(n)) == n * n else 1)"
+  chk "6e 台账登记该命题"          0 $BIN/opl-conj add --id E-3 \
+      --title "前 n 个奇数之和等于 n²" \
+      --statement "对任意自然数 n，1+3+5+…+(2n-1) = n²" --source $FIX/lean-real.lean
+  chk "6f 台账定案 lean_checked"   0 $BIN/opl-conj set E-3 --formal-status proved \
+      --evidence "$work/e2e/lab/evidence/E-3.json" --verification-level lean_checked
+  chk "6g 终态：proved + 证据指针"  0 python3 -c "
+import json, sys
+f = json.load(open('$work/e2e/lab/conjectures/E-3.json'))
+ok = (f['formal_status'] == 'proved'
+      and f['verification_level'] == 'lean_checked'
+      and any('E-3.json' in str(h.get('evidence', '')) for h in f['history']))
+sys.exit(0 if ok else 1)"
+fi
 
 # ----------------------------------------------------------------
 printf '\n  通过 %d / 失败 %d / 跳过 %d\n' "$pass" "$fail" "$skip"
