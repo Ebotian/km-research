@@ -6,8 +6,9 @@
 三条来自实测的要求：
 
 * **版本探测必须带硬超时。** `~/.elan/settings.toml` 的 `default_toolchain = "stable"`
-  使每次 `lean` / `lake` 调用都要联网解析版本。实测在无 `lean-toolchain` 的目录里
-  耗时 5.0 / 3.0 / 5.0 秒（两次撞上 5 秒预算），在定点 toolchain 的目录里是 0.02 秒。
+  使每次 `lean` / `lake` 调用都要联网解析版本。实测在无 `lean-toolchain` 的目录里，
+  同一命令两轮分别是 5.0 / 3.0 / 5.0 秒与 12.0 / 3.0 / 9.9 秒（后者有一次撞上 12 秒
+  上限），在定点 toolchain 的目录里是 0.02 秒。
   超时只能标为「暂不可用」，**不得**缓存成「不存在」——一次网络抖动不该让某一层
   被永久降级。
 * **存在性不等于可用。** `decompress` 是「存在但坏了」：上游 `read_lit` 内有一句
@@ -178,7 +179,7 @@ def probe_lean_project(timeout: float = 30.0) -> dict[str, Any]:
     else:
         info["pinned"] = False
         info["note"] = ("无 lean-toolchain：elan 每次调用都要联网解析 stable，"
-                        "实测 5.0 / 3.0 / 5.0 秒，定点后 0.021 秒")
+                        "实测每次数秒且随机（最坏一次 12 秒），定点后 0.02 秒")
 
     lake = find_tool("lake")
     if lake is None:

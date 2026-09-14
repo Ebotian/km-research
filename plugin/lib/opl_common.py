@@ -102,7 +102,8 @@ def probe_version(tool: str, args=("--version",), timeout: float = 5.0) -> dict:
     """探测工具并取其版本。
 
     超时是硬要求：本机 elan 的 default_toolchain = "stable" 使每次调用都要联网
-    解析版本；无 lean-toolchain 的目录里实测 5.0 / 3.0 / 5.0 秒。这里把超时当作
+    解析版本；无 lean-toolchain 的目录里实测每次数秒且随机（两轮：5.0 / 3.0 / 5.0
+    秒与 12.0 / 3.0 / 9.9 秒）。这里把超时当作
     「暂不可用」处理并记录 probe_timeout——注意不要把它缓存成「不存在」，
     一次网络抖动不该让某一层被永久降级。
     """
@@ -131,8 +132,7 @@ def run(cmd: list[str], timeout: float | None = None, stdin: bytes | None = None
     """执行子进程，返回 (returncode, stdout, stderr)。超时返回 rc=None。
 
     `cwd` 是必需能力而非便利：Lean 必须在定点了 `lean-toolchain` 的目录里执行，
-    否则 elan 每次调用都要联网解析 `stable`（实测 5.0 / 3.0 / 5.0 秒，
-    定点后 0.021 秒）。
+    否则 elan 每次调用都要联网解析 `stable`（实测每次数秒且随机，定点后 0.02 秒）。
     """
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=timeout, input=stdin,
