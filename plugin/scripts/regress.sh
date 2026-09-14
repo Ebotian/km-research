@@ -27,6 +27,8 @@ trap 'rm -rf "$work"' EXIT
 
 pass=0
 fail=0
+# 跳过与通过是两件事：缺 Lean 项目时那几项*没跑*，不该显得像通过。
+skip=0
 
 chk() {
   local name=$1 want=$2
@@ -230,7 +232,32 @@ fm = m.group(1) if m else ''
 sys.exit(0 if 'name:' in fm and 'description:' in fm else 1)"
 done
 
+# ---------------------------------------------------------------- Lean 内核审计
+# 这些检查需要 Lean 与一个*定点 toolchain* 的项目（plugin/lean 软链）。仓库里
+# 不含那个项目（它指向本机的外部目录），所以缺它时**跳过并如实报出跳过数**，
+# 而不是把它们当作通过——跳过与通过是两件事。
+echo "leancheck —— Lean 内核审计（依赖 plugin/lean 项目）"
+lean_ready=0
+if command -v lake >/dev/null 2>&1 && [ -f "$plugin/lean/lean-toolchain" ]; then
+  lean_ready=1
+else
+  skip=$((skip + 5))
+  printf '  skip  %-46s 缺 lake 或 plugin/lean（无定点 toolchain）\n' "Lean 审计五项"
+fi
+if [ "$lean_ready" = 1 ]; then
+  chk "无公理证明 -> 0（PROVED）"      0 $BIN/opl-leancheck --file $FIX/lean-ok.lean --decl opl_ok
+  chk "含 sorry -> 1（SORRY_AX）"      1 $BIN/opl-leancheck --file $FIX/lean-sorry.lean --decl opl_sorry
+  chk "native_decide -> 1（未证明）"   1 $BIN/opl-leancheck --file $FIX/lean-native.lean --decl opl_native
+  chk "编译错误 -> 1（FAILED）"        1 $BIN/opl-leancheck --file $FIX/lean-bad.lean
+  # 这条也要 Lean 已安装才有意义：没有 lake 时先报 MISSING(4) 才对
+  # ——Lean 都没装，「项目未定点」无从谈起。
+  chk "toolchain 未定点 -> 2（拒绝运行）" 2 $BIN/opl-leancheck --file $FIX/lean-ok.lean \
+      --decl opl_ok --project "$work"
+fi
+# 与 Lean 是否安装无关的一条：文件不存在必须在任何 Lean 检查之前就报 2。
+chk "文件不存在 -> 2"                2 $BIN/opl-leancheck --file "$work/nope.lean"
+
 # ----------------------------------------------------------------
-printf '\n  通过 %d / 失败 %d\n' "$pass" "$fail"
+printf '\n  通过 %d / 失败 %d / 跳过 %d\n' "$pass" "$fail" "$skip"
 [ "$fail" -gt 0 ] && exit 1
 exit 0

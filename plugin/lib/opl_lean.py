@@ -129,11 +129,12 @@ def audit(lean_file: str, *, project: str | None = None,
     if not os.path.isfile(lean_file):
         raise LeanError(f"Lean 文件不存在：{lean_file}")
 
-    proj, toolchain = resolve_project(project)
+    # 先看 Lean 装了没有。「系统里没有 lake」报 MISSING(4) 比报「项目未定点」准确
+    # ——后者会让人去翻项目目录，而问题其实在系统侧。两个都错时才无所谓顺序。
     lake = find_tool("lake")
     if lake is None:
         raise LeanError("找不到 lake（Lean 工具链未安装？）")
-
+    proj, toolchain = resolve_project(project)
     target = os.path.abspath(lean_file)
     tmp = None
     if decls:
@@ -188,10 +189,18 @@ def _parse_jsonl(text: str, res: LeanAudit) -> None:
             pos = msg.get("pos") or {}
             res.errors.append(f"line {pos.get('line', '?')}: {data[0] if data else '?'}")
 
-        m = _AXIOM_RE.search(msg.get("data") or "")
+        data = msg.get("data") or ""
+        m = _AXIOM_RE.search(data)
         if m:
             names = [a.strip() for a in m.group("axioms").split(",") if a.strip()]
             res.axioms[m.group("decl")] = names
+        else:
+            # Lean 对*无公理*的证明打印的是「does not depend on any axioms」，
+            # 而不是「depends on axioms: []」。漏掉这条措辞会把一个干净的已证明
+            # 文件判成「无法判定」——这是实测踩出来的。
+            m2 = re.search(r"'(?P<decl>[^']+)' does not depend on any axioms", data)
+            if m2:
+                res.axioms[m2.group("decl")] = []
 
 
 def _decide(res: LeanAudit) -> str:

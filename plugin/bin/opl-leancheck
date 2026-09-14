@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""opl-leancheck —— 编译 Lean 文件并审计其证明状态。薄壳：逻辑在 lib/opl_lean.py。
+
+一个职责：回答「这份 Lean 文件构成一个证明吗」。它不搜索证明（那是人做的），
+也不形式化（那是 opl-formalize 技能的事）。
+
+用法：
+    opl-leancheck --file F.lean [--decl NAME]... [--project DIR]
+                  [--timeout S] [--evidence-out P] [--json]
+
+`--decl NAME` 会在**临时副本**里追加 `#print axioms NAME`（原文件不动），
+从而拿到该定理依赖的公理集合。不给 --decl 且文件里也没有 `#print axioms` 时，
+文件级信息仍可用，但无法判定证明状态——工具会如实说明而不是猜。
+
+退出码：
+    0  PROVED            内核接受，且公理集合落在白名单内
+    1  SORRY_AX / UNPROVED_AXIOMS / FAILED
+                         「这份文件构成一个证明」被推翻。含 sorry、依赖白名单外
+                         公理（如 native_decide 生成的）、或编译不过，都属此列
+    2  USAGE             参数错误、文件不存在、或 toolchain 未定点（拒绝运行）
+    3  UNKNOWN           超时：本次没有结论。*不要*据此认为 Lean 不可用
+    4  MISSING           找不到 lake（Lean 工具链未安装）
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+
+from opl_common import (PASS, REJECT, UNKNOWN, MISSING, USAGE,  # noqa: E402
+                        c, out_json, s)
+from opl_lean import (AXIOM_WHITELIST, FAILED, PROVED, SORRY_AX, UNPROVED_AXIOMS,  # noqa: E402
+                      LeanError, ToolchainUnpinned, audit, describe)
+
+VERDICT_LINE = {
+    PROVED: "PROVED",
+    SORRY_AX: "SORRY_AX",
+    UNPROVED_AXIOMS: "UNPROVED_AXIOMS",
+    FAILED: "FAILED",
+}
+
+
+def sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--file", required=True, help="要审计的 .lean 文件")
+    ap.add_argument("--decl", action="append", default=[],
+                    help="要审计的定理名，可重复。会在临时副本里追加 #print axioms")
+    ap.add_argument("--project", help="Lean 项目目录（默认 $OPL_LEAN_PROJECT 或 <plugin>/lean）")
+    ap.add_argument("--timeout", type=float, default=300.0)
+    ap.add_argument("--evidence-out", help="把证据记录写到该路径（供 opl-conj --evidence 引用）")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    if not os.path.isfile(args.file):
+        c(f"文件不存在：{args.file}")
+        return USAGE
+    if args.file.endswith(".lean") is False:
+        c(f"注意：{args.file} 不以 .lean 结尾，仍按 Lean 源文件处理")
+
+    t0 = time.monotonic()
+    try:
+        res = audit(args.file, project=args.project, decls=args.decl or None,
+                    timeout=args.timeout)
+    except ToolchainUnpinned as exc:
+        # 拒绝运行而非触发联网下载。这是可修的环境问题，不是后端缺失——
+        # 报 USAGE 让调用方去修目录，而不是报 MISSING 说 Lean 不在。
+        c(str(exc))
+        s("UNPINNED", "no lean-toolchain")
+        return USAGE
+    except LeanError as exc:
+        msg = str(exc)
+        c(msg)
+        if "找不到 lake" in msg:
+            s("MISSING", "lake")
+            return MISSING
+        return USAGE
+    res.elapsed_ms = int((time.monotonic() - t0) * 1000)
+
+    for note in res.notes:
+        c(f"注意：{note}")
+    c(f"项目 {res.project}  toolchain {res.toolchain}  退出码 {res.exit_code}  {res.elapsed_ms}ms")
+
+    record = {
+        "schema": "opl.evidence/1",
+        "kind": "lean_audit",
+        "file": os.path.abspath(args.file),
+        "file_sha256": sha256(args.file),
+        "decls": args.decl,
+        "toolchain": res.toolchain,
+        "project": res.project,
+        "verdict": res.verdict,
+        "axiom_whitelist": sorted(AXIOM_WHITELIST),
+        "axioms": res.axioms,
+        "offending": res.offending,
+        "sorries": res.sorries,
+        "errors": res.errors,
+        "elapsed_ms": res.elapsed_ms,
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+    if res.timed_out:
+        # 超时不是判决。报 UNKNOWN，且明确标注「暂不可用」而非「不存在」。
+        record |= {"verdict": "UNKNOWN", "reason": "timeout",
+                   "verification_level": "none"}
+        if args.evidence_out:
+            out_json(record, args.evidence_out)
+        if args.json:
+            out_json(record)
+        s("UNKNOWN", f"超时（{args.timeout}s）。这是暂不可用，不是 Lean 不可用")
+        return UNKNOWN
+
+    if res.verdict == PROVED:
+        record["verification_level"] = "lean_checked"
+    else:
+        record["verification_level"] = "none"
+
+    if args.evidence_out:
+        out_json(record, args.evidence_out)
+
+    if args.json:
+        out_json(record)
+    line = VERDICT_LINE.get(res.verdict, res.verdict.upper())
+    if res.verdict == PROVED:
+        s(line, describe(res))
+        return PASS
+    s(line, describe(res))
+    return REJECT
+
+
+if __name__ == "__main__":
+    sys.exit(main())
