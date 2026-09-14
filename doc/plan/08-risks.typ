@@ -67,6 +67,9 @@
   [`drat-trim` 覆盖面窄],
   [只验命题逻辑 CNF 上的 UNSAT。Z3/cvc5 在整数算术上给的 `unsat` 没有 DRAT 后端，区间算术与 Lean 也都另走各路],
   [把 SAT 层的 DRAT 定位为*可选的子集后端*，不是「证据分级的第三档」。UNSAT 结论若无法下推到 CNF，就停在 `empirical`，不得宣称 `exact_certificate`],
+  [`cake_lpr` 用退出码撒谎],
+  [它是 CakeML 编译、经形式化验证的 LPR 检查器，信任等级高于 `drat-trim`（后者是未经验证的 C 程序）。但*退出码恒为 0*：空证明、非法提示号、截断证明全都返回 0。判决只在文本里——通过时 stdout 出 `s VERIFIED UNSAT`，拒绝时 stdout 为空、stderr 出 `c Checking failed at line: N. Reason: ...`。若照搬 `drat-trim` 的「读退出码」写法，会把无效证明判成通过],
+  [`opl-certcheck` 对 `lpr` 路径不读退出码：有 `s VERIFIED` 判通过，无判决行但有 `c ` 诊断判拒绝，两者皆无判 `UNKNOWN`（绝不猜）。拒绝原因写进证据记录的 `checker_messages`。这类「包装第三方工具时必须逐个确认其判决信道」是通用教训——退出码、stdout、stderr 三者谁说话，每个工具都要实测],
 )
 
 == 方法论风险

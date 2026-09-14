@@ -120,13 +120,34 @@ def last_line_checked(log: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def checker_messages(log: str, max_lines: int = 20, max_chars: int = 2000) -> list[str] | None:
+    """摘录检查器的诊断行，供证据记录留证。
+
+    只取 `c ` / `s ` 开头的行——那是 SAT 竞赛系的约定，drat-trim、lrat-check、
+    cake_lpr 都遵守。截断到固定行数与字符数，避免把整份日志塞进记录。
+    拒绝情形尤其需要它：「哪一行、什么原因」是事后审计唯一能回答
+    「为什么这份证书不算」的东西，而各检查器的措辞并不统一。
+    """
+    picked: list[str] = []
+    total = 0
+    for line in log.splitlines():
+        line = line.strip()
+        if not (line.startswith("c ") or line.startswith("s ")):
+            continue
+        picked.append(line)
+        total += len(line)
+        if len(picked) >= max_lines or total >= max_chars:
+            break
+    return picked or None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("formula_pos", nargs="?")
     ap.add_argument("cert_pos", nargs="?")
     ap.add_argument("--formula")
     ap.add_argument("--cert")
-    ap.add_argument("--format", default="auto", choices=["auto", "drat", "lrat", "clrat"])
+    ap.add_argument("--format", default="auto", choices=["auto", "drat", "lrat", "clrat", "lpr"])
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--evidence-out")
@@ -151,7 +172,12 @@ def main() -> int:
 
     fmt, why = args.format, "由 --format 指定"
     if fmt == "auto":
-        fmt, why = sniff(unpacked)
+        # 先看扩展名：`.lpr` 与 LRAT 的行语法相同，sniff 分辨不出来，而两者
+        # 该走不同的检查器——`.lpr` 交给经形式化验证的 cake_lpr。
+        if cert.endswith(".lpr"):
+            fmt, why = "lpr", "扩展名为 .lpr"
+        else:
+            fmt, why = sniff(unpacked)
     if fmt == "unknown":
         return die_unknown(f"无法识别证书格式：{why}", args)
     c(f"格式判定：{fmt}（{why}）")
@@ -187,6 +213,26 @@ def main() -> int:
         extra["last_line_checked"] = last
         parsed_ok = (last > 0) if last is not None else None
 
+    elif fmt == "lpr":
+        # cake_lpr 是 CakeML 编译出的、经形式化验证的 LPR 检查器，信任等级高于
+        # drat-trim（后者是未经验证的 C 程序）。但它有一个必须处理的怪癖：
+        # *退出码恒为 0*。空证明、非法提示号、截断证明全都返回 0，判决只在文本里：
+        #   通过 -> stdout `s VERIFIED UNSAT`
+        #   拒绝 -> stdout 空，stderr 出 `c Checking failed at line: N. Reason: ...`
+        # 所以这里不读退出码，只取输出，判决交给下方的 lpr 分支去判。
+        exe = find_tool("cake_lpr")
+        if exe is None:
+            return die_missing("cake_lpr", args)
+        backend = "cake_lpr"
+        rc, log, _ = check(exe, [formula, unpacked], args.timeout)
+        if rc is None:
+            return die_unknown("cake_lpr 超时", args, backend, extra)
+        if rc != 0:
+            # 非 0 只可能是进程级异常（崩溃），不是「证明无效」。
+            return die_unknown(f"cake_lpr 异常退出（rc={rc}）", args, backend, extra)
+        # cake_lpr 不提供「是否读完整份证明」的自述，故不推断完整性。
+        parsed_ok = None
+
     elif fmt == "clrat":
         dec, lrat = find_tool("decompress"), find_tool("lrat-check")
         if dec is None or lrat is None:
@@ -220,8 +266,20 @@ def main() -> int:
             if line.strip():
                 c(line)
 
-    m = VERDICT_RE.search(log)
-    verdict = m.group(1) if m else None
+    if fmt == "lpr":
+        # cake_lpr 的退出码没有说话能力，判决只能从文本读：
+        #   有 `s VERIFIED …`         -> 通过
+        #   无判决行但有 `c ` 诊断    -> 被显式拒绝（诊断里带行号与原因）
+        #   两者都没有                -> 无法判定，绝不猜
+        if re.search(r"^s VERIFIED\b", log, re.M):
+            verdict = "VERIFIED"
+        elif re.search(r"^c \S", log, re.M):
+            verdict = "NOT VERIFIED"
+        else:
+            verdict = None
+    else:
+        m = VERDICT_RE.search(log)
+        verdict = m.group(1) if m else None
 
     record = {
         "schema": "opl.evidence/1",
@@ -235,6 +293,9 @@ def main() -> int:
         "parse_complete": parsed_ok,
         "duration_ms": duration_ms,
         "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        # 检查器的诊断摘录。拒绝情形必须留证：「哪一行、什么原因」是事后审计
+        # 唯一能回答「为什么这份证书不算」的东西，而各检查器的措辞并不统一。
+        "checker_messages": checker_messages(log),
         **extra,
     }
 
