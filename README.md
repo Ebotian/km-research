@@ -1,4 +1,4 @@
-# kimi-research
+# km-research
 
 为 [Kimi Code](https://moonshotai.github.io/kimi-code/) 制作的开放问题研究插件，代号 **open-problem-lab**。
 

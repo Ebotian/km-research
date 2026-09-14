@@ -3,7 +3,7 @@
 #show: opl-conf.with(
   title: [open-problem-lab],
   subtitle: [本地 Kimi Code 插件设计方案 —— 开放问题算法研究],
-  authors: ((name: "EBT", affiliation: "本地工作区 kimi-research"),),
+  authors: ((name: "EBT", affiliation: "本地工作区 km-research"),),
   date: [2026-09-14],
   version: [草案 v0.1 ｜ 待评审],
   abstract: [
