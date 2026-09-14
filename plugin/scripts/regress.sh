@@ -111,6 +111,43 @@ chk "list 无匹配"            5 $BIN/opl-conj list --status proved
 # ---------------------------------------------------------------- 能力探测
 echo "capabilities —— 必需层"
 chk "必需层齐全"             0 $BIN/opl-capabilities --layer required --quiet
+# 判据 2 的后半句：探测超时只能标「暂不可用」，**不得**缓存成「不存在」。
+# 这两件事在结果里必须分得开——`not_found` 是事实，`probe_timeout` 是「这次没问出来」。
+# 假工具用 PATH 注入，不碰系统里任何真后端。
+chk "超时标 timeout 而不冒充「不存在」" 0 python3 -c "
+import os, stat, sys, tempfile, time
+sys.path.insert(0, '$plugin/lib')
+from opl_probe import probe_executable
+
+d = tempfile.mkdtemp()
+slow = os.path.join(d, 'opl-slowtool')
+with open(slow, 'w') as fh:
+    fh.write('#!/bin/sh\nsleep 30\n')
+os.chmod(slow, 0o755)
+os.environ['PATH'] = d + os.pathsep + os.environ['PATH']
+
+t0 = time.monotonic()
+r1 = probe_executable('opl-slowtool', '--version', 0.4)
+t1 = time.monotonic()
+r2 = probe_executable('opl-slowtool', '--version', 0.4)   # 再探一次
+t2 = time.monotonic()
+missing = probe_executable('opl-definitely-not-here', '--version', 0.4)
+
+why = []
+# 1 硬超时生效：不能挂到 30 秒
+if t1 - t0 > 3 or t2 - t1 > 3:
+    why.append('没被硬超时截断：%.1fs / %.1fs' % (t1 - t0, t2 - t1))
+# 2 超时与不存在必须标成两回事
+if r1.get('error') != 'probe_timeout':
+    why.append('超时被标成 %r' % (r1.get('error'),))
+if missing.get('error') != 'not_found':
+    why.append('不存在被标成 %r' % (missing.get('error'),))
+# 3 不缓存：第二次仍去探（仍是 timeout），而不是记成「不存在」
+if r2.get('error') != 'probe_timeout':
+    why.append('第二次探测结果变了：%r —— 超时被缓存成了结论' % (r2.get('error'),))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
 
 # ---------------------------------------------------------------- 编码
 echo "encode —— 规格到模型，双后端互相证伪"
