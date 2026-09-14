@@ -150,13 +150,21 @@ class MissingBackend(Exception):
 
 
 def interpreter_candidates() -> list[str]:
-    """可能带着求解器的解释器，按优先级排列。"""
+    """可能带着求解器的解释器，按优先级排列。
+
+    `OPL_VENV` 是*覆盖*而不是追加：显式设定它就意味着「只从这里找」。
+    （早先是追加语义，结果设了 `OPL_VENV=/nonexistent` 仍会退到硬编码的默认
+    路径，导致「缺后端」这条验收根本测不出来。）
+    """
     cands: list[str] = []
     if os.environ.get("OPL_PYTHON"):
         cands.append(os.environ["OPL_PYTHON"])
-    for base in (b for b in (os.environ.get("OPL_VENV"),
-                             "~/.local/share/open-problem-lab/venv") if b):
-        cands.append(os.path.join(os.path.expanduser(base), "bin", "python"))
+    if os.environ.get("OPL_VENV"):
+        cands.append(os.path.join(os.path.expanduser(os.environ["OPL_VENV"]),
+                                  "bin", "python"))
+    else:
+        cands.append(os.path.join(
+            os.path.expanduser("~/.local/share/open-problem-lab/venv"), "bin", "python"))
     sys_py = find_tool("python3")
     if sys_py:
         cands.append(sys_py)

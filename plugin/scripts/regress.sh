@@ -114,15 +114,51 @@ chk "编码代价超限（拒绝而非静默）" 2 $BIN/opl-encode --spec $FIX/s
 mkdir -p "$work/probe/bin"
 cp -r "$plugin/lib" "$work/probe/lib"
 cp "$BIN/opl-encode" "$work/probe/bin/"
-python3 - "$work/probe/lib/opl_encode.py" <<'PY'
+python3 - "$work/probe/lib/opl_encode.py" <<'PY' || exit 1
 import sys
 p = sys.argv[1]
 s = open(p).read()
 old = "    for combo in itertools.product(*assigns):"
 assert old in s, "注入锚点没找到"
-open(p, "w").write(s.replace(old, "    return  # ← 注入：不生成任何 linear 禁止子句\n" + old, 1))
+# 这里可以*前置*，因为注入的是 `return`——它在循环之前就退出，不会被覆盖。
+# 若是赋值就必须替换，否则会被下一行覆盖成空操作（在 search 的注入上踩过）。
+open(p, "w").write(s.replace(
+    old, "    return  # ← 注入：不生成任何 linear 禁止子句\n" + old, 1))
 PY
 chk "编坏 CNF 侧后能检出不一致" 1 "$work/probe/bin/opl-encode" --spec $FIX/spec-pc43.json --check-consistency
+
+# ---------------------------------------------------------------- 搜索与证书链
+echo "search —— 搜索的退出码与证书链"
+chk "SAT -> 0（见证经规格复核）"  0 $BIN/opl-search --spec $FIX/spec-pc23.json \
+    --cnf-out "$work/sat.cnf" --witness-out "$work/sat.witness.json"
+chk "见证可被独立复核"            0 $BIN/opl-encode --spec $FIX/spec-pc23.json \
+    --eval-witness "$work/sat.witness.json"
+chk "UNSAT -> 0（带 DRAT 证明）"  0 $BIN/opl-search --spec $FIX/spec-pc43.json \
+    --cnf-out "$work/unsat.cnf" --proof-out "$work/unsat.drat"
+chk "证明可被独立复核（证书链）"   0 $BIN/opl-certcheck --formula "$work/unsat.cnf" --cert "$work/unsat.drat"
+chk "必然超时 -> 3（不是 1）"      3 $BIN/opl-search --spec $FIX/spec-pc43.json \
+    --timeout 0.001 --proof-out "$work/never.drat"
+chk "超时后未产出证明"             0 test ! -e "$work/never.drat"
+chk "缺后端 -> 4"                4 env OPL_VENV=/nonexistent OPL_PYTHON=/bin/false \
+    PATH=/usr/bin:/bin $BIN/opl-search --spec $FIX/spec-pc23.json
+
+# 反解码故障注入：让 decode 返回错值，见证就不该通过——必须报 1 而不是成功。
+# 在临时副本上做，真实代码树全程不被碰。
+mkdir -p "$work/probe2/bin"
+cp -r "$plugin/lib" "$work/probe2/lib"
+cp "$BIN/opl-search" "$work/probe2/bin/"
+python3 - "$work/probe2/lib/opl_encode.py" <<'PY' || exit 1
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "        truth = {lit for lit in model if lit > 0}"
+assert old in s, "注入锚点没找到"
+# 必须*替换*而不是前置：前置的赋值会被紧随其后的原赋值覆盖，注入就成空操作。
+# （这里踩过一次——注入没生效，测试却静默通过报 0。）
+open(p, "w").write(s.replace(
+    old, "        truth = set()  # ← 注入：反解码故意返回空", 1))
+PY
+chk "反解码出错时报 1（不伪报成功）" 1 "$work/probe2/bin/opl-search" --spec $FIX/spec-pc23.json
 
 # ----------------------------------------------------------------
 printf '\n  通过 %d / 失败 %d\n' "$pass" "$fail"

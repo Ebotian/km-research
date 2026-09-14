@@ -208,6 +208,40 @@ def solve_cnf(cnf: Cnf, *, backend: str = "glucose42") -> tuple[str, list[int] |
         return "sat", model
 
 
+def solve_cnf_proof(cnf: Cnf, *, backend: str = "glucose42"
+                    ) -> tuple[str, list[int] | None, list[str] | None]:
+    """跑 SAT，并在不可满足时取出 DRAT 证明。
+
+    返回 (sat|unsat|unknown, model, proof_lines)。证明只在这一条路径上产出，
+    因为它要求求解器开着 proof logging——那会显著变慢，不是每次搜索都需要。
+
+    取证明与取模型共用同一个求解器实例：分两次跑可能得到不同的证明，
+    而证书必须对应我们实际拿到的那个结论。
+    """
+    ps = _optional("pysat.solvers")
+    cls = _resolve_solver(ps, backend)
+    if cls is None:
+        available = ", ".join(sorted(a for a in dir(ps) if a[0].isupper()))
+        raise SolverMissing(f"PySAT 里没有求解器 {backend!r}；可用：{available}")
+
+    solver = cls(bootstrap_with=cnf.clauses, with_proof=True)
+    try:
+        ok = solver.solve()
+        if ok:
+            model = solver.get_model()
+            return ("sat", model, None) if model is not None else ("unknown", None, None)
+        try:
+            proof = solver.get_proof()
+        except NotImplementedError as exc:
+            raise SolverMissing(
+                f"求解器 {backend} 不支持 proof logging：{exc}。"
+                f"已知支持且实测可被 drat-trim 复核的是 Glucose42 与 Lingeling；"
+                f"Kissat404 与 Minisat22 不支持。") from exc
+        return "unsat", None, list(proof or [])
+    finally:
+        solver.delete()
+
+
 def build_cpsat(spec: Spec) -> tuple[Any, dict[str, Any]]:
     """用 ortools CP-SAT 独立建一遍模型。返回 (model, cpvars)。
 

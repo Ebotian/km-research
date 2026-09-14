@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""opl-search —— 在规格上搜索，产出见证或证明。薄壳：逻辑在 lib/opl_search.py。
+
+一个职责：跑搜索并自检，然后把结果落成文件交下游。它不编码（那是 opl-encode
+的能力，经 lib/），也不复核证书（那是 opl-certcheck）。
+
+用法：
+    opl-search --spec S.json [--backend sat|cpsat] [--cnf-out F.cnf]
+               [--witness-out W.json] [--proof-out P.drat] [--timeout S]
+
+退出码：0 sat（见证经规格直接求值复核）或 unsat（附证明）/
+        1 sat 但见证不满足规格（编码或反解码错误）/ 3 unknown（超时或求解器说
+        unknown，附 reason）/ 4 缺求解器库 / 2 用法或规格错误。
+
+典型串法（五步里的后三步）：
+    opl-encode --spec S --to cnf --out F.cnf --check-consistency
+    opl-search --spec S --cnf-out F.cnf --proof-out P.drat
+    opl-certcheck --formula F.cnf --cert P.drat --evidence-out E.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+
+from opl_common import (PASS, REJECT, UNKNOWN, MISSING, USAGE,  # noqa: E402
+                        MissingBackend, c, ensure_modules, out_json, s)
+from opl_spec import Spec, SpecError  # noqa: E402
+from opl_encode import EncodeError, SolverMissing  # noqa: E402
+from opl_search import search  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--spec", required=True)
+    ap.add_argument("--backend", choices=["sat", "cpsat"], default="sat")
+    ap.add_argument("--sat-backend", default="glucose42",
+                    help="PySAT 求解器名（默认 glucose42：它能出可复核的 DRAT）")
+    ap.add_argument("--cnf-out", help="把 CNF 写到该路径（供 opl-certcheck 复核证明）")
+    ap.add_argument("--witness-out", help="sat 时把见证写到该路径")
+    ap.add_argument("--proof-out", help="unsat 时把 DRAT 证明写到该路径")
+    ap.add_argument("--timeout", type=float, default=None,
+                    help="墙钟超时秒数；超时返回 3 而不是 1")
+    ap.add_argument("--no-proof", action="store_true", help="不要证明（更快）")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    need = ["pysat"] if args.backend == "sat" else ["ortools"]
+    try:
+        ensure_modules(need)
+    except MissingBackend as exc:
+        c(str(exc))
+        s("MISSING", ",".join(need))
+        return MISSING
+
+    try:
+        spec = Spec.load(args.spec)
+    except SpecError as exc:
+        c(str(exc))
+        return USAGE
+    c(f"规格 {spec.name}：{len(spec.variables)} 变量 {len(spec.constraints)} 约束，"
+      f"搜索空间 {spec.search_space}")
+
+    try:
+        res = search(spec, backend=args.backend, sat_backend=args.sat_backend,
+                     timeout_s=args.timeout, want_proof=not args.no_proof)
+    except (EncodeError,) as exc:
+        c(str(exc))
+        return USAGE
+    except (SolverMissing, MissingBackend) as exc:
+        c(str(exc))
+        s("MISSING", ",".join(need))
+        return MISSING
+
+    for note in res.notes:
+        c(f"注意：{note}")
+    c(f"后端 {res.backend}，{res.elapsed_ms}ms，"
+      f"{res.nvars} 变量 {res.nclauses} 子句 -> {res.verdict}")
+
+    if args.cnf_out:
+        try:
+            import opl_encode
+            cnf = opl_encode.to_cnf(spec)
+        except EncodeError as exc:
+            c(str(exc))
+            return USAGE
+        os.makedirs(os.path.dirname(os.path.abspath(args.cnf_out)) or ".", exist_ok=True)
+        with open(args.cnf_out, "w", encoding="utf-8") as fh:
+            fh.write(cnf.to_dimacs())
+        c(f"wrote {args.cnf_out}")
+
+    report = {"spec": spec.name, "backend": res.backend, "verdict": res.verdict,
+              "elapsed_ms": res.elapsed_ms, "witness_ok": res.witness_ok,
+              "proof_lines": len(res.proof), "notes": res.notes}
+
+    if res.verdict == "sat":
+        if res.assignment is None:
+            c("判 sat 却没有赋值")
+            s("UNKNOWN", "sat without model")
+            return UNKNOWN
+        if res.witness_ok is False:
+            # 求解器说 sat，但它的赋值不满足规格 —— 编码或反解码有错。
+            # 这既不是通过也不是「无解」，必须报成推翻，绝不能当成成功。
+            c(f"见证不满足规格：{res.witness_reason}")
+            c("求解器判 sat 而见证不成立，说明编码或反解码有错。")
+            report |= {"reason": res.witness_reason}
+            if args.json:
+                out_json(report)
+            s("WITNESS_INVALID", res.witness_reason or "")
+            return REJECT
+        if args.witness_out:
+            os.makedirs(os.path.dirname(os.path.abspath(args.witness_out)) or ".", exist_ok=True)
+            with open(args.witness_out, "w", encoding="utf-8") as fh:
+                json.dump(res.assignment, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                fh.write("\n")
+            c(f"wrote {args.witness_out}")
+        report["witness"] = res.assignment
+        if args.json:
+            out_json(report)
+        s("SAT", f"见证经规格直接求值复核通过（{len(res.assignment)} 个变量）")
+        return PASS
+
+    if res.verdict == "unsat":
+        if args.proof_out and res.proof:
+            os.makedirs(os.path.dirname(os.path.abspath(args.proof_out)) or ".", exist_ok=True)
+            with open(args.proof_out, "w", encoding="utf-8") as fh:
+                fh.write("".join(line + "\n" for line in res.proof))
+            c(f"wrote {args.proof_out}（{len(res.proof)} 行）")
+        if args.proof_out and not res.proof:
+            c("没有证明可写：本次结论无法升到 exact_certificate，"
+              "在 opl-certcheck 那里会被判为无法复核。")
+        if args.json:
+            out_json(report)
+        s("UNSAT", f"{len(res.proof)} 行证明" if res.proof else "无证明")
+        return PASS
+
+    # unknown：超时或求解器拒绝判定。绝不能折叠成「无反例」。
+    if args.json:
+        out_json(report)
+    s("UNKNOWN", res.reason or "求解器未给出判定")
+    return UNKNOWN
+
+
+if __name__ == "__main__":
+    sys.exit(main())
