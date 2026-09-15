@@ -413,10 +413,61 @@ def _parse_range(spec: str) -> tuple[int, int]:
     return lo, hi
 
 
-def validate_record(rec: Conjecture, *, evidence_path: str | None = None) -> list[str]:
+def _check_counterexamples(rec: Conjecture, why: list[str]) -> None:
+    """反例的复核章：**独立于主结论**，而且必须当场还能立得住。
+
+    第四轮审阅 F1 抓到的就是「独立」与「当场」这两件事都没做到：
+
+    * `validate_record` 在主结论不声称事实（`open`）时**提前返回**，于是反例的约束
+      在那种记录上根本不执行——约束跟着主结论的取值走，本身就是个缺口；
+    * 只要证据读得出来、种类是 `witness_eval`、见证名一样就盖章，**不看判决、不看对象**。
+      实测两种假复核：一份 `verdict: NOT VERIFIED` 的见证（全零赋值违反规格）拿到
+      `independent`；一份 `subject: OTHER` 的有效证据也能给本猜想盖章。
+    * 记录里只剩一个摘要（`evidence_sha256`），**不重读证据**。凭空写一个哈希就能
+      让章看起来有出处；而真正的办法是让它**每次写入都重新核一遍**——章的价值就在于
+      事后还能复查，不能被复查的章只是字符串。
+    """
+    for c in rec.get("counterexamples") or []:
+        if c.get("verified_by") != "independent":
+            continue
+        w = str(c.get("witness"))
+        if not c.get("evidence_sha256"):
+            why.append(f"反例 {w[:40]!r} 声称独立复核，却没有记下所依据证据的哈希"
+                       f"——一次没有 artifact 的复核")
+            continue
+        vw = c.get("verified_witness")
+        if not vw:
+            why.append(f"反例 {w[:40]!r} 声称独立复核，却没记下被验证的是哪份见证")
+            continue
+        if str(vw) != w:
+            why.append(f"反例写的是 {c.get('witness')!r}，复核章却来自见证 {vw!r}"
+                       f"——章盖在了另一份见证上")
+            continue
+        cert = c.get("certificate")
+        if not cert or not os.path.isfile(str(cert)):
+            why.append(f"反例 {w[:40]!r} 的复核章指向的证书读不到（{cert!r}）"
+                       f"——复核章必须能当场复核，读不该走的证书记不了独立复核")
+            continue
+        try:
+            cev = load_evidence(str(cert), subject=rec.get("id"),
+                                expect_subject=rec.get("id") or None,
+                                required_level="exact_certificate")
+        except LedgerError as exc:
+            why.append(f"反例 {w[:40]!r} 的复核章现在核不过：{exc}")
+            continue
+        if cev.sha256 != c.get("evidence_sha256"):
+            why.append(f"反例 {w[:40]!r} 的证书文件被换过：章底下记的是 "
+                       f"{str(c.get('evidence_sha256'))[:16]}…，现在这份是 "
+                       f"{cev.sha256[:16]}…")
+        elif str(cev.record.get("witness")) != w:
+            why.append(f"这份证据验证的见证是 {cev.record.get('witness')!r}，"
+                       f"不是盖章的 {w!r}")
+
+
+def validate_record(rec: Conjecture) -> list[str]:
     """检查**修改后的完整记录**是否自洽。返回违规列表，空列表表示合格。
 
-    为什么校验的对象是「记录」而不是「这次传了哪些参数」：这一轮审阅的教训是
+    为什么校验的对象是「记录」而不是「这次传了哪些参数」：二轮审阅的教训是
     **检查绑定在某些参数上，而不是修改后的记录上**，于是每个没传参数的入口都成了一个
     缺口——实测三条：
 
@@ -428,10 +479,19 @@ def validate_record(rec: Conjecture, *, evidence_path: str | None = None) -> lis
     逐条给命令参数补条件的做法会一直漏（每加一个参数就多一个入口）。所以改成一次成型：
     **先把改动全部应用到一个副本上，再检查整个副本**，不自洽就整笔拒绝、一个字段都不写。
 
-    记录自带它的依据：`rec["evidence"]` 记着当前这次结论所依据的那份证据（路径、哈希、
-    种类、对象、范围）。于是「换范围不换证据」「换形式化目标不换证据」这类改动一望即知。
+    第四轮又补了两件「一次成型」也没覆盖的事：
+
+    * **摘要不是证据。** `rec["evidence"]` 里存的只是路径 + 哈希 + 几个字段，校验若只
+      读这份摘要，那么「把被验证的见证文件换掉、路径不变」就查不出来——记录会继续挂着
+      `exact_certificate`。所以每次写入都**重新加载**那份证据，核对它自己的哈希、以及
+      它引用的输入文件的哈希（`load_evidence` 本来就查后者，只是没人再调它）。
+    * **`evidence_path` 参数原来收下不用**，等于把「这次给的是哪份证据」当摆设。这一版
+      改成从记录里的 `path` 重新加载：记录说它依据哪份，就核哪份，不靠调用方转述。
     """
     why: list[str] = []
+    # 反例的约束**先查、且与主结论无关**：主结论是 open 不代表反例可以随便盖章。
+    _check_counterexamples(rec, why)
+
     pending = str(rec.get("formal_status", "open"))
     want_kind, want_verdict = CONCLUSION_EVIDENCE.get(pending, (None, None))
     ev = rec.get("evidence")
@@ -450,14 +510,33 @@ def validate_record(rec: Conjecture, *, evidence_path: str | None = None) -> lis
         why.append(f"结论是 {pending!r}，但记录里**没有**它所依据的证据"
                    f"（改范围、改形式化目标、改结论都会走到这里）")
         return why
-    if ev.get("kind") != want_kind:
-        why.append(f"依据的证据种类是 {ev.get('kind')!r}，而结论 {pending!r} 需要 "
+
+    # == 重新加载那份证据（第四轮审阅 F2）==
+    # 记录里的摘要是**过去某次写入时**抄下来的；证据文件、以及它引用的见证/公式/Lean
+    # 文件都还是普通文件，事后都能被改。摘要过期了却继续当依据用，就是「路径一致」
+    # 冒充「对象没变」。核不过就如实报，不拿旧摘要把结论糊过去。
+    use = ev
+    try:
+        fresh = load_evidence(str(ev.get("path") or ""), subject=rec.get("id"),
+                              expect_subject=rec.get("id") or None)
+    except LedgerError as exc:
+        why.append(f"依据的证据现在核不过（{ev.get('path')!r}）：{exc}")
+    else:
+        if fresh.sha256 != ev.get("sha256"):
+            why.append(f"依据的证据文件本身被改过：记录写的是 "
+                       f"{str(ev.get('sha256'))[:16]}…，现在是 {fresh.sha256[:16]}…")
+        use = {"kind": fresh.kind, "verdict": fresh.verdict,
+               "subject": fresh.record.get("subject"), "range": fresh.record.get("range"),
+               "file": fresh.record.get("file"), "decls": fresh.record.get("decls")}
+
+    if use.get("kind") != want_kind:
+        why.append(f"依据的证据种类是 {use.get('kind')!r}，而结论 {pending!r} 需要 "
                    f"{want_kind!r}")
-    if ev.get("verdict") != want_verdict:
-        why.append(f"依据的证据判决是 {ev.get('verdict')!r}，而结论 {pending!r} 需要 "
+    if use.get("verdict") != want_verdict:
+        why.append(f"依据的证据判决是 {use.get('verdict')!r}，而结论 {pending!r} 需要 "
                    f"{want_verdict!r}")
-    if ev.get("subject") != rec.get("id"):
-        why.append(f"依据的证据 subject 是 {ev.get('subject')!r}，而这条记录的 id 是 "
+    if use.get("subject") != rec.get("id"):
+        why.append(f"依据的证据 subject 是 {use.get('subject')!r}，而这条记录的 id 是 "
                    f"{rec.get('id')!r}")
     # 范围：结论里那句「某范围内」必须与证据里记的完全一致
     if pending == "no_counterexample_in_range":
@@ -466,15 +545,32 @@ def validate_record(rec: Conjecture, *, evidence_path: str | None = None) -> lis
             why.append("no_counterexample_in_range 必须带 verified_range")
         else:
             want = f"{vr['lo']}..{vr['hi']}"
-            if str(ev.get("range") or "") != want:
+            if str(use.get("range") or "") != want:
                 why.append(f"范围（range）是 {want!r}，而依据的证据记的是 "
-                           f"{ev.get('range')!r}——范围与证据不一致时，"
+                           f"{use.get('range')!r}——范围与证据不一致时，"
                            f"「该范围内没有反例」无法核对")
-    # 形式化目标：被证明的对象变了，原来的证据就不再是它的依据
+    # 形式化目标：被证明的对象变了，原来的证据就不再是它的依据。
+    # **路径一致不等于对象没变**：同一个 `.lean` 文件里换个声明，就是换了被证明的命题。
     if pending == "proved":
         sf = rec.get("statement_formal") or {}
-        if sf.get("file") and ev.get("file") and sf["file"] != ev["file"]:
-            why.append(f"形式化目标是 {sf['file']!r}，而依据的证据审的是 {ev['file']!r}")
+        decl = sf.get("decl")
+        audited = [str(x) for x in (use.get("decls") or [])]
+        # 路径按**绝对路径**比：`tests/fixtures/x.lean` 与 `/abs/tests/fixtures/x.lean`
+        # 是同一个文件（实测：证据那边写的是绝对路径，这边手敲相对路径就被误判）。
+        # 只比路径形态会放过「同文件换声明」，只比字符串会误伤同一个文件的两种写法。
+        sf_file = os.path.abspath(str(sf["file"])) if sf.get("file") else ""
+        ev_file = os.path.abspath(str(use["file"])) if use.get("file") else ""
+        if sf_file and ev_file and sf_file != ev_file:
+            why.append(f"形式化目标是 {sf['file']!r}，而依据的证据审的是 {use['file']!r}")
+        elif not decl:
+            why.append(f"结论是 proved，但记录没有点名证明了**哪个声明**"
+                       f"（`--statement-formal F.lean --decl NAME`）。"
+                       f"这份证据点的是 {audited or '（没点名）'}——"
+                       f"不点名，就分不出「同文件里另一个定理」是不是被证明了")
+        elif decl not in audited:
+            why.append(f"记录声称证明的是 {decl!r}，而这份证据点的是 "
+                       f"{audited or '（没点名）'}——同一个文件里换一个声明，"
+                       f"就是换了一个被证明的对象")
     # 档位：不能高于该结论 + 该证据支持到的档位
     supported = CONCLUSION_LEVEL.get(pending, "empirical")
     lvl = rec.get("verification_level", "empirical")
@@ -484,23 +580,6 @@ def validate_record(rec: Conjecture, *, evidence_path: str | None = None) -> lis
     if lvl not in ok_levels:
         why.append(f"档位是 {lvl!r}，而这个结论 + 这份证据只支持 "
                    f"{sorted(ok_levels)}")
-    # 反例：被标成独立复核的，必须**自己说得清依据**——引用哪份证据、验证的是哪份见证。
-    # 这里刻意**不**要求它引用的就是当前结论依据的那份证据：一个猜想可以「在 1..1000
-    # 内没有反例」同时「另有一个从别处独立复核过的反例」，两件事各有各的证据。
-    for c in rec.get("counterexamples") or []:
-        if c.get("verified_by") != "independent":
-            continue
-        if not c.get("evidence_sha256"):
-            why.append(f"反例 {str(c.get('witness'))[:40]!r} 声称独立复核，却没有记下"
-                       f"所依据证据的哈希——一次没有artifact的复核")
-            continue
-        vw = c.get("verified_witness")
-        if not vw:
-            why.append(f"反例 {str(c.get('witness'))[:40]!r} 声称独立复核，却没记下"
-                       f"被验证的是哪份见证")
-        elif str(vw) != str(c.get("witness")):
-            why.append(f"反例写的是 {c.get('witness')!r}，复核章却来自见证 {vw!r}"
-                       f"——章盖在了另一份见证上")
     return why
 
 
@@ -546,13 +625,18 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
     # 变成了硬拒收——正好把降级路径删掉了。
     claims_fact = bool(formal_status or informal_status
                        or (verification_level and verification_level != "empirical"))
+    rec_id = rec.get("id")
     warnings: list[str] = []
     cand: Conjecture = copy.deepcopy(rec)
     ev: Evidence | None = None
     ev_ref: dict[str, Any] | None = None
     if evidence:
         try:
-            ev = load_evidence(evidence, subject=cand.get("id"))
+            # `expect_subject` 才是**核对**对象，`subject` 只是报错时显示的名字——
+            # 第四轮审阅 F1 实测：只传 `subject=` 时，一份 `subject: OTHER` 的真证据
+            # 照样能给出独立复核章。两个参数长得像，作用完全不同。
+            ev = load_evidence(evidence, subject=rec_id,
+                               expect_subject=rec_id if rec_id else None)
         except LedgerError as exc:
             if claims_fact:
                 raise
@@ -563,6 +647,7 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
             ev_ref = {"path": ev.path, "sha256": ev.sha256, "kind": ev.kind,
                       "subject": ev.record.get("subject"), "verdict": ev.verdict,
                       "range": ev.record.get("range"), "file": ev.record.get("file"),
+                      "decls": ev.record.get("decls"),
                       "witness": ev.record.get("witness"), "at": now_iso()}
     if formal_status:
         if formal_status not in FORMAL_STATUSES:
@@ -612,11 +697,13 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
         # 以前只要 evidence 非空就写 independent，于是随便一个字符串、甚至一个无关的
         # 文件路径都能拿到复核标记——那是直接伪造复核。
         #
-        # 见证身份**一律按字符串比对**，不给「不是路径所以没法比」留豁免：豁免就等于
-        # 「换一个写法的见证名就能把章挪走」。证据里没记 witness 时也无从比对，
-        # 同样记 UNVERIFIED——**没有绑定关系就不该有章**。
+        # 第四轮审阅 F1 又指出两处：**判决**和**对象**没看。一份 `verdict: NOT VERIFIED`
+        # 的见证（全零赋值违反规格）照样盖到 `independent` 上——**「证据读得出来」被当成了
+        # 「证据说它成立」**；一份 `subject: OTHER` 的有效证据也能给本猜想盖章。四项缺
+        # 一不可：种类、判决、对象、见证身份（对象那项在读取时由 `expect_subject` 兜住）。
         entry: dict[str, Any] = {"witness": witness, "certificate": evidence,
                                  "recorded_at": now_iso()}
+        want_verdicts = LEVEL_VERDICTS.get("exact_certificate", ())
         if ev is None:
             entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
             warnings.append(f"反例 {witness!r} 没有可用的证书指针，请补 --evidence")
@@ -624,6 +711,13 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
             entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
             warnings.append(
                 f"反例 {witness!r} 的证据种类是 {ev.kind!r}，不是 witness_eval，"
+                f"记为 UNVERIFIED")
+        elif str(ev.verdict) not in want_verdicts:
+            # 「见证不满足规格」也是有价值的结论，但它**不是**独立复核过的反例。
+            entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
+            warnings.append(
+                f"反例 {witness!r} 的证据判决是 {ev.verdict!r}（该档位需要 "
+                f"{sorted(want_verdicts)}）——一份「没验证通过」的记录撑不起复核章，"
                 f"记为 UNVERIFIED")
         elif not ev.record.get("witness"):
             entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
@@ -677,7 +771,7 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
     if ev_ref is not None and claims_fact:
         cand["evidence"] = ev_ref          # 记录自带它的依据
 
-    problems = validate_record(cand, evidence_path=ev.path if ev else None)
+    problems = validate_record(cand)
     if problems:
         raise LedgerError("拒绝写入：修改后的记录不自洽——\n  - " + "\n  - ".join(problems))
 
