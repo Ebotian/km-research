@@ -125,7 +125,14 @@ $OPL/opl-conj set C-0001 --formal-status no_counterexample_in_range \
 `no_counterexample_in_range` 之所以必须绑 `--verified-range`：**「没找到」只在说清
 在哪个范围内时才有意义**。不写范围就写成 refuted，会把「我没有找到」记成「它不成立」。
 
-**不带 `--evidence` 会被拒绝写入（退出码 `2`）。** 这条纪律由工具强制，不是约定。
+**`--formal-status` / `--informal-status` 不带 `--evidence` 会被拒绝写入（退出码
+`2`）。** 这条纪律由工具强制，不是约定。追加反例走的是另一条路：给不出可用的证据时
+降级记 `UNVERIFIED`，不拒收。
+
+**校验的对象是改完之后的整条记录，不是你这次传了哪些参数。** 工具先在副本上把改动
+全部应用掉，再检查整条记录是否自洽；任何一处不自洽就**整笔拒绝**（退出码 `2`，
+一个字段都不写），理由逐条列出。逐个参数补条件的写法每加一个入口就漏一个——只改
+`--verified-range` 而不给新证据、把档位抬到依据支持不到的高度，都在这里被拦下。
 
 **证据还必须与结论对得上**——四项绑定，缺一项就拒（退出码 `2`）：
 
@@ -133,7 +140,7 @@ $OPL/opl-conj set C-0001 --formal-status no_counterexample_in_range \
 |---|---|
 | 对象 | 证据的 `subject` 必须等于这次登记的猜想 id。**一份真证据不能给另一个猜想背书** |
 | 方向 | `refuted` 要见证求值记录（`witness_eval`）、`no_counterexample_in_range` 要证书（`cert`）、`proved` 要 Lean 审计（`lean_audit`）。**见证求值说不了「没有反例」**，反过来也一样 |
-| 范围 | `--verified-range` 必须与证据里记的范围一致。不一致时「该范围内没有反例」无法核对 |
+| 范围 | `--verified-range` 必须与证据里记的范围**完全一致**。不一致时「该范围内没有反例」无法核对——只把范围改大而不换证据，就是在这里被拒 |
 | 输入 | 每类证据必须带自己的文件与哈希（证书要 `certificate`+`formula`、见证要 `witness`+`spec`、Lean 要 `file`）。缺了它们，记录没有绑定到任何输入 |
 
 生成证据时就把这些写进去：
@@ -145,14 +152,35 @@ $OPL/opl-encode --spec … --eval-witness … --evidence-out lab/evidence/C-0001
   --subject C-0001
 ```
 
-**改结论会重新定档位**，不继承旧的：结论换成 `open` 就是 `empirical`，
-换成 `refuted` 而证据是见证记录就是 `exact_certificate`。这一条修的是「换结论不换徽章」：
-旧版只在显式传 `--verification-level` 时才验证据，于是「改结论 + 一个不存在的证据路径」
-拿得到退出码 0，而高档位原样留着。
+**把反例追加进记录**用 `--add-counterexample`——它记的是「这一份见证推翻了猜想」，
+与改结论是两件事，可以各自发生：
+
+```bash
+# 给的那串要与证据里记的 `witness` 逐字相同：`--eval-witness` 记的是绝对路径
+$OPL/opl-conj set C-0001 --add-counterexample "$PWD/lab/runs/C-0001/witness.json" \
+  --evidence lab/evidence/C-0001.json
+```
+
+复核章只盖在**证据里记着的那份见证**上：证据要能读出、种类必须是 `witness_eval`，
+见证名要逐字相同（见证名不是路径时照样比对——留一个「不是路径所以没法比」的豁免，
+等于换个写法就能把章挪走）。对上了才写 `verified_by=independent`，并记下
+`evidence_sha256` 与 `verified_witness`；对不上只写 `verified_by=UNVERIFIED` 加一句
+警告——**降级而不拒收**：台账的价值之一是留住「试过但没成」，把这种追加拒之门外，
+事后就看不到搜索做过什么。
+
+追加反例不顶掉已有结论的依据：记录里的 `evidence` 只在改结论或升档时更新，反例的
+依据记在它自己那条条目里。
+
+**改结论会重新定档位**，不继承旧的：结论换成 `open` 就是 `empirical`，换成 `refuted`
+而证据是见证记录就是 `exact_certificate`。档位说的是「这条结论的依据有多硬」——换了
+结论就是换了依据，继承旧档位等于让新结论搭旧证据的便车；而且它不能高于这个结论加
+这份证据支持到的档位。
 
 `verification_level` 只填你实际拿到的档，而且**升档要证据支撑**：
 `exact_certificate` 要求证据记录的 `verdict` 是 `VERIFIED`（`lean_checked` 要求
-`proved`），记录里引用的文件还必须与哈希对得上。指针非空 ≠ 复核过。
+`proved`），证据的 `kind` 还得是已知种类（`cert` / `lean_audit` / `witness_eval`），
+记录里引用的文件还必须与哈希对得上。只有 `{"schema": …, "verdict": …}` 的最小 JSON
+定不了它该要求哪些绑定字段，**不足以升档**。指针非空 ≠ 复核过。
 
 `human_peer_reviewed` 与 `faithfulness_checked` 是**人的判断**，要 `--confirmed-by`：
 

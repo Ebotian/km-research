@@ -53,7 +53,7 @@ OPL="${KIMI_PLUGIN_ROOT:-<插件根>}/bin"
 | 命令 | 一个职责 |
 |---|---|
 | `opl-capabilities` | 探测后端，产出 `capabilities.json`。含 Python 模块探测与解释器分裂检测 |
-| `opl-conj` | 猜想台账。一题一文件；**状态变更必须带 `--evidence`**，否则拒绝写入 |
+| `opl-conj` | 猜想台账。一题一文件；**状态变更必须带 `--evidence`**，否则拒绝写入。依据随记录一起存，改完的整条记录不自洽（结论、档位与依据对不上）就整笔拒绝（`2`），一个字段都不写 |
 | `opl-encode` | 规格 → CNF / CP-SAT；双后端一致性检查；见证直接求值 |
 | `opl-search` | 跑搜索，产出见证或 DRAT 证明 |
 | `opl-certcheck` | 用独立校验器复核证书（drat-trim / lrat-check / cake_lpr / carcara） |
