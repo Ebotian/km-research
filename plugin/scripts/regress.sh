@@ -874,6 +874,120 @@ if after != mid:
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+# ---- F5：程序身份与评估运行分列（同一程序可多次评估，各留证据）----
+# 判据 8 要「重复提交被拒」，F5 要「同一程序能再评估一次」——两件事由**同一个动作**
+# 触发，所以必须能区分：默认拒绝（不花沙箱的钱），补测要显式 `--reevaluate`。
+chk "F5 补测：身份不变、运行史 +1" 0 python3 -c "
+import json, os, shutil, sqlite3, subprocess, sys, tempfile
+env = dict(os.environ)
+SN = '$SNF'
+d = tempfile.mkdtemp(prefix='opl-reeval.')
+why = []
+try:
+    lab = d + '/lab'
+    # 先让评估器坏掉：基线拿不到指标
+    open(d + '/bad_ev.py', 'w').write(
+        'import sys\nprint(\"crashed\", file=sys.stderr)\nsys.exit(3)\n')
+    r0 = subprocess.run(['$BIN/opl-evolve-init', '--lab', lab,
+                         '--skeleton', SN + '/skeleton.py',
+                         '--evaluator', d + '/bad_ev.py',
+                         '--problem', SN + '/problem.json'],
+                        capture_output=True, text=True, env=env)
+    if r0.returncode != 0:
+        why.append('init 退出码 %d' % r0.returncode)
+    db = lab + '/evolve/programs.sqlite'
+    def q(sql):
+        con = sqlite3.connect(db); con.row_factory = sqlite3.Row
+        try:
+            return [dict(r) for r in con.execute(sql)]
+        finally:
+            con.close()
+    base = q('SELECT id, metrics_json FROM programs')
+    if not base or base[0]['metrics_json'] is not None:
+        why.append('基线本该没有指标：%r' % (base and base[0]['metrics_json']))
+    if len(q('SELECT id FROM evaluations')) != 1:
+        why.append('基线那次运行应当进运行史')
+    skel = lab + '/evolve/skeleton.py'
+    # 默认再提交：拒绝，且不花沙箱的钱
+    r1 = subprocess.run(['$BIN/opl-evolve-eval', '--lab', lab, '--candidate', skel],
+                        capture_output=True, text=True, env=env)
+    if r1.returncode != 5:
+        why.append('默认重复提交退出码 %d（应为 5）' % r1.returncode)
+    # 换上好评估器，显式补测
+    shutil.copyfile(SN + '/evaluator.py', lab + '/evolve/evaluator.py')
+    r2 = subprocess.run(['$BIN/opl-evolve-eval', '--lab', lab, '--candidate', skel,
+                         '--reevaluate'], capture_output=True, text=True, env=env)
+    if r2.returncode != 0:
+        why.append('补测退出码 %d：%s' % (r2.returncode, r2.stderr[-140:]))
+    after = q('SELECT id, metrics_json FROM programs')
+    # 1 身份不变：程序数还是 1，同一个 id
+    if len(after) != 1 or after[0]['id'] != base[0]['id']:
+        why.append('补测改变了程序身份：%r' % after)
+    # 2 运行史 +1，且两次运行的目录不同（不覆盖证据）
+    evs = q('SELECT id, run_dir, metrics_json FROM evaluations ORDER BY id')
+    if len(evs) != 2:
+        why.append('运行史 %d 条（应为 2）' % len(evs))
+    elif evs[0]['run_dir'] == evs[1]['run_dir']:
+        why.append('两次运行共用一个目录，前一次的证据被覆盖了')
+    # 3 头条指标被补测填上
+    if not after[0]['metrics_json']:
+        why.append('补测之后基线仍然没有指标')
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F5 每次运行都落四份快照且来源可追" 0 python3 -c "
+import json, os, sqlite3, sys
+db = '$EL/evolve/programs.sqlite'
+why = []
+con = sqlite3.connect(db); con.row_factory = sqlite3.Row
+runs = [dict(r) for r in con.execute('SELECT id, run_dir, program_id FROM evaluations')]
+con.close()
+if not runs:
+    why.append('运行史是空的')
+for r in runs:
+    rd = r['run_dir']
+    if not rd or not os.path.isdir(rd):
+        why.append('运行 #%s 的目录不存在：%r' % (r['id'], rd))
+        continue
+    for name in ('cmd.json', 'env.json', 'capabilities.json', 'metrics.json'):
+        if not os.path.isfile(os.path.join(rd, name)):
+            why.append('运行 #%s 缺 %s' % (r['id'], name))
+    mp = os.path.join(rd, 'metrics.json')
+    if os.path.isfile(mp):
+        m = json.load(open(mp))
+        for k, v in (m.get('sources') or {}).items():
+            if isinstance(v, str) and v.startswith('/') and not os.path.exists(v):
+                why.append('运行 #%s 的 metrics.sources[%s] 指向不存在的路径' % (r['id'], k))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F5 运行史可查（show --id）" 0 python3 -c "
+import json, subprocess, sys
+r = subprocess.run(['$BIN/opl-evolve-show', '--lab', '$EL', '--id', '1',
+                    '--json'], capture_output=True, text=True)
+why = []
+if r.returncode != 0:
+    why.append('show --id 退出码 %d' % r.returncode)
+else:
+    rec = json.loads(r.stdout)
+    evs = rec.get('evaluations') or []
+    if not evs:
+        why.append('show --id 没带出运行史')
+    for e in evs:
+        if not e.get('kind'):
+            why.append('运行史条目缺 kind：%r' % e)
+        if 'created_at' not in e:
+            why.append('运行史条目缺 created_at')
+    # 运行史必须带「当时什么条件」——否则事后无法回答「这个数字哪来的」
+    if evs and not any(e.get('evaluator_sha256') for e in evs):
+        why.append('运行史没记评估器指纹，事后无法确认是哪份评估器跑的')
+    if evs and not any(e.get('problem_sha256') for e in evs):
+        why.append('运行史没记实验定义指纹')
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
 # ---- F2/F3/F4：判决绑定到可信端（审阅稿的三条复现已进回归）----
 # 三条都指向同一类错误：**把「东西在那儿」当成了「事情成立」**。
 #   F2 区外文本没变   → 当成题目没变（候选在区内重绑定 N 就能改题目）

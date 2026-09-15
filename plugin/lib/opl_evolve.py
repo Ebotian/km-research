@@ -70,6 +70,24 @@ CREATE TABLE IF NOT EXISTS programs (
     created_at   TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS programs_cell ON programs (island, cell_key);
+
+-- 评估运行与程序**身份**分列。一份程序可以跑很多次：换预算、换机器、上次评估器坏了
+-- 要补测。`programs.metrics_json` 保留「最近一次**合格**评估」的指标（best() 读它），
+-- 而完整的运行史在这里——「这个数字是哪一次跑出来的、当时什么预算」必须查得到。
+CREATE TABLE IF NOT EXISTS evaluations (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    program_id    INTEGER NOT NULL REFERENCES programs(id),
+    run_dir       TEXT,
+    kind          TEXT NOT NULL,
+    feasible      INTEGER,
+    metrics_json  TEXT,
+    problem_sha256 TEXT,
+    evaluator_sha256 TEXT,
+    budget_json   TEXT,
+    note          TEXT,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS evaluations_program ON evaluations (program_id, id);
 """
 
 
@@ -443,6 +461,8 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
     """
     import shutil
 
+    from opl_ledger import sha256_file
+
     p = lab_paths(lab)
     if os.path.exists(p["db"]) and not force:
         raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
@@ -473,7 +493,17 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
             metrics = None
     with ProgramLibrary(p["db"]) as lib:
         res = lib.add(code=code, skeleton=None, generation=0, operation="init",
-                      metrics=metrics)
+                      metrics=None)
+        if res.program_id is not None:
+            # 基线也是一次运行，同样进运行史——「这个数字哪来的」要能一路查到 init
+            lib.add_evaluation(
+                res.program_id, kind=kind, run_dir=run_dir,
+                metrics=metrics if metrics else None,
+                feasible=None if metrics is None else problem.feasible(metrics),
+                note=None if metrics else (note or "基线未取得指标"),
+                problem_sha256=sha256_file(p["problem"]),
+                evaluator_sha256=sha256_file(p["evaluator"]),
+                budget={"timeout_s": timeout, "mem_max_mb": mem_max_mb})
     return InitResult(lab_dir=p["dir"], db_path=p["db"], skeleton=p["skeleton"],
                       evaluator=p["evaluator"], problem=p["problem"],
                       seeded_id=res.program_id, already_existed=force,
@@ -482,7 +512,8 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
 
 def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
                    parent_id: int | None = None, operation: str | None = None,
-                   timeout: float = 60.0, mem_max_mb: int | None = None) -> EvalOutcome:
+                   timeout: float = 60.0, mem_max_mb: int | None = None,
+                   reevaluate: bool = False) -> EvalOutcome:
     """评估一份候选并入库。这是判据 8/9 与两条判据（F3/F4）在命令层的落点。
 
     判决的顺序是**先问「这次跑完了吗」，再问「它说行不行」**：
@@ -496,6 +527,7 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
     产物存在只说明写过文件，**不说明这次运行正常结束**。
     """
     from opl_common import EMPTY, MISSING, PASS, REJECT, UNKNOWN, USAGE
+    from opl_ledger import sha256_file  # 与台账共用同一份实现，不复制第二份
     from opl_run import OK, PAYLOAD_FAILED
 
     p = lab_paths(lab)
@@ -520,23 +552,46 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
     h, _ = code_hash(code)
     with ProgramLibrary(p["db"]) as lib:
         dup = lib.by_hash(h)
-    if dup:
+    # 已知程序默认**不再跑**（判据 8：第二次提交因 code_hash 被拒，且不花沙箱的钱）。
+    # 但「同一份程序要能再评估一次」是另一件事——补测、换预算、换机器都要它。
+    # 两件事都用「提交同一份候选」触发，所以必须能区分：**补测要显式说**。
+    # 默认拒绝、显式补测，比反过来安全：反过来会让「重复提交」静默地又跑一遍。
+    if dup and not reevaluate:
         return EvalOutcome(exit_code=EMPTY, kind="duplicate", code_hash=h,
                            program_id=dup["id"], duplicate=True,
                            metrics=dup.get("metrics"),
                            reason=f"duplicate: code_hash 命中 {h[:12]}…"
-                                  f"（已有 id={dup['id']}，第 {dup['generation']} 代）")
+                                  f"（已有 id={dup['id']}，第 {dup['generation']} 代）。"
+                                  f"要再跑一次加 --reevaluate")
 
     metrics, run_dir, kind, _files = _stage_and_evaluate(
         p, code, h, problem_path=p["problem"], timeout=timeout, mem_max_mb=mem_max_mb)
+    # 这次运行「在什么条件下、由什么评估器」跑的——运行史里必须查得到这些
+    fp = {"problem_sha256": sha256_file(p["problem"]),
+          "evaluator_sha256": sha256_file(p["evaluator"])}
+    budget = {"timeout_s": timeout, "mem_max_mb": mem_max_mb}
+
+    def record(program_id: int | None, *, feasible: bool | None, note: str | None = None,
+               metrics_for_row: dict[str, Any] | None = None) -> None:
+        if program_id is None:
+            return
+        with ProgramLibrary(p["db"]) as lib:
+            lib.add_evaluation(program_id, kind=kind, run_dir=run_dir,
+                               metrics=metrics_for_row, feasible=feasible,
+                               note=note, budget=budget, **fp)
 
     # ---- F3：运行没正常结束就是「没有判决」，产物存在也不改这一条 ----
+    existing_id = dup["id"] if dup else None
     if kind == "backend_missing":
+        record(existing_id, feasible=None, note="沙箱后端缺失")
         return EvalOutcome(exit_code=MISSING, kind=kind, code_hash=h,
-                           reason="找不到 bwrap：不降级到裸跑", run_dir=run_dir)
+                           reason="找不到 bwrap：不降级到裸跑", run_dir=run_dir,
+                           summary_fields=summary)
     if kind not in (OK, PAYLOAD_FAILED):
         extra = "（评估器写出了 metrics，但这次运行没有正常结束——不采信）" \
             if metrics is not None else ""
+        # 这次没有结论：**不入 metrics**，只留一条运行史。旧指标也不动。
+        record(existing_id, feasible=None, note=f"无判决：{kind}")
         return EvalOutcome(exit_code=UNKNOWN, kind=kind, code_hash=h,
                            reason=f"沙箱结局 {kind}{extra}", run_dir=run_dir,
                            summary_fields=summary)
@@ -545,6 +600,7 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
         # 拒了候选（实测：区内把 N 改成 0，评估器报「与冻结定义不一致」）。把那段
         # stderr 带出来；否则用户只看到「没有指标」，得自己去翻运行目录才知道为什么。
         tail = _tail(os.path.join(run_dir, "stderr.txt"))
+        record(existing_id, feasible=None, note="评估器没写出指标")
         return EvalOutcome(exit_code=UNKNOWN, kind="no_metrics", code_hash=h,
                            reason=(f"评估器没写出指标（{run_dir}/work/metrics.json）"
                                    + (f"；它的 stderr 末尾：{tail}" if tail else "")),
@@ -553,24 +609,30 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
     # ---- F4：指标的合法性由**冻结定义**判定，插件不认识具体字段名 ----
     bad = problem.check_metrics(metrics)
     if bad:
+        record(existing_id, feasible=None, note="指标不合格：" + "；".join(bad))
         return EvalOutcome(exit_code=USAGE, kind="metrics_invalid", code_hash=h,
                            metrics=metrics, run_dir=run_dir,
                            reason="评估器产出的 metrics 不符合实验定义：" + "；".join(bad),
                            summary_fields=summary)
 
+    ok = problem.feasible(metrics)
+    if dup:
+        # 补测：**身份不变**，只追加一次运行
+        record(dup["id"], feasible=ok, metrics_for_row=metrics)
+        return EvalOutcome(exit_code=PASS if ok else REJECT,
+                           kind="reevaluated" if ok else "reevaluated_infeasible",
+                           program_id=dup["id"], code_hash=h, duplicate=True,
+                           metrics=metrics, run_dir=run_dir, summary_fields=summary,
+                           reason=f"补测：id={dup['id']} 的又一次运行（身份未变）")
     with ProgramLibrary(p["db"]) as lib:
         added = lib.add(code=code, skeleton=skeleton, parent_id=parent_id,
-                        generation=generation, operation=operation, metrics=metrics)
+                        generation=generation, operation=operation, metrics=None)
     if not added.accepted:
         reason = added.rejected_reason or ""
-        if reason.startswith("duplicate"):
-            return EvalOutcome(exit_code=EMPTY, kind="duplicate", code_hash=h,
-                               duplicate=True, metrics=metrics,
-                               reason=reason, run_dir=run_dir)
         return EvalOutcome(exit_code=USAGE, kind="candidate_invalid", code_hash=h,
-                           metrics=metrics, reason=reason, run_dir=run_dir)
-
-    ok = problem.feasible(metrics)
+                           metrics=metrics, reason=reason, run_dir=run_dir,
+                           summary_fields=summary)
+    record(added.program_id, feasible=ok, metrics_for_row=metrics)
     return EvalOutcome(exit_code=PASS if ok else REJECT,
                        kind="feasible" if ok else "infeasible",
                        program_id=added.program_id, code_hash=h, metrics=metrics,
@@ -737,6 +799,47 @@ class ProgramLibrary:
             return AddResult(False, code_hash=h,
                              rejected_reason="internal: INSERT 成功但拿不到 lastrowid")
         return AddResult(True, program_id=int(new_id), code_hash=h)
+
+    def add_evaluation(self, program_id: int, *, kind: str, run_dir: str | None = None,
+                       metrics: dict[str, Any] | None = None, feasible: bool | None = None,
+                       problem_sha256: str | None = None,
+                       evaluator_sha256: str | None = None,
+                       budget: dict[str, Any] | None = None,
+                       note: str | None = None) -> int:
+        """记一次运行。**只有合格且可行的新结果才更新程序的头条指标。**
+
+        不覆盖的理由：一次后来的坏运行（超时、评估器坏了）不该抹掉已经拿到的成绩——
+        那会让库里的最好结果随运气漂移。旧指标留在 `programs.metrics_json`，
+        这次运行如实进 `evaluations`，两者都能查到。
+        """
+        cur = self.conn.execute(
+            "INSERT INTO evaluations (program_id, run_dir, kind, feasible, metrics_json,"
+            " problem_sha256, evaluator_sha256, budget_json, note, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (program_id, run_dir, kind,
+             None if feasible is None else int(feasible),
+             json.dumps(metrics, ensure_ascii=False, sort_keys=True) if metrics else None,
+             problem_sha256, evaluator_sha256,
+             json.dumps(budget, ensure_ascii=False, sort_keys=True) if budget else None,
+             note, time.strftime("%Y-%m-%dT%H:%M:%S%z")))
+        if metrics is not None:
+            self.conn.execute("UPDATE programs SET metrics_json = ? WHERE id = ?",
+                              (json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+                               program_id))
+        self.conn.commit()
+        return int(cur.lastrowid or 0)
+
+    def evaluations(self, program_id: int) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM evaluations WHERE program_id = ? ORDER BY id",
+            (program_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            raw = d.pop("metrics_json", None)
+            d["metrics"] = json.loads(raw) if raw else None
+            out.append(d)
+        return out
 
     # -------------------------------------------------------------- 读取
 

@@ -23,14 +23,30 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 from opl_common import PASS, USAGE, EMPTY, c  # noqa: E402
 from opl_evolve import (EvolveError, ProgramLibrary, lab_paths,  # noqa: E402
-                        parse_where)
+                        load_problem, parse_where)
 
-SUMMARY_KEYS = ("sorts", "comparators", "zero_one_inputs_checked")
+def summary_keys(lab: str) -> tuple[str, ...]:
+    """摘要打哪几个字段，**从实验定义读**，不硬编码。
+
+    原先这里写死 `("sorts", "comparators", "zero_one_inputs_checked")`——那等于把
+    「所有实验都是排序网络」钉进了展示层：换成 `feasible`/`loss` 的问题，摘要一律
+    显示「无指标」，而库里其实有数。定义读不到时退回「读到什么打什么」。
+    """
+    try:
+        problem = load_problem(lab_paths(lab)["problem"])
+    except EvolveError:
+        return ()
+    keys = [problem.feasible_field]
+    if problem.objective_field:
+        keys.append(problem.objective_field)
+    keys += [k for k in problem.required if k not in keys]
+    return tuple(keys)
 
 
-def brief(rec: dict) -> str:
+def brief(rec: dict, keys: tuple[str, ...] = ()) -> str:
     m = rec.get("metrics") or {}
-    bits = " ".join(f"{k}={m[k]}" for k in SUMMARY_KEYS if k in m) or "无指标"
+    use = keys or tuple(sorted(m))
+    bits = " ".join(f"{k}={m[k]}" for k in use if k in m) or "无指标"
     return (f"id={rec['id']:<4} 第{rec['generation']}代  {bits}  "
             f"op={rec.get('operation') or '-'}  {rec['code_hash'][:12]}…")
 
@@ -42,8 +58,9 @@ def main() -> int:
     ap.add_argument("--best", default=None, help="按某个 metrics 字段取最好的一条")
     ap.add_argument("--where", action="append", default=None, metavar="KEY=VALUE",
                     help="只在此条件成立的行里取最好（可重复）。"
-                         "**不加它是危险的**：数字最小不等于最好，"
-                         "实测会选中一条不排序的 4 比较器网络")
+                         "**不加它是危险的**：数字最小不等于最好——"
+                         "实测会选中一条不可行的候选（本仓库夹具是排序网络，"
+                         "那条是 4 比较器但不排序的网络）")
     ap.add_argument("--minimize", action="store_true", default=True)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--json", action="store_true")
@@ -54,14 +71,21 @@ def main() -> int:
         c(f"实验目录不存在：{p['db']}（先跑 opl-evolve-init）")
         return USAGE
 
+    keys = summary_keys(args.lab)
     with ProgramLibrary(p["db"]) as lib:
         if args.id is not None:
             rec = lib.get(args.id)
             if rec is None:
                 c(f"库里没有 id={args.id}")
                 return EMPTY
+            # 身份与运行分列：同一个 id 可能跑过很多次（补测、换预算、换评估器），
+            # 每次都留在运行史里，并把「哪次跑的、什么条件」一起给出来
+            rec["evaluations"] = lib.evaluations(args.id)
             print(json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True))
-            c(brief(rec))
+            c(brief(rec, keys))
+            for e in rec["evaluations"]:
+                c(f"  运行 #{e['id']}  {e['kind']:<22} feasible={e['feasible']}  "
+                  f"{e['created_at']}  {e.get('run_dir') or '-'}")
             return PASS
         if args.best:
             try:
@@ -76,7 +100,7 @@ def main() -> int:
                   + ("；注意不加 --where 时不可行的程序也会参与比较" if not where else ""))
                 return EMPTY
             print(json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True))
-            c(f"best({args.best}) → " + brief(rec))
+            c(f"best({args.best}) → " + brief(rec, keys))
             if not where:
                 c("提示：未加 --where，选出的可能是不可行的程序（数字最小不等于最好）")
             return PASS
@@ -91,7 +115,7 @@ def main() -> int:
                             | {"metrics": r.get("metrics")} for r in rows]}
         print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
         for r in rows:
-            c(brief(r))
+            c(brief(r, keys))
         return PASS
 
 

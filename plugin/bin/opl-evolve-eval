@@ -16,7 +16,7 @@
     3  UNKNOWN  沙箱**没有给出判决**（超时 / 被 OOM 杀 / 被杀 / 没写出产物）。
                 这不是「候选不行」——别读错
     4  MISSING  找不到 bwrap。不降级到裸跑
-    5  EMPTY    重复：`code_hash` 命中，没有新增任何东西
+    5  EMPTY    重复：`code_hash` 命中，没有新增任何东西（要再跑一次加 --reevaluate）
 """
 
 from __future__ import annotations
@@ -50,13 +50,18 @@ def main() -> int:
     ap.add_argument("--operation", default=None)
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--mem-mb", type=int, default=None)
+    ap.add_argument("--reevaluate", action="store_true",
+                    help="已知程序也再跑一次（补测 / 换预算 / 换评估器）。"
+                         "**身份不变**，只追加一条运行史。不给这个开关时，"
+                         "重复提交会被 code_hash 拒（退出码 5）且不花沙箱的钱")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     try:
         out = eval_candidate(args.lab, args.candidate, generation=args.generation,
                              parent_id=args.parent, operation=args.operation,
-                             timeout=args.timeout, mem_max_mb=args.mem_mb)
+                             timeout=args.timeout, mem_max_mb=args.mem_mb,
+                             reevaluate=args.reevaluate)
     except EvolveError as exc:
         c(str(exc))
         return USAGE
