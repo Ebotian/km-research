@@ -62,6 +62,8 @@ def main() -> int:
     ap.add_argument("--project", help="Lean 项目目录（默认 $OPL_LEAN_PROJECT 或 <plugin>/lean）")
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--evidence-out", help="把证据记录写到该路径（供 opl-conj --evidence 引用）")
+    ap.add_argument("--subject",
+                    help="这份证据是关于哪个猜想的（id）；台账会核对")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -97,6 +99,7 @@ def main() -> int:
     record = {
         "schema": "opl.evidence/1",
         "kind": "lean_audit",
+        "subject": args.subject,
         "file": os.path.abspath(args.file),
         "file_sha256": sha256(args.file),
         "decls": args.decl,

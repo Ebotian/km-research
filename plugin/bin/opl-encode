@@ -43,6 +43,8 @@ def main() -> int:
     ap.add_argument("--check-consistency", action="store_true",
                     help="两种独立编码各求解一次并交叉验证见证")
     ap.add_argument("--eval-witness", help="用规格直接求值一份见证（与编码器无关）")
+    ap.add_argument("--subject",
+                    help="这份证据是关于哪个猜想的（id）；台账会核对")
     ap.add_argument("--evidence-out",
                     help="把复核结果写成 opl.evidence/1 记录（台账升档要求这种记录，"
                          "裸的 witness.json 不是证据）")
@@ -129,6 +131,7 @@ def do_eval_witness(spec: Spec, args) -> int:
         rec = {
             "schema": "opl.evidence/1",
             "kind": "witness_eval",
+            "subject": args.subject,
             "verdict": "VERIFIED" if ok else "NOT VERIFIED",
             "verification_level": "exact_certificate" if ok else "none",
             "spec": os.path.abspath(args.spec),

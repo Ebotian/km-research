@@ -46,6 +46,11 @@ def main() -> int:
     ap.add_argument("--timeout", type=float, default=3600.0)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--evidence-out")
+    ap.add_argument("--subject", help="这份证据是关于哪个猜想的（id）。"
+                                      "台账会核对它——没有它，一份真证据可以被拿去"
+                                      "给另一个猜想背书")
+    ap.add_argument("--range", dest="vrange", metavar="LO..HI",
+                    help="本次检查覆盖的范围。用于支撑 no_counterexample_in_range")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
@@ -101,7 +106,8 @@ def main() -> int:
             s("UNKNOWN", res.failure_reason)
         return UNKNOWN
 
-    record = build_record(res=res, formula=formula, cert=cert)
+    record = build_record(res=res, formula=formula, cert=cert,
+                          subject=args.subject, vrange=args.vrange)
     if args.evidence_out:
         out_json(record, args.evidence_out)
 

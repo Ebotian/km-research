@@ -48,7 +48,7 @@
 | 命令 | 一个职责 |
 |---|---|
 | `opl-capabilities` | 探测后端，产出 `capabilities.json`。含 Python 模块探测、解释器分裂检测与**功能性沙箱探测** |
-| `opl-conj` | 猜想台账。一题一文件；状态变更必须带 `--evidence`，且**升档必须附判决支撑该档位的 `opl.evidence/1` 记录**，否则拒绝写入（退出码 `2`） |
+| `opl-conj` | 猜想台账。一题一文件；状态变更必须带 `--evidence`，证据还要与结论**绑对象、绑方向、绑范围、绑输入哈希**，否则拒绝写入（退出码 `2`） |
 | `opl-encode` | 规格 → CNF / CP-SAT；双后端一致性检查；见证直接求值 |
 | `opl-search` | 跑搜索，产出见证或 DRAT 证明 |
 | `opl-certcheck` | 用独立校验器复核证书 |
@@ -335,14 +335,14 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 138 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 140 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
 plugin/scripts/verify-zip.sh     # 47 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
 回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
-`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `124 通过 / 0 失败 / 14 跳过`），
+`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `126 通过 / 0 失败 / 14 跳过`），
 `verify-zip.sh` 在同样情形下报 `42 通过 / 0 失败 / 5 跳过`。
 跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
 

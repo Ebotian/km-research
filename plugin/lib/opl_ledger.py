@@ -71,7 +71,28 @@ LEVEL_VERDICTS: dict[str, frozenset[str]] = {
 HUMAN_LEVEL = "human_peer_reviewed"
 HUMAN_FORMALIZATION = "faithfulness_checked"
 
-# 证据记录里「文件字段 → 哈希字段」的对应。有就查，没有就跳过。
+# 结论方向 ↔ 证据种类：**证据必须支持它被用来支持的那个结论**。
+# 一份「见证求值通过」的记录说的是「这个见证满足规格」，它说不了「该范围内没有反例」；
+# 反过来，一份不可满足证书也说不了「存在反例」。拿错方向的证据去支撑结论，
+# 就是在用真证据说假话。
+CONCLUSION_EVIDENCE: dict[str, tuple[str | None, str | None]] = {
+    "refuted": ("witness_eval", "VERIFIED"),
+    "no_counterexample_in_range": ("cert", "VERIFIED"),
+    "proved": ("lean_audit", "proved"),
+    "open": (None, None),          # 不声称结论，不需要证据
+    "inconclusive": (None, None),
+}
+
+# 结论 → 它能支撑的档位（再由证据是否合格决定能否真给到这一档）
+CONCLUSION_LEVEL: dict[str, str] = {
+    "refuted": "exact_certificate",
+    "no_counterexample_in_range": "exact_certificate",
+    "proved": "lean_checked",
+}
+
+# 证据记录里「文件字段 → 哈希字段」的对应。**按种类必填**：缺了就拒，不跳过。
+# 早先的写法是「有就查，没有就跳过」，于是一份只写了 schema 与 verdict 的 JSON
+# 也能支撑 exact_certificate——那等于给「随便写个文件」开了后门。
 EVIDENCE_BINDINGS: tuple[tuple[str, str], ...] = (
     ("certificate", "certificate_sha256"),
     ("formula", "formula_sha256"),
@@ -79,6 +100,13 @@ EVIDENCE_BINDINGS: tuple[tuple[str, str], ...] = (
     ("witness", "witness_sha256"),
     ("spec", "spec_sha256"),
 )
+
+# 每种证据**必须**带哪些绑定字段
+KIND_REQUIRED_BINDINGS: dict[str, tuple[tuple[str, str], ...]] = {
+    "cert": (("certificate", "certificate_sha256"), ("formula", "formula_sha256")),
+    "witness_eval": (("witness", "witness_sha256"), ("spec", "spec_sha256")),
+    "lean_audit": (("file", "file_sha256"),),
+}
 
 
 class LedgerError(Exception):
@@ -154,7 +182,9 @@ def sha256_file(path: str) -> str:
 
 
 def load_evidence(path: str | None, *, required_level: str | None = None,
-                  subject: str | None = None) -> Evidence:
+                  subject: str | None = None, expect_kind: str | None = None,
+                  expect_range: str | None = None,
+                  expect_subject: str | None = None) -> Evidence:
     """读并校验一份证据记录。任何一处不合格都抛 `LedgerError`，理由写到点上。
 
     `path` 允许为 `None`：**「没给指针」也是在这一层被拒的**。升档却什么都不带，
@@ -188,7 +218,30 @@ def load_evidence(path: str | None, *, required_level: str | None = None,
                 f"证据记录的判决是 {verdict!r}，不足以支撑 {required_level}{who}；"
                 f"该档位需要 {sorted(want)}。"
                 f"（`none` / `UNKNOWN` / `NOT VERIFIED` / `sorry_ax` 都属此列）")
-    # 绑定性：记录引用的文件必须存在，且哈希对得上
+    # 种类与方向：这份证据讲的是哪一类事实
+    kind = rec.get("kind")
+    if expect_kind is not None and kind != expect_kind:
+        raise LedgerError(
+            f"证据的种类是 {kind!r}，而这个结论需要 {expect_kind!r}{who}。"
+            f"一份「见证求值通过」说不了「该范围内没有反例」，反过来也一样——"
+            f"拿错方向的证据去支撑结论，就是在用真证据说假话。")
+    # 对象：这份证据是为哪个猜想出的
+    if expect_subject is not None and rec.get("subject") != expect_subject:
+        raise LedgerError(
+            f"证据的 subject 是 {rec.get('subject')!r}，而这次要记的是 "
+            f"{expect_subject!r}{who}。没有这一项，一份真证据可以给**另一个**猜想背书。")
+    # 范围：结论里那句「某范围内」必须与证据里的一致
+    if expect_range is not None and str(rec.get("range") or "") != expect_range:
+        raise LedgerError(
+            f"证据记录的 range 是 {rec.get('range')!r}，而登记的范围是 "
+            f"{expect_range!r}{who}。范围不一致时，「该范围内没有反例」这句话无法核对。")
+    # 绑定性：**按种类必填**，缺了就拒
+    required = KIND_REQUIRED_BINDINGS.get(str(kind), ())
+    for file_key, hash_key in required:
+        if not rec.get(file_key) or not rec.get(hash_key):
+            raise LedgerError(
+                f"{kind!r} 类证据必须带 {file_key!r} 与 {hash_key!r}{who}——"
+                f"缺了它们，这份记录没有绑定到任何输入。")
     for file_key, hash_key in EVIDENCE_BINDINGS:
         f, h = rec.get(file_key), rec.get(hash_key)
         if not f or not h:
@@ -201,7 +254,7 @@ def load_evidence(path: str | None, *, required_level: str | None = None,
                 f"证据与文件对不上{who}：{f}\n  记录写的是 {h[:16]}…，实际是 {got[:16]}…\n"
                 f"  记录过期或被改过——旧记录不该继续给新文件背书。")
     return Evidence(path=path, sha256=sha256_file(path), verdict=str(verdict),
-                    level=rec.get("verification_level"), kind=rec.get("kind"), record=rec)
+                    level=rec.get("verification_level"), kind=kind, record=rec)
 
 
 def require_human(confirmed_by: str | None, what: str) -> dict[str, Any]:
@@ -391,19 +444,64 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
     if verification_level:
         if verification_level not in LEVELS:
             raise LedgerError(f"非法 verification_level，允许：{', '.join(LEVELS)}")
-        if verification_level == HUMAN_LEVEL:
-            require_human(confirmed_by, f"verification_level={HUMAN_LEVEL}")
-        elif verification_level != "empirical":
-            ev = load_evidence(evidence, required_level=verification_level,
-                               subject=rec.get("id"))
-
     if formal_status:
         if formal_status not in FORMAL_STATUSES:
             raise LedgerError(f"非法 formal_status，允许：{', '.join(FORMAL_STATUSES)}")
+
+    # == 每次改结论都重新校验证据 ==
+    #
+    # 上一版只在**显式传 --verification-level** 时才验证据，于是「改结论 + 一个不存在的
+    # 证据路径」拿得到退出码 0，而旧的高档位（exact_certificate）**原样保留**——
+    # 换了个结论，徽章没换。所以这里把「改结论」本身当成一次重新校验：
+    # 证据必须支持**新结论的方向**，档位由此**重新定**，而不是继承。
+    #
+    # 触发条件是**显式改结论**（传了 `--formal-status`），不是「任何一次 set」：
+    # 加一个反例、写一次 formalization_status 都不改变已经成立的那个结论，
+    # 不该因此把记录打回原形（实测踩到：加反例与写签字都被这条误拦）。
+    pending = formal_status if formal_status else None
+    want_kind, want_verdict = CONCLUSION_EVIDENCE.get(str(pending), (None, None))
+    level_from_evidence: str | None = None
+    if formal_status and want_kind is not None:
+        want_range = None
+        if pending == "no_counterexample_in_range":
+            # 范围必须一起核：只说「某范围内没有反例」而不说范围，等于什么都没说。
+            if verified_range:
+                lo, hi = _parse_range(verified_range)
+                want_range = f"{lo}..{hi}"
+            else:
+                existing = rec.get("verified_range") or {}
+                if existing.get("lo") is not None:
+                    want_range = f"{existing['lo']}..{existing['hi']}"
+            if want_range is None:
+                raise LedgerError(
+                    "登记 no_counterexample_in_range 必须带 --verified-range："
+                    "「没找到」只在说清在哪个范围内时才有意义")
+        ev = load_evidence(evidence, required_level="exact_certificate"
+                           if want_kind != "lean_audit" else "lean_checked",
+                           subject=rec.get("id"), expect_kind=want_kind,
+                           expect_range=want_range, expect_subject=rec.get("id"))
+        if ev.verdict != want_verdict:
+            raise LedgerError(
+                f"证据的判决是 {ev.verdict!r}，不足以支撑结论 {pending!r}"
+                f"（需要 {want_verdict!r}）")
+        level_from_evidence = CONCLUSION_LEVEL.get(str(pending))
+
+    if formal_status:
         _touch(rec, "formal_status", rec.get("formal_status"), formal_status,
                evidence=evidence, run_id=run_id,
                evidence_sha256=ev.sha256 if ev else None)
         rec["formal_status"] = formal_status
+        # 档位**重新定**，不继承。证据支持到哪一档就是哪一档；没证据就是 empirical。
+        # 这一步是「换结论不换徽章」那个 bug 的正面修法。
+        new_level = level_from_evidence or "empirical"
+        if rec.get("verification_level") != new_level:
+            _touch(rec, "verification_level", rec.get("verification_level"), new_level,
+                   evidence=evidence, run_id=run_id,
+                   evidence_sha256=ev.sha256 if ev else None)
+            rec["verification_level"] = new_level
+            warnings.append(
+                f"结论改成 {formal_status!r} 后，档位按新证据重新定为 {new_level!r}"
+                f"（不再继承旧档位）")
     if informal_status:
         if informal_status not in STATUSES:
             raise LedgerError(f"非法 informal_status，允许：{', '.join(STATUSES)}")
@@ -469,6 +567,12 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
             if confirmation_note:
                 conf["note"] = confirmation_note
             rec.setdefault("human_confirmations", []).append(conf)
+        elif verification_level != "empirical":
+            # 显式升档：证据要支撑得住。这里与上面的「结论驱动」是两条路，
+            # 但用的是同一套证据校验。
+            ev2 = load_evidence(evidence, required_level=verification_level,
+                                subject=rec.get("id"))
+            ev = ev2
         _touch(rec, "verification_level", rec.get("verification_level"),
                verification_level, evidence=evidence, run_id=run_id,
                evidence_sha256=ev.sha256 if ev else None)

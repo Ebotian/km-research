@@ -344,11 +344,24 @@ def derive_verdict(fmt: str, log: str, parsed_ok: bool | None,
 # ------------------------------------------------------------------ 证据记录
 
 
-def build_record(*, res: CheckResult, formula: str, cert: str) -> dict[str, Any]:
-    """组装 `opl.evidence/1` 记录。判决与「是否完整读入」都如实写进去。"""
+def build_record(*, res: CheckResult, formula: str, cert: str,
+                 subject: str | None = None, vrange: str | None = None) -> dict[str, Any]:
+    """组装 `opl.evidence/1` 记录。判决与「是否完整读入」都如实写进去。
+
+    还要写清**这份证据是关于谁的、支持哪个方向的结论**：
+
+    * `kind = "cert"`：这是「某证书证明某公式不可满足」。台账据此判断它能不能用来
+      支撑 `no_counterexample_in_range`——**一份见证求值记录说不了「没有反例」**。
+    * `subject`：猜想 id。没有它，一份真证据可以被拿去给**另一个**猜想背书。
+    * `range`：这次检查覆盖的范围。范围必须随证据一起走，否则「某范围内无反例」
+      这句话里的「某范围」在事后无法核对。
+    """
     parsed_ok = res.parsed_ok
     record: dict[str, Any] = {
         "schema": "opl.evidence/1",
+        "kind": "cert",
+        "subject": subject,
+        "range": vrange,
         "backend": res.backend,
         "format": res.fmt,
         "formula": os.path.abspath(formula),

@@ -98,17 +98,22 @@ export OPL_LAB="$work/lab"
 #   ev-notverified  内容篡改的证书 -> verdict=NOT VERIFIED（真记录，只是判决是否）
 #   ev-stale.json   把真记录指向另一个文件 -> 哈希对不上
 $BIN/opl-certcheck --formula $FIX/uuf-100-1.cnf --cert $FIX/uuf-100-1.drat \
-    --evidence-out "$work/ev-cert.json" >/dev/null 2>&1
+    --evidence-out "$work/ev-cert.json" --subject R-1 --range 1..1000 >/dev/null 2>&1
 $BIN/opl-certcheck --formula $FIX/uuf-100-1.cnf --cert "$work/drat-tampered.drat" \
-    --evidence-out "$work/ev-notverified.json" >/dev/null 2>&1
+    --evidence-out "$work/ev-notverified.json" --subject R-1 --range 1..1000 >/dev/null 2>&1
 python3 -c "
 import json
 r = json.load(open('$work/ev-cert.json'))
 r['certificate'] = '$work/drat-tampered.drat'      # 记录不变，指向的文件变了
 json.dump(r, open('$work/ev-stale.json', 'w'))"
+# R-1 的**见证证据**：改结论=refuted 需要它（方向是 witness_eval）。
+# 「带证据改状态」那条用例原先给的是一个**不存在的文件**——在只查「串非空」的年代
+# 能过，现在改结论会真校验证据，所以必须给真东西。
+$BIN/opl-encode --spec $FIX/spec-pc23.json --eval-witness $FIX/spec-pc23-witness.json \
+    --evidence-out "$work/ev-wit.json" --subject R-1 >/dev/null 2>&1
 chk "add"                    0 $BIN/opl-conj add --id R-1 --statement "测试陈述"
 chk "无证据改状态（拒绝写入）" 2 $BIN/opl-conj set R-1 --formal-status refuted
-chk "带证据改状态"           0 $BIN/opl-conj set R-1 --formal-status refuted --evidence "$work/ev.json"
+chk "带证据改状态"           0 $BIN/opl-conj set R-1 --formal-status refuted --evidence "$work/ev-wit.json"
 # 锁住一个修掉的真 bug：旧代码在*没有* --evidence 时也写死 verified_by=independent
 # 与 verification_level=exact_certificate，只打一句 stderr 警告——那是在数据里
 # 断言一次从未做过的独立复核。
@@ -127,9 +132,11 @@ chk "list 无匹配"            5 $BIN/opl-conj list --status proved
 # 自己的纪律（人工确认不能由机器判决代替）。
 chk "证据文件不存在 -> 2"     2 $BIN/opl-conj set R-1 --formal-status proved \
     --evidence /nonexistent/evidence.json --verification-level lean_checked
-chk "判决不足以支撑档位 -> 2" 2 $BIN/opl-conj set R-1 --formal-status proved \
+chk "判决不足以支撑档位 -> 2" 2 $BIN/opl-conj set R-1 \
+    --formal-status no_counterexample_in_range --verified-range 1..1000 \
     --evidence "$work/ev-notverified.json" --verification-level exact_certificate
-chk "证据与文件对不上 -> 2"   2 $BIN/opl-conj set R-1 --formal-status proved \
+chk "证据与文件对不上 -> 2"   2 $BIN/opl-conj set R-1 \
+    --formal-status no_counterexample_in_range --verified-range 1..1000 \
     --evidence "$work/ev-stale.json" --verification-level exact_certificate
 chk "缺人工确认 -> 2"         2 $BIN/opl-conj set R-1 --formalization-status faithfulness_checked
 chk "人工确认不能由机器判决代替" 2 $BIN/opl-conj set R-1 \
@@ -137,7 +144,10 @@ chk "人工确认不能由机器判决代替" 2 $BIN/opl-conj set R-1 \
 chk "带 --confirmed-by 才放行" 0 $BIN/opl-conj set R-1 \
     --formalization-status faithfulness_checked --confirmed-by "EBT"
 # 真记录必须能过：否则上面那五条等于把功能锁死了
-chk "真证书记录可升档"        0 $BIN/opl-conj set R-1 --formal-status proved \
+# 证书支撑的结论是「该范围内无反例」，不是「已被推翻」——**方向由证据种类决定**。
+# 所以这条要连范围一起给（范围必须与证据里记的一致，否则「某范围内」无法核对）。
+chk "真证书记录可升档"        0 $BIN/opl-conj set R-1 \
+    --formal-status no_counterexample_in_range --verified-range 1..1000 \
     --evidence "$work/ev-cert.json" --verification-level exact_certificate
 chk "升档在 history 里留下证据哈希" 0 python3 -c "
 import json, sys
@@ -167,6 +177,115 @@ cs = json.load(open('$work/lab/conjectures/R-1.json'))['counterexamples']
 c = [x for x in cs if x['witness'] == 'n=99'][0]
 sys.exit(0 if (c['verified_by'] == 'UNVERIFIED'
                and c['verification_level'] == 'empirical') else 1)"
+
+# ---- F2：证据必须绑定对象、方向与范围（审阅稿第二轮的复现）----
+$BIN/opl-conj add --id R-2 --statement "另一个猜想" >/dev/null 2>&1
+# 「真证据说假话」比假证据更难防：证据本身没问题，它被拿来说了另一件事。
+chk "F2 真证据不得给另一个猜想背书" 0 python3 -c "
+import subprocess, sys, os
+env = dict(os.environ)
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-2',
+                    '--formal-status', 'no_counterexample_in_range',
+                    '--verified-range', '1..1000',
+                    '--evidence', '$work/ev-cert.json'],   # 这份证据的 subject 是 R-1
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 2:
+    why.append('退出码 %d（应为 2）' % r.returncode)
+if 'subject' not in (r.stderr + r.stdout):
+    why.append('理由没提 subject：%r' % r.stderr.strip()[-90:])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F2 证据方向必须匹配结论" 0 python3 -c "
+import subprocess, sys, os
+env = dict(os.environ)
+why = []
+# 见证记录（witness_eval）说不了「该范围内没有反例」
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-1',
+                    '--formal-status', 'no_counterexample_in_range',
+                    '--verified-range', '1..1000',
+                    '--evidence', '$work/ev-wit.json'],
+                   capture_output=True, text=True, env=env)
+if r.returncode != 2:
+    why.append('用见证支撑「无反例」得到退出码 %d（应为 2）' % r.returncode)
+if 'witness_eval' not in (r.stderr + r.stdout):
+    why.append('理由没点出证据种类：%r' % r.stderr.strip()[-90:])
+# 反过来：证书说不了「已被推翻」
+r2 = subprocess.run(['$BIN/opl-conj', 'set', 'R-1', '--formal-status', 'refuted',
+                     '--evidence', '$work/ev-cert.json'],
+                    capture_output=True, text=True, env=env)
+if r2.returncode != 2:
+    why.append('用证书支撑「已被推翻」得到退出码 %d（应为 2）' % r2.returncode)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F2 范围必须与证据一致" 0 python3 -c "
+import subprocess, sys, os
+env = dict(os.environ)
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-1',
+                    '--formal-status', 'no_counterexample_in_range',
+                    '--verified-range', '1..7',            # 证据里记的是 1..1000
+                    '--evidence', '$work/ev-cert.json'],
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 2:
+    why.append('退出码 %d（应为 2）' % r.returncode)
+if 'range' not in (r.stderr + r.stdout):
+    why.append('理由没提 range：%r' % r.stderr.strip()[-90:])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F2 缺绑定字段的记录 -> 2" 0 python3 -c "
+import json, subprocess, sys, os
+env = dict(os.environ)
+# 只有 schema/kind/subject/verdict 的记录：没有 certificate 与它的哈希
+json.dump({'schema': 'opl.evidence/1', 'kind': 'cert', 'subject': 'R-1',
+           'range': '1..1000', 'verdict': 'VERIFIED'}, open('$work/ev-bare.json', 'w'))
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-1',
+                    '--formal-status', 'no_counterexample_in_range',
+                    '--verified-range', '1..1000',
+                    '--evidence', '$work/ev-bare.json'],
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 2:
+    why.append('退出码 %d（应为 2）' % r.returncode)
+if 'certificate_sha256' not in (r.stderr + r.stdout):
+    why.append('理由没点出缺哪个绑定字段：%r' % r.stderr.strip()[-90:])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# 改结论必须重新校验，且档位**重新定**而不是继承——这是「换结论不换徽章」的正面修法
+chk "F2 改结论重新校验并重定档位" 0 python3 -c "
+import json, subprocess, sys, os
+env = dict(os.environ)
+why = []
+# 1 不存在的证据 + 改结论：旧版给退出码 0 并把旧档位原样留着
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-1', '--formal-status', 'refuted',
+                    '--evidence', '/nonexistent/x.json'],
+                   capture_output=True, text=True, env=env)
+if r.returncode != 2:
+    why.append('改结论 + 不存在的证据得到退出码 %d（应为 2）' % r.returncode)
+# 2 用对方向的证据改结论：档位由证据重定（witness → exact_certificate）
+r2 = subprocess.run(['$BIN/opl-conj', 'set', 'R-1', '--formal-status', 'refuted',
+                     '--evidence', '$work/ev-wit.json'],
+                    capture_output=True, text=True, env=env)
+if r2.returncode != 0:
+    why.append('正确的方向改结论得到退出码 %d：%s' % (r2.returncode, r2.stderr[-100:]))
+d = json.load(open('$work/lab/conjectures/R-1.json'))
+if d['verification_level'] != 'exact_certificate':
+    why.append('档位是 %r（应为 exact_certificate）' % d['verification_level'])
+# 3 换成不需要证据的结论（open）：档位必须**降下来**，不继承
+r3 = subprocess.run(['$BIN/opl-conj', 'set', 'R-1', '--formal-status', 'open',
+                     '--evidence', '$work/ev-wit.json'],
+                    capture_output=True, text=True, env=env)
+d = json.load(open('$work/lab/conjectures/R-1.json'))
+if d['verification_level'] != 'empirical':
+    why.append('结论改回 open 之后档位仍是 %r——徽章被继承了'
+               % d['verification_level'])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
 
 # ---------------------------------------------------------------- 能力探测
 echo "capabilities —— 必需层"
@@ -1527,7 +1646,8 @@ chk "3 搜索（sat 侧，出见证）" 0 $BIN/opl-search --spec $FIX/spec-pc23.
 # 复核见证并**产出结构化证据记录**：裸的 witness.json 不是证据——它既没法证明
 # 「谁复核的」，也没法证明「复核的是这份见证」。台账升档要求 opl.evidence/1。
 chk "4 独立复核见证"          0 $BIN/opl-encode --spec $FIX/spec-pc23.json \
-    --eval-witness "$work/e2e/witness.json" --evidence-out "$work/e2e/ev-witness.json"
+    --eval-witness "$work/e2e/witness.json" --evidence-out "$work/e2e/ev-witness.json" \
+    --subject E-1
 chk "5 台账定案"              0 $BIN/opl-conj set E-1 --formal-status refuted \
     --evidence "$work/e2e/ev-witness.json" --verification-level exact_certificate
 chk "终态与证据指针正确"       0 python3 -c "
@@ -1546,7 +1666,8 @@ sys.exit(0 if ok else 1)"
 chk "3b 搜索（unsat 侧，出证明）" 0 $BIN/opl-search --spec $FIX/spec-pc43.json \
     --cnf-out "$work/e2e/u.cnf" --proof-out "$work/e2e/u.drat"
 chk "4b 复核证明并落证据记录"     0 $BIN/opl-certcheck --formula "$work/e2e/u.cnf" \
-    --cert "$work/e2e/u.drat" --evidence-out "$work/e2e/lab/evidence/E-2.json"
+    --cert "$work/e2e/u.drat" --evidence-out "$work/e2e/lab/evidence/E-2.json" \
+    --subject E-2
 chk "证据记录字段正确"            0 python3 -c "
 import json, sys
 d = json.load(open('$work/e2e/lab/evidence/E-2.json'))
@@ -1559,10 +1680,10 @@ sys.exit(0 if ok else 1)"
 # 冻结整个顶层键集，任何漂移都会红。
 chk "证据记录字段冻结"            0 python3 -c "
 import json, sys
-FROZEN = {'schema', 'backend', 'format', 'formula', 'formula_sha256',
-          'certificate', 'certificate_sha256', 'certificate_bytes',
-          'parse_complete', 'parsed_bytes', 'duration_ms', 'checked_at',
-          'checker_messages', 'verdict', 'verification_level'}
+FROZEN = {'schema', 'kind', 'subject', 'range', 'backend', 'format',
+          'formula', 'formula_sha256', 'certificate', 'certificate_sha256',
+          'certificate_bytes', 'parse_complete', 'parsed_bytes', 'duration_ms',
+          'checked_at', 'checker_messages', 'verdict', 'verification_level'}
 got = set(json.load(open('$work/e2e/lab/evidence/E-2.json')))
 if got != FROZEN:
     print('新增:', sorted(got - FROZEN), '丢失:', sorted(FROZEN - got), file=sys.stderr)
@@ -1690,7 +1811,8 @@ ok = ('theorem oddSum_eq_sq' in code and 'True' not in code
       and 'native_decide' not in code)
 sys.exit(0 if ok else 1)"
   chk "6b 证明检查 + 产出证据记录"  0 $BIN/opl-leancheck --file $FIX/lean-real.lean \
-      --decl oddSum_eq_sq --evidence-out "$work/e2e/lab/evidence/E-3.json"
+      --decl oddSum_eq_sq --evidence-out "$work/e2e/lab/evidence/E-3.json" \
+      --subject E-3
   chk "6c 证据记录判为 lean_checked" 0 python3 -c "
 import json, sys
 d = json.load(open('$work/e2e/lab/evidence/E-3.json'))

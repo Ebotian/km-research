@@ -89,7 +89,8 @@ chk "2 编码一致"      0 "$root/bin/opl-encode" --spec "$F/spec-pc23.json" --
 chk "3 搜索出见证"    0 "$root/bin/opl-search" --spec "$F/spec-pc23.json" \
     --cnf-out "$work/m.cnf" --witness-out "$work/w.json"
 chk "4 独立复核"      0 "$root/bin/opl-encode" --spec "$F/spec-pc23.json" \
-    --eval-witness "$work/w.json" --evidence-out "$work/ev-witness.json"
+    --eval-witness "$work/w.json" --evidence-out "$work/ev-witness.json" \
+    --subject Z-1
 chk "5 定案"          0 "$root/bin/opl-conj" set Z-1 --formal-status refuted \
     --evidence "$work/ev-witness.json" --verification-level exact_certificate
 chk "unsat 侧出证明"  0 "$root/bin/opl-search" --spec "$F/spec-pc43.json" \
@@ -173,7 +174,8 @@ if command -v lake >/dev/null 2>&1 && [ -f "$lean_proj/lean-toolchain" ]; then
   export OPL_LEAN_PROJECT="$(readlink -f "$lean_proj")"
   echo "  （Lean 可用：$OPL_LEAN_PROJECT）"
   chk "证明检查 + 证据记录" 0 "$root/bin/opl-leancheck" --file "$F/lean-real.lean" \
-      --decl oddSum_eq_sq --evidence-out "$work/lab/evidence/Z-3.json"
+      --decl oddSum_eq_sq --evidence-out "$work/lab/evidence/Z-3.json" \
+      --subject Z-3
   chk "证据记录判为 lean_checked" 0 python3 -c "
 import json, sys
 d = json.load(open('$work/lab/evidence/Z-3.json'))

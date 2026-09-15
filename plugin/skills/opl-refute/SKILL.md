@@ -127,6 +127,29 @@ $OPL/opl-conj set C-0001 --formal-status no_counterexample_in_range \
 
 **不带 `--evidence` 会被拒绝写入（退出码 `2`）。** 这条纪律由工具强制，不是约定。
 
+**证据还必须与结论对得上**——四项绑定，缺一项就拒（退出码 `2`）：
+
+| 绑定 | 规则 |
+|---|---|
+| 对象 | 证据的 `subject` 必须等于这次登记的猜想 id。**一份真证据不能给另一个猜想背书** |
+| 方向 | `refuted` 要见证求值记录（`witness_eval`）、`no_counterexample_in_range` 要证书（`cert`）、`proved` 要 Lean 审计（`lean_audit`）。**见证求值说不了「没有反例」**，反过来也一样 |
+| 范围 | `--verified-range` 必须与证据里记的范围一致。不一致时「该范围内没有反例」无法核对 |
+| 输入 | 每类证据必须带自己的文件与哈希（证书要 `certificate`+`formula`、见证要 `witness`+`spec`、Lean 要 `file`）。缺了它们，记录没有绑定到任何输入 |
+
+生成证据时就把这些写进去：
+
+```bash
+$OPL/opl-certcheck --formula … --cert … --evidence-out lab/evidence/C-0001.json \
+  --subject C-0001 --range 1..1000000
+$OPL/opl-encode --spec … --eval-witness … --evidence-out lab/evidence/C-0001.json \
+  --subject C-0001
+```
+
+**改结论会重新定档位**，不继承旧的：结论换成 `open` 就是 `empirical`，
+换成 `refuted` 而证据是见证记录就是 `exact_certificate`。这一条修的是「换结论不换徽章」：
+旧版只在显式传 `--verification-level` 时才验证据，于是「改结论 + 一个不存在的证据路径」
+拿得到退出码 0，而高档位原样留着。
+
 `verification_level` 只填你实际拿到的档，而且**升档要证据支撑**：
 `exact_certificate` 要求证据记录的 `verdict` 是 `VERIFIED`（`lean_checked` 要求
 `proved`），记录里引用的文件还必须与哈希对得上。指针非空 ≠ 复核过。
