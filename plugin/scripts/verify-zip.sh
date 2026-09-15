@@ -59,9 +59,10 @@ done
 chk "opl-leancheck 在包里且可执行" 0 test -x "$root/bin/opl-leancheck"
 chk "opl-run 在包里且可执行"      0 test -x "$root/bin/opl-run"
 # opl-evolve 的三个命令也要随包可用（判据 12：新命令随包）
-for b in opl-evolve-init opl-evolve-eval opl-evolve-show; do
+for b in opl-evolve-init opl-evolve-eval opl-evolve-show opl-evolve-suggest; do
   chk "$b 在包里且可执行" 0 test -x "$root/bin/$b"
 done
+chk "opl-evolve 技能在包里" 0 test -f "$root/skills/opl-evolve/SKILL.md"
 chk "无残留软链"      0 test -z "$(find "$root" -type l)"
 chk "运行时夹具在位"  0 test -f "$root/tests/fixtures/tiny.clrat"
 chk "证明侧夹具在位"  0 test -f "$root/tests/fixtures/lean-real.lean"

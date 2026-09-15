@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""opl-evolve-suggest —— 出一份可执行的变异任务书。薄壳：逻辑在 lib/opl_evolve.py。
+
+用法：
+    opl-evolve-suggest --lab DIR [--parents N] [--metric KEY] [--where KEY=VALUE]
+                       [--maximize] [--json]
+
+工具**不替你变异**（变异算子留给宿主 agent）。它做的是让变异有据可依：交出可进化区
+与不可动的区外、挑出亲本并逐条说明为什么挑它、把提交时会被执行的约束原样列出。
+
+`stdout` 只出 JSON；人看的摘要走 `stderr`。
+
+退出码：
+    0  任务书已产出
+    2  参数错或实验目录不存在
+    5  EMPTY：库里没有任何带指标的候选 —— 挑亲本没有依据
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+
+from opl_common import PASS, USAGE, EMPTY, c  # noqa: E402
+from opl_evolve import EvolveError, parse_where, suggest  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--lab", required=True)
+    ap.add_argument("--parents", type=int, default=3)
+    ap.add_argument("--metric", default=None, help="按哪个 metrics 字段挑亲本")
+    ap.add_argument("--maximize", action="store_true", help="默认按最小化")
+    ap.add_argument("--where", action="append", default=None, metavar="KEY=VALUE",
+                    help="只在这些条件成立的行里挑亲本（可重复），例如 sorts=true")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        where = parse_where(args.where)
+        brief = suggest(args.lab, parents=args.parents, metric=args.metric,
+                        minimize=not args.maximize, where=where)
+    except EvolveError as exc:
+        c(str(exc))
+        return USAGE
+
+    for n in brief.notes:
+        c(f"注意：{n}")
+    if not brief.parents:
+        # 「没有依据」不是「任务书是空的」——如实报 EMPTY，不要给一份无亲本的任务书
+        if args.json:
+            print(json.dumps({"schema": "opl.evolve.suggest/1", "parents": [],
+                              "notes": brief.notes, "constraints": brief.constraints},
+                             ensure_ascii=False, indent=2, sort_keys=True))
+        return EMPTY
+    for r in brief.parents:
+        c(f"亲本 id={r['id']} 第{r['generation']}代 {r.get('why')}  "
+          f"metrics={json.dumps(r.get('metrics') or {}, ensure_ascii=False)}")
+    if args.json:
+        print(json.dumps({
+            "schema": "opl.evolve.suggest/1",
+            "lab_dir": brief.lab_dir, "skeleton_path": brief.skeleton_path,
+            "evolve_block": brief.block, "immutable_outside": brief.outside,
+            "parents": [{k: r[k] for k in ("id", "generation", "operation",
+                                          "code_hash", "metrics", "why")}
+                        for r in brief.parents],
+            "constraints": brief.constraints,
+            "notes": brief.notes,
+        }, ensure_ascii=False, indent=2, sort_keys=True))
+    return PASS
+
+
+if __name__ == "__main__":
+    sys.exit(main())

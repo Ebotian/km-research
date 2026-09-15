@@ -19,7 +19,8 @@
     "./skills/opl-entry/",
     "./skills/opl-refute/",
     "./skills/opl-formalize/",
-    "./skills/opl-prove/"
+    "./skills/opl-prove/",
+    "./skills/opl-evolve/"
   ],
   "sessionStart": {
     "skill": "opl-entry"

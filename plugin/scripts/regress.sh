@@ -809,6 +809,57 @@ if after != mid:
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+# ---- suggest + 技能（判据 7/13 的收口）----
+# `suggest` 的核心不是「输出点什么」，而是**亲本必须有理由、且最好的那条真的是最好的**。
+# 这里刻意先放一条更差的候选再问：排序方向写反过一次（把 comparators=6 当成了「当前
+# 最好」，而库里明明有 5），所以这一条同时断言方向与理由。
+chk "suggest 亲本有理由且方向正确" 0 python3 -c "
+import json, os, subprocess, sys
+env = dict(os.environ)
+r = subprocess.run(['$BIN/opl-evolve-suggest', '--lab', '$EL',
+                    '--metric', 'comparators', '--where', 'sorts=true', '--json'],
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 0:
+    why.append('退出码 %d' % r.returncode)
+else:
+    d = json.loads(r.stdout)
+    ps = d.get('parents') or []
+    if not ps:
+        why.append('没有亲本')
+    else:
+        top = ps[0]
+        got = (top.get('metrics') or {}).get('comparators')
+        if got != 5:
+            why.append('「当前最好」是 comparators=%r（库里最好的是 5）——方向写反' % got)
+        if (top.get('metrics') or {}).get('sorts') is not True:
+            why.append('亲本不可行：sorts=%r' % (top.get('metrics') or {}).get('sorts'))
+        if 'why' not in top:
+            why.append('亲本没给理由')
+        # 每条亲本都要有理由，而且理由要能区分（不是同一个字符串复读）
+        whys = [p.get('why') for p in ps]
+        if any(not w for w in whys):
+            why.append('有亲本没给理由：%r' % whys)
+        if len(set(whys)) != len(whys):
+            why.append('亲本理由重复：%r' % whys)
+    if len(d.get('constraints') or []) < 3:
+        why.append('约束列得太少：%r' % d.get('constraints'))
+    # `evolve_block` 是**标记之间**的内容，标记本身在 immutable_outside 里。
+    # （第一版把这条断言写成「evolve_block 里要有 EVOLVE-BLOCK」，错在没分清两者。）
+    blob = d.get('evolve_block') or ''
+    if not blob.strip() or 'build_network' not in blob:
+        why.append('任务书没给出可进化区的内容：%r' % blob[:40])
+    if 'EVOLVE-BLOCK' not in (d.get('immutable_outside') or ''):
+        why.append('任务书没标明不可动的区外在哪里')
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "skill frontmatter 有 name/description: opl-evolve" 0 python3 -c "
+import re, sys
+t = open('$plugin/skills/opl-evolve/SKILL.md').read()
+m = re.match(r'^---\n(.*?)\n---\n', t, re.S)
+fm = m.group(1) if m else ''
+sys.exit(0 if 'name: opl-evolve' in fm and 'description:' in fm else 1)"
 echo "encode —— 规格到模型，双后端互相证伪"
 chk "纯编码到 CNF（不需求解器）" 0 $BIN/opl-encode --spec $FIX/spec-pc43.json --to cnf --out "$work/e.cnf"
 chk "见证成立"                0 $BIN/opl-encode --spec $FIX/spec-pc23.json --eval-witness $FIX/spec-pc23-witness.json

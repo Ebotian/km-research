@@ -43,18 +43,24 @@
 
 `stdout` 只出机器可解析内容（一行 `s <判决>` 或一个 JSON 对象），诊断走 `stderr`。
 
-## 已实现的六个命令与四个技能
+## 已实现的十个命令与五个技能
 
 | 命令 | 一个职责 |
 |---|---|
-| `opl-capabilities` | 探测后端，产出 `capabilities.json`。含 Python 模块探测与解释器分裂检测 |
+| `opl-capabilities` | 探测后端，产出 `capabilities.json`。含 Python 模块探测、解释器分裂检测与**功能性沙箱探测** |
 | `opl-conj` | 猜想台账。一题一文件；**状态变更必须带 `--evidence`**，否则拒绝写入（退出码 `2`） |
 | `opl-encode` | 规格 → CNF / CP-SAT；双后端一致性检查；见证直接求值 |
 | `opl-search` | 跑搜索，产出见证或 DRAT 证明 |
 | `opl-certcheck` | 用独立校验器复核证书 |
 | `opl-leancheck` | 编译 Lean 文件并审计证明状态（公理白名单 + `sorry` 检测） |
+| `opl-run` | 在沙箱里跑一条命令，落四份快照（`cmd`/`env`/`capabilities`/`metrics`），支持 `--detach` / `--wait` |
+| `opl-evolve-init` | 建程序库：拷入骨架与评估器，并把骨架作为第 0 代**带指标**入库 |
+| `opl-evolve-suggest` | 出一份变异任务书（可进化区 + 带理由的亲本 + 提交时会执行的约束） |
+| `opl-evolve-eval` | 在沙箱里评估一份候选并入库；区外越界、重复各有各的退出码 |
+| `opl-evolve-show` | 看程序库；`--best` 必须配 `--where`，否则可能选出不可行的程序 |
 
-（都在 `plugin/bin/` 下；下面出现时按完整路径写。）
+（都在 `plugin/bin/` 下；下面出现时按完整路径写。上表 11 行是因为 `opl-evolve-*`
+占了四行——四个命令同属一个子系统。）
 
 证书格式与检查器（均实测通过）：
 
@@ -66,12 +72,15 @@
 | Alethe | [carcara](https://github.com/ufmg-smite/carcara)（可选） | Apache-2.0 |
 
 技能：`opl-entry`（总纲与路由）、`opl-refute`（反例搜索五步流程）、
-`opl-formalize`（命题 → Lean 陈述）、`opl-prove`（Lean 证明的审计与定案）。
+`opl-formalize`（命题 → Lean 陈述）、`opl-prove`（Lean 证明的审计与定案）、
+`opl-evolve`（程序骨架的变异搜索）。
 
-**六个命令的逻辑全部在 `lib/*.py` 内**（可类型检查、可单测），`bin/` 下只做 argv
+**十个命令的逻辑全部在 `lib/*.py` 内**（可类型检查、可单测），`bin/` 下只做 argv
 解析与退出码翻译。这是必需的而不是偏好：`bin/` 里的命令没有 `.py` 扩展名，
 是三个类型检查器的共同盲区（`mypy` 报 `Cannot find implementation`、
-`ty` 报 `unresolved-import`），逻辑只要留在那儿就等于没有类型检查。
+`ty` 报 `unresolved-import`），逻辑只要留在那儿就等于没有类型检查。实测印证过：
+一次编辑让 `bin/opl-run` 引用了未导入的名字，**三个类型检查器都没出声**，是回归
+跑出四项红并打出 traceback 才发现的。
 
 ## 准备 Lean（证明侧）
 
@@ -200,7 +209,51 @@ plugin/bin/opl-conj set C-0003 --formal-status proved \
 `{propext, Classical.choice, Quot.sound}` 内为准——这与 `cake_lpr`、`carcara`
 是同一类陷阱：**工具的退出码不携带我们要的那个区别**。
 
+## 程序搜索：`opl-evolve-*`（M4）
+
+工具**不替你变异**——变异算子留给宿主 agent，可执行文件只做「数据库 + 评估器 +
+沙箱」（`doc/plan/01-overview.typ` 定的分工）。它保证你变出来的东西**可独立复核、
+可去重、不会越界**。
+
+```bash
+SN=plugin/tests/fixtures/sortnet       # 排序网络：骨架 6 个比较器，n=4 最优 5 个
+plugin/bin/opl-evolve-init --lab lab --skeleton $SN/skeleton.py --evaluator $SN/evaluator.py
+plugin/bin/opl-evolve-suggest --lab lab --metric comparators --where sorts=true
+# …你按任务书改可进化区，交一份完整文件…
+plugin/bin/opl-evolve-eval --lab lab --candidate ./cand-01.py --generation 1 --operation mutate
+plugin/bin/opl-evolve-show --lab lab --best comparators --where sorts=true
+```
+
+判决分四档，各自的动作不同：`0` 入库且评估通过 / `1` 入库但评估不通过（**换方向**，
+不是微调）/ `2` 候选不合格（去修候选）/ `5` `code_hash` 命中，没有新增。
+另有两种「没有判决」：`3` 沙箱没给出结论（超时/被 OOM 杀），`4` 找不到 bwrap。
+
+**两处刻意取严的约束，都有实测理由：**
+
+- **区外逐字节不许变。** 「研究者写死骨架」得由工具执行，不能靠自觉。改一个空格
+  也算改动——这会误拒「只重排格式」的候选，但绝不会放过一次真实的区外改动，
+  而两种错的代价不对称。
+- **`best` 必须带 `--where`。** 实测：库里有一条 4 比较器的候选，它**并不排序**。
+  不加过滤时 `--best comparators` 会选中它——「从 6 个改进到 4 个」听起来像提升，
+  实际是把不可行的东西当成了成绩。可行性必须显式给出；工具刻意不替你猜哪个字段
+  意味着「可行」，猜错的那一次就会静默产出一条假曲线。
+
+## 沙箱执行：`opl-run`
+
+候选在 `bwrap` 里跑（禁网 + 独立 PID namespace + 只读系统库），外面套一层**自己建的
+per-run cgroup**（内存/进程数限额 + 收口 + OOM 归因）。三条实测推翻了三个想当然：
+
+| 想当然 | 实测 |
+|---|---|
+| `systemd-run -p IPAddressDeny=any` 能禁网 | **不禁网，而且不报错**（退出 0、无警告）。它靠 cgroup 的 `bpf` 控制器，而本机根 cgroup 没有 `bpf`。禁网因此一律走 `bwrap --unshare-net` |
+| `MemoryMax` 能限住内存 | **拦不住**：8 GB swap 把匿名页吸收掉，200 MB 逐页写照样成功（退出 0）。加上 `MemorySwapMax=0` 才开火（被杀，退出 `-9`，`memory.events` 记 `oom_kill 1`）。**两个结果都在这里写着**——只写对自己有利的那一个就成了假验收 |
+| `os.killpg` 能收干净 | **收不住 `setsid` 逃逸**（孙子活下来）。`cgroup.kill` 收得住；`bwrap --unshare-pid` 也收得住（内核在 PID namespace 的 init 终止时连坐） |
+
+`opl-capabilities --layer sandbox` 会**当场做一次**这些检查（不是查版本），因为只查
+`command -v` 会把「接受参数但什么都不做」的后端记成可用。
+
 ## 打包与安装
+
 
 ```bash
 plugin/scripts/build-zip.sh      # -> plugin/dist/open-problem-lab-<版本>.zip（约 285 KB）
@@ -227,13 +280,13 @@ Python 有 `z3`/`sympy`，另一个 venv 有 `cvc5`/`ortools`，两边都缺对�
 plugin/                 插件本体
   kimi.plugin.json      清单（skills 显式列出）
   THIRD-PARTY-NOTICES.md  随包分发的第三方许可声明
-  bin/                  六个命令（含 third-party/，由脚本安装，不入库）
-  lib/                  全部逻辑（2,228 行），可类型检查、可单测
-  skills/               opl-entry · opl-refute · opl-formalize · opl-prove
+  bin/                  十个命令（含 third-party/，由脚本安装，不入库）
+  lib/                  全部逻辑（3,960 行），可类型检查、可单测
+  skills/               opl-entry · opl-refute · opl-formalize · opl-prove · opl-evolve
   scripts/              typecheck · regress · build-zip · verify-zip
                         setup-third-party · update-third-party-notices · install-hooks
   hooks/pre-commit      提交前：类型检查 + 退出码回归
-  tests/fixtures/       运行时与回归共用的夹具（108 KB）
+  tests/fixtures/       运行时与回归共用的夹具（128 KB，含排序网络）
   lean                  指向本机 Lean 项目的软链（不入库）
 doc/
   plan/                 设计方案 8 章（790 行）
@@ -246,15 +299,15 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 107 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 110 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
-plugin/scripts/verify-zip.sh     # 45 项：解压到干净目录并跑通两条链
+plugin/scripts/verify-zip.sh     # 47 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
 回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
-`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `93 通过 / 0 失败 / 14 跳过`），
-`verify-zip.sh` 在同样情形下报 `27 通过 / 0 失败 / 5 跳过`。
+`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `96 通过 / 0 失败 / 14 跳过`），
+`verify-zip.sh` 在同样情形下报 `42 通过 / 0 失败 / 5 跳过`。
 跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
 
 回归里有两处**故障注入**——在*临时副本*上故意编坏 CNF 侧、故意让反解码返回错值，
@@ -295,12 +348,19 @@ plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 
 ## 状态
 
-已实现并纳入回归：`opl-encode` / `opl-search` 与其下游的证书链（反例侧），
-以及 `opl-leancheck` 与其两个技能（证明侧）。两侧的端到端都固化在
+已实现并纳入回归：`opl-encode` / `opl-search` 与其下游的证书链（反例侧）；
+`opl-leancheck` 与其两个技能（证明侧）；`opl-run` 与 `opl-evolve-*` 四命令加
+`opl-evolve` 技能（程序搜索侧，M4）。三条链的端到端都固化在
 `plugin/scripts/regress.sh` 与 `verify-zip.sh` 里，不是一次性手跑。
 
-设计方案里尚未实现：进化式程序搜索（M4）、基准与统计（M5）与报告生成，
-命令清单见 `doc/plan/03-toolchain.typ`，里程碑见 `doc/plan/07-roadmap.typ`。
+**M4 要说清楚的一点**：改进是「提交一份更好的候选」验出来的，**不是搜索出来的**。
+这符合设计（变异算子留给宿主 agent，插件只做数据库 + 评估器 + 沙箱），含义是——
+工具不替你变异，它保证你变出来的东西可独立复核、可去重、不会越界。
+
+设计方案里尚未实现：基准与统计（M5）、报告生成（M6），以及 `cell_key`
+（MAP-Elites 特征格）的坐标定义——字段已在表里，但单维会退化成单目标，多维需要先
+想清楚第二个维度是什么，所以没有编一个出来充数。命令清单见
+`doc/plan/03-toolchain.typ`，里程碑见 `doc/plan/07-roadmap.typ`。
 
 ## 许可
 

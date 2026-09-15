@@ -409,6 +409,98 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
 
 
 
+# ------------------------------------------------------------------ 出题
+
+
+@dataclass
+class SuggestBrief:
+    lab_dir: str
+    skeleton_path: str
+    block: str = ""
+    outside: str = ""
+    parents: list[dict[str, Any]] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+def suggest(lab: str, *, parents: int = 3, metric: str | None = None,
+            minimize: bool = True, where: dict[str, Any] | None = None) -> SuggestBrief:
+    """给宿主 agent 出一份**可执行的变异任务书**。
+
+    工具不替你做变异（`doc/plan/01-overview.typ`：变异算子留给宿主 agent，可执行文件
+    只做「数据库 + 评估器 + 沙箱」）。它做的是让变异**有据可依、有据可查**：
+
+    * 交出可进化区与**不可动的区外**（后者逐字节不许变，提交时会被拒）；
+    * 挑出亲本，并逐条说明**为什么挑它**——一份没有理由的亲本清单是不可复核的；
+    * 把提交时会被执行的约束原样列出，省掉一轮「提交→被拒」的往返。
+
+    挑亲本的策略说清楚（单目标最好者 + 尽量覆盖不同代以保证多样性）。它**不**声称
+    是 MAP-Elites：`cell_key` 的坐标还没定，编一个出来只会让「多样性」变成装饰。
+    """
+    p = lab_paths(lab)
+    if not os.path.isfile(p["db"]):
+        raise EvolveError(f"实验目录不存在：{p['db']}（先跑 opl-evolve-init）")
+    skeleton = open(p["skeleton"], encoding="utf-8").read()
+    parts = split_block(skeleton)
+
+    brief = SuggestBrief(lab_dir=p["dir"], skeleton_path=p["skeleton"],
+                         block=parts.block,
+                         outside=parts.before + "…（此处不许改）…" + parts.after)
+    brief.constraints = [
+        f"可进化区由 `{BLOCK_START}` 与 `{BLOCK_END}` 标出，必须各出现一次；",
+        "区外**逐字节**不许变——改一个空格也会被拒（退出码 2）；",
+        "提交时按归一化 token 序列算 `code_hash`，重复的程序会被拒（退出码 5）；",
+        "产物必须是**完整文件**（含区外原文），不是片段。",
+    ]
+
+    with ProgramLibrary(p["db"]) as lib:
+        rows = [r for r in lib.all_programs() if r.get("metrics")]
+        if not rows:
+            brief.notes.append(
+                "库里没有任何带指标的程序：先 `opl-evolve-eval` 一次骨架或某个候选，"
+                "否则挑亲本没有依据")
+            return brief
+        feas = [r for r in rows
+                if not where or all((r["metrics"] or {}).get(k) == v for k, v in where.items())]
+        if not feas:
+            brief.notes.append(f"没有程序满足过滤条件 {where}——退回按全部候选挑")
+            feas = rows
+
+        def sort_key(r: dict) -> tuple[float, int]:
+            v = (r["metrics"] or {}).get(metric) if metric else 0.0
+            v = float(v) if isinstance(v, (int, float)) else 0.0
+            # 升序排列；最小化时直接按值升序，最大化时才取负。写反的话「当前最好」
+            # 会指向一个更差的行——实测踩到：comparators 有 5 的时候把 6 当成了最好。
+            return ((v if minimize else -v), int(r["id"]))
+
+        ordered = sorted(feas, key=sort_key)
+        chosen: list[dict[str, Any]] = []
+        seen_gen: set[int] = set()
+        if ordered:
+            top = ordered[0]
+            chosen.append(top | {"why": "当前最好"
+                                 + (f"（按 {metric} {'最小' if minimize else '最大'}）"
+                                    if metric else "")})
+            seen_gen.add(int(top["generation"]))
+        for r in ordered[1:]:
+            if len(chosen) >= parents:
+                break
+            if int(r["generation"]) in seen_gen:
+                continue
+            chosen.append(r | {"why": f"第 {r['generation']} 代的其他代表（多样性）"})
+            seen_gen.add(int(r["generation"]))
+        for r in ordered[1:]:
+            if len(chosen) >= parents:
+                break
+            if any(c["id"] == r["id"] for c in chosen):
+                continue
+            chosen.append(r | {"why": "次优（多样性已用尽）"})
+        brief.parents = chosen
+        if metric and not any(metric in (r["metrics"] or {}) for r in rows):
+            brief.notes.append(f"没有任何程序带指标 {metric!r}，排序退化为按 id")
+    return brief
+
+
 # ------------------------------------------------------------------ 程序库
 
 
