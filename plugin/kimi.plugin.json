@@ -1,6 +1,6 @@
 {
   "name": "open-problem-lab",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "本地工具链，协助攻击开放问题：猜想台账、有限域约束的双后端编码、反例搜索、以及可被独立复核的证明证书（DRAT / LRAT / LPR / Alethe）。判决走退出码，证据落盘，缺失验证器时硬失败。",
   "keywords": [
     "open-problem",
