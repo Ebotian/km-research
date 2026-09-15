@@ -2,14 +2,41 @@
 
 一题一文件、纯文本、可入版本控制，`SQLite` 之类只配当派生索引。
 
-两条设计要点，都是为了让「自欺」在结构上无法*表达*：
+三条设计要点，都是为了让「自欺」在结构上无法*表达*：
 
 * **总状态是派生的，不存盘。** 它由 `informal_status` 与 `formal_status` 两个独立
   字段算出——单一枚举写不出「机器已证、人未消化」这类中间态（那是 `open (Lean)`）。
   所以直接读台账文件是**看不到** `status` 的，必须经 `derive_status` 或向命令要。
-* **状态变更必须带证据指针。** 这不是文档里的约定，而是被拒绝的操作：
-  `apply_changes` 在没有 evidence 时抛 `LedgerError`。没有证据指针的状态变更
-  正是本项目最想防的那件事，所以它必须由代码拦，不能靠提示词劝。
+* **任何状态变更都必须带证据指针。** 这不是文档里的约定，而是被拒绝的操作：
+  `apply_changes` 在没有 evidence 时抛 `LedgerError`。
+* **档位（`verification_level`）不能没有依据地升。** 指针非空只是「填了」，
+  不等于「复核过」。所以升到 `exact_certificate` / `lean_checked` 时，指针必须指向
+  一份**结构化证据记录**，且该记录的判决要支撑这个档位；见 `load_evidence`。
+
+== 台账只认「验证器说了什么」，不替它作证 ==
+
+`load_evidence` 做三件事，一件比一件强：
+
+1. **存在且格式对**：文件在、是 JSON、`schema == "opl.evidence/1"`。
+2. **判决支撑档位**：`exact_certificate` 要求 `verdict == "VERIFIED"`（来自
+   `opl-certcheck`）；`lean_checked` 要求 `verdict == "proved"`（来自 `opl-leancheck`）。
+   一份「未通过」的记录不能用来升档。
+3. **记录与输入绑定**：记录里引用的文件（`certificate` / `formula` / `file` / `witness`）
+   必须存在，且**其 sha256 与记录里写的一致**。这一条挡的是「记录是真的、但它说的是
+   另一个文件」——证书被换掉之后旧记录就自动失效。
+
+**残留缺口，如实写在这里**：以上都挡不住「手写一份格式正确的记录」——那需要验证器
+签名，而当前没有密钥体系。所以本模块保证的是「这是某个验证器对**这些字节**的判决」，
+不是「某个验证器真的说过」。台账会把证据文件自身的 sha256 记进 history，让事后篡改
+可见（`evidence_sha256`），但可见 ≠ 阻止。要真正关闭这个缺口得先有签名，那是另一个
+设计决定，不在台账里悄悄假装。
+
+== 人工确认与机器判决分列 ==
+
+`faithfulness_checked`（陈述忠实度）与 `human_peer_reviewed` 是**人的判断**，不是验证器
+的输出。它们必须带 `--confirmed-by`，并写进独立的 `human_confirmations` 列表——
+不与机器判决混在同一列。理由：实测自动形式化的语义正确率约 76%，把「编译通过」
+与「忠实」写进同一个字段，正是这个项目要防的那类混淆。
 
 本模块不做 I/O 输出、不解析 argv——那些在 `bin/opl-conj`。这样它可 import、
 可单测、可被类型检查（`bin/` 下的无扩展名文件是类型检查的盲区）。
@@ -18,9 +45,11 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Required, TypedDict
 
 STATUSES = ["open", "proved_by_hand", "disproved"]
@@ -28,9 +57,44 @@ FORMAL_STATUSES = ["open", "refuted", "proved", "no_counterexample_in_range", "i
 FORMALIZATION = ["none", "draft", "compiles", "faithfulness_checked"]
 LEVELS = ["empirical", "exact_certificate", "lean_checked", "human_peer_reviewed"]
 
+# 证据记录的 schema；由 `opl-certcheck` / `opl-leancheck` / `opl-encode` 产生。
+EVIDENCE_SCHEMA = "opl.evidence/1"
+
+# 档位 → 该档位要求的机器判决。不在表里的档位不走机器判决：
+# `empirical` 不需要证据；`human_peer_reviewed` 要人工确认（见 HUMAN_LEVEL）。
+LEVEL_VERDICTS: dict[str, frozenset[str]] = {
+    "exact_certificate": frozenset({"VERIFIED"}),
+    "lean_checked": frozenset({"proved"}),
+}
+
+# 需要人工确认的档位与状态：它们的依据是「人看过」，不是验证器的输出。
+HUMAN_LEVEL = "human_peer_reviewed"
+HUMAN_FORMALIZATION = "faithfulness_checked"
+
+# 证据记录里「文件字段 → 哈希字段」的对应。有就查，没有就跳过。
+EVIDENCE_BINDINGS: tuple[tuple[str, str], ...] = (
+    ("certificate", "certificate_sha256"),
+    ("formula", "formula_sha256"),
+    ("file", "file_sha256"),
+    ("witness", "witness_sha256"),
+    ("spec", "spec_sha256"),
+)
+
 
 class LedgerError(Exception):
     """记录或参数不合法。调用方翻成 USAGE（退出码 2）。"""
+
+
+@dataclass
+class Evidence:
+    """一份校验过的证据记录。`sha256` 是**文件本身**的哈希，进 history 供事后比对。"""
+
+    path: str
+    sha256: str
+    verdict: str
+    level: str | None
+    kind: str | None
+    record: dict[str, Any]
 
 
 class Source(TypedDict):
@@ -42,7 +106,7 @@ class Source(TypedDict):
 # `from` 是 Python 关键字，类语法写不出来，所以用函数式形式。
 HistoryEntry = TypedDict("HistoryEntry", {
     "at": str, "field": str, "from": Any, "to": Any,
-    "evidence": str | None, "run_id": str | None,
+    "evidence": str | None, "run_id": str | None, "evidence_sha256": str | None,
 })
 
 
@@ -69,12 +133,85 @@ class Conjecture(TypedDict, total=False):
     verified_range: dict[str, Any] | None
     known_bounds: list[dict[str, Any]]
     counterexamples: list[dict[str, Any]]
+    human_confirmations: list[dict[str, Any]]
     source: Source
     status: str
 
 
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+# ------------------------------------------------------------------ 证据校验
+
+
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_evidence(path: str | None, *, required_level: str | None = None,
+                  subject: str | None = None) -> Evidence:
+    """读并校验一份证据记录。任何一处不合格都抛 `LedgerError`，理由写到点上。
+
+    `path` 允许为 `None`：**「没给指针」也是在这一层被拒的**。升档却什么都不带，
+    是最该拦下的那一种，把它留在这里处理比让每个调用方各写一遍更不容易漏。
+
+    `subject` 只是给报错用的对象名（猜想 id 之类），不参与判定——台账不假装知道
+    证据应该长什么样才算「对得上这个命题」，那需要验证器把命题写进记录里。
+    """
+    who = f"（对象 {subject}）" if subject else ""
+    if not path:
+        raise LedgerError(f"缺少证据指针{who}")
+    if not os.path.isfile(path):
+        raise LedgerError(f"证据文件不存在{who}：{path}")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise LedgerError(f"证据文件不是合法 JSON{who}：{path}:{exc.lineno}: {exc.msg}") from exc
+    if not isinstance(rec, dict):
+        raise LedgerError(f"证据记录的顶层应为对象{who}，实为 {type(rec).__name__}")
+    schema = rec.get("schema")
+    if schema != EVIDENCE_SCHEMA:
+        raise LedgerError(
+            f"证据记录的 schema 是 {schema!r}，本台账只认 {EVIDENCE_SCHEMA!r}{who}。"
+            f"手写的自由文本、或验证器以外的产物，都不是证据。")
+    verdict = rec.get("verdict")
+    if required_level is not None:
+        want = LEVEL_VERDICTS.get(required_level)
+        if want is not None and verdict not in want:
+            raise LedgerError(
+                f"证据记录的判决是 {verdict!r}，不足以支撑 {required_level}{who}；"
+                f"该档位需要 {sorted(want)}。"
+                f"（`none` / `UNKNOWN` / `NOT VERIFIED` / `sorry_ax` 都属此列）")
+    # 绑定性：记录引用的文件必须存在，且哈希对得上
+    for file_key, hash_key in EVIDENCE_BINDINGS:
+        f, h = rec.get(file_key), rec.get(hash_key)
+        if not f or not h:
+            continue
+        if not os.path.isfile(f):
+            raise LedgerError(f"证据引用的文件不存在{who}：{f}")
+        got = sha256_file(f)
+        if got != h:
+            raise LedgerError(
+                f"证据与文件对不上{who}：{f}\n  记录写的是 {h[:16]}…，实际是 {got[:16]}…\n"
+                f"  记录过期或被改过——旧记录不该继续给新文件背书。")
+    return Evidence(path=path, sha256=sha256_file(path), verdict=str(verdict),
+                    level=rec.get("verification_level"), kind=rec.get("kind"), record=rec)
+
+
+def require_human(confirmed_by: str | None, what: str) -> dict[str, Any]:
+    """人工确认项的守卫。**机器判决不能替代人的复核**，所以这里只要人签字。"""
+    if not confirmed_by or not confirmed_by.strip():
+        raise LedgerError(
+            f"拒绝写入：{what} 是人工确认项，必须带 --confirmed-by <谁>。"
+            f"理由：实测自动形式化的语义正确率约 76%，编译通过看不出那 24%——"
+            f"工具不会替你下这个判断，也不会接受一个空的签字。")
+    return {"at": now_iso(), "by": confirmed_by.strip(), "what": what}
 
 
 # ------------------------------------------------------------------ 路径与读写
@@ -188,15 +325,17 @@ def new_record(*, cid: str, statement: str, title: str | None = None,
         "source": {"url": source, "attribution": attribution, "retrieved_at": now},
         "verification_level": "empirical",
         "history": [{"at": now, "field": "id", "from": None, "to": cid,
-                     "evidence": None, "run_id": None}],
+                     "evidence": None, "run_id": None, "evidence_sha256": None}],
     }
 
 
 def _touch(rec: Conjecture, field: str, old: Any, new: Any, *,
-           evidence: str | None, run_id: str | None) -> None:
+           evidence: str | None, run_id: str | None,
+           evidence_sha256: str | None = None) -> None:
     rec.setdefault("history", []).append({
         "at": now_iso(), "field": field, "from": old, "to": new,
         "evidence": evidence, "run_id": run_id,
+        "evidence_sha256": evidence_sha256,
     })
 
 
@@ -225,38 +364,63 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
                   add_bound: list[str] | None = None,
                   add_counterexample: list[str] | None = None,
                   verification_level: str | None = None,
+                  confirmed_by: str | None = None,
+                  confirmation_note: str | None = None,
                   ) -> tuple[Conjecture, list[str]]:
     """把一批改动应用到记录上，返回 (记录, 警告列表)。
 
-    唯一的硬规则：**任何状态变更都必须带 evidence**，否则抛 LedgerError。
-    其余非法的取值也抛 LedgerError；可容忍的情形（如反例缺证书指针）走警告。
+    两级硬规则，都由代码拦而不是靠提示词劝：
+
+    1. **任何状态变更都必须带 evidence 指针**，否则抛 `LedgerError`。
+    2. **档位不能没有依据地升**：升到 `exact_certificate` / `lean_checked` 时，
+       指针必须指向一份判决支撑该档位的结构化证据记录（见 `load_evidence`）；
+       升到 `human_peer_reviewed`、或写 `faithfulness_checked`，必须带
+       `--confirmed-by`（见 `require_human`）。
+
+    可容忍的情形（反例缺证据、证据不足）走警告：**记下来，但记成 UNVERIFIED**，
+    不拒收——台账的价值之一是留住「试过但没成」的事实。拒收与降级是两件事。
     """
     if (formal_status or informal_status) and not evidence:
         raise LedgerError(
             "拒绝写入：状态变更必须带 --evidence <指针>。"
             "没有证据指针的状态变更正是本项目要防的自欺。")
 
+    warnings: list[str] = []
+    # 先验证据，再落字段：验不过就什么都不改，避免半个变更留在记录里。
+    ev: Evidence | None = None
+    if verification_level:
+        if verification_level not in LEVELS:
+            raise LedgerError(f"非法 verification_level，允许：{', '.join(LEVELS)}")
+        if verification_level == HUMAN_LEVEL:
+            require_human(confirmed_by, f"verification_level={HUMAN_LEVEL}")
+        elif verification_level != "empirical":
+            ev = load_evidence(evidence, required_level=verification_level,
+                               subject=rec.get("id"))
+
     if formal_status:
         if formal_status not in FORMAL_STATUSES:
             raise LedgerError(f"非法 formal_status，允许：{', '.join(FORMAL_STATUSES)}")
         _touch(rec, "formal_status", rec.get("formal_status"), formal_status,
-               evidence=evidence, run_id=run_id)
+               evidence=evidence, run_id=run_id,
+               evidence_sha256=ev.sha256 if ev else None)
         rec["formal_status"] = formal_status
     if informal_status:
         if informal_status not in STATUSES:
             raise LedgerError(f"非法 informal_status，允许：{', '.join(STATUSES)}")
         _touch(rec, "informal_status", rec.get("informal_status"), informal_status,
-               evidence=evidence, run_id=run_id)
+               evidence=evidence, run_id=run_id,
+               evidence_sha256=ev.sha256 if ev else None)
         rec["informal_status"] = informal_status
 
-    warnings: list[str] = []
     if formalization_status:
         if formalization_status not in FORMALIZATION:
             raise LedgerError(f"非法 formalization_status，允许：{', '.join(FORMALIZATION)}")
-        if formalization_status == "faithfulness_checked":
-            warnings.append(
-                "faithfulness_checked 是人工确认项。自动形式化的编译率会系统性高估"
-                "忠实度（实测语义正确率约 76%），工具不会替你下这个判断。")
+        if formalization_status == HUMAN_FORMALIZATION:
+            # 人工确认单独建模：不进 history 的证据列，进 human_confirmations
+            conf = require_human(confirmed_by, f"formalization_status={HUMAN_FORMALIZATION}")
+            if confirmation_note:
+                conf["note"] = confirmation_note
+            rec.setdefault("human_confirmations", []).append(conf)
         _touch(rec, "formalization_status", rec.get("formalization_status"),
                formalization_status, evidence=evidence, run_id=run_id)
         rec["formalization_status"] = formalization_status
@@ -278,19 +442,36 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
             {"claim": claim, "value": value, "source": src or None})
 
     for witness in add_counterexample or []:
-        rec.setdefault("counterexamples", []).append(
-            {"witness": witness, "certificate": evidence,
-             "verified_by": "independent" if evidence else "UNVERIFIED",
-             "verification_level": "exact_certificate" if evidence else "empirical",
-             "recorded_at": now_iso()})
-        if not evidence:
+        # 反例的「独立复核」必须由证据支撑。以前只要 evidence 非空就写 independent，
+        # 于是随便一个字符串就能给反例盖上一个复核章——那是直接伪造复核。
+        entry: dict[str, Any] = {"witness": witness, "certificate": evidence,
+                                 "recorded_at": now_iso()}
+        if evidence:
+            try:
+                ev2 = load_evidence(evidence, required_level="exact_certificate",
+                                    subject=rec.get("id"))
+            except LedgerError as exc:
+                entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
+                warnings.append(f"反例 {witness!r} 的证据不足以支撑独立复核，"
+                                f"记为 UNVERIFIED：{exc}")
+            else:
+                entry |= {"verified_by": "independent",
+                          "verification_level": "exact_certificate",
+                          "evidence_sha256": ev2.sha256}
+        else:
+            entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
             warnings.append(f"反例 {witness!r} 没有证书指针，请补 --evidence")
+        rec.setdefault("counterexamples", []).append(entry)
 
     if verification_level:
-        if verification_level not in LEVELS:
-            raise LedgerError(f"非法 verification_level，允许：{', '.join(LEVELS)}")
+        if verification_level == HUMAN_LEVEL:
+            conf = require_human(confirmed_by, f"verification_level={HUMAN_LEVEL}")
+            if confirmation_note:
+                conf["note"] = confirmation_note
+            rec.setdefault("human_confirmations", []).append(conf)
         _touch(rec, "verification_level", rec.get("verification_level"),
-               verification_level, evidence=evidence, run_id=run_id)
+               verification_level, evidence=evidence, run_id=run_id,
+               evidence_sha256=ev.sha256 if ev else None)
         rec["verification_level"] = verification_level
 
     return rec, warnings

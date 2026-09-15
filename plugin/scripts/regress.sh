@@ -92,6 +92,20 @@ chk "缺后端（不是 REJECT）"   4 env KIMI_PLUGIN_ROOT="$work/emptyroot" OP
 # ---------------------------------------------------------------- 台账
 echo "conj —— 台账的退出码语义"
 export OPL_LAB="$work/lab"
+# 三个证据夹具都**跑真检查器**产出，不手写 JSON 冒充：手写的那种连格式都不一定对，
+# 用它测「台账认不认证据」会得到一个比真实情形宽松的结论。
+#   ev-cert.json    真证书 -> verdict=VERIFIED
+#   ev-notverified  内容篡改的证书 -> verdict=NOT VERIFIED（真记录，只是判决是否）
+#   ev-stale.json   把真记录指向另一个文件 -> 哈希对不上
+$BIN/opl-certcheck --formula $FIX/uuf-100-1.cnf --cert $FIX/uuf-100-1.drat \
+    --evidence-out "$work/ev-cert.json" >/dev/null 2>&1
+$BIN/opl-certcheck --formula $FIX/uuf-100-1.cnf --cert "$work/drat-tampered.drat" \
+    --evidence-out "$work/ev-notverified.json" >/dev/null 2>&1
+python3 -c "
+import json
+r = json.load(open('$work/ev-cert.json'))
+r['certificate'] = '$work/drat-tampered.drat'      # 记录不变，指向的文件变了
+json.dump(r, open('$work/ev-stale.json', 'w'))"
 chk "add"                    0 $BIN/opl-conj add --id R-1 --statement "测试陈述"
 chk "无证据改状态（拒绝写入）" 2 $BIN/opl-conj set R-1 --formal-status refuted
 chk "带证据改状态"           0 $BIN/opl-conj set R-1 --formal-status refuted --evidence "$work/ev.json"
@@ -107,6 +121,52 @@ ok = (c['verified_by'] == 'UNVERIFIED' and c['verification_level'] == 'empirical
 sys.exit(0 if ok else 1)"
 chk "取不存在的记录"         5 $BIN/opl-conj get R-404
 chk "list 无匹配"            5 $BIN/opl-conj list --status proved
+
+# ---- 证据必须是结构化的：指针非空 ≠ 复核过（审阅稿的复现已进回归）----
+# 四条都是「填了就算过」的旧行为，现在逐条拦下。前三条来自审阅稿，第四条是本项目
+# 自己的纪律（人工确认不能由机器判决代替）。
+chk "证据文件不存在 -> 2"     2 $BIN/opl-conj set R-1 --formal-status proved \
+    --evidence /nonexistent/evidence.json --verification-level lean_checked
+chk "判决不足以支撑档位 -> 2" 2 $BIN/opl-conj set R-1 --formal-status proved \
+    --evidence "$work/ev-notverified.json" --verification-level exact_certificate
+chk "证据与文件对不上 -> 2"   2 $BIN/opl-conj set R-1 --formal-status proved \
+    --evidence "$work/ev-stale.json" --verification-level exact_certificate
+chk "缺人工确认 -> 2"         2 $BIN/opl-conj set R-1 --formalization-status faithfulness_checked
+chk "人工确认不能由机器判决代替" 2 $BIN/opl-conj set R-1 \
+    --verification-level human_peer_reviewed --evidence "$work/ev.json"
+chk "带 --confirmed-by 才放行" 0 $BIN/opl-conj set R-1 \
+    --formalization-status faithfulness_checked --confirmed-by "EBT"
+# 真记录必须能过：否则上面那五条等于把功能锁死了
+chk "真证书记录可升档"        0 $BIN/opl-conj set R-1 --formal-status proved \
+    --evidence "$work/ev-cert.json" --verification-level exact_certificate
+chk "升档在 history 里留下证据哈希" 0 python3 -c "
+import json, sys
+why = []
+d = json.load(open('$work/lab/conjectures/R-1.json'))
+h = [x for x in d['history'] if x['field'] == 'verification_level'
+     and x['to'] == 'exact_certificate']
+if not h:
+    why.append('history 里没有这次升档')
+elif not h[-1].get('evidence_sha256'):
+    why.append('升档没记下 evidence_sha256 —— 事后无法比对证据是否被换过')
+if d['verification_level'] != 'exact_certificate':
+    why.append('档位没落盘')
+# 人工确认单独建模，不与机器判决混在一列
+conf = d.get('human_confirmations') or []
+if not conf or conf[-1].get('by') != 'EBT':
+    why.append('人工确认没有单独记录：%r' % conf)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# 反例的证据不足：**降级而不是伪造** —— 也不拒收（台账要留住「试过但没成」）
+chk "反例证据不足 -> 记 UNVERIFIED" 0 $BIN/opl-conj set R-1 \
+    --add-counterexample "n=99" --evidence "随便一个字符串"
+chk "该反例没有被盖上复核章"  0 python3 -c "
+import json, sys
+cs = json.load(open('$work/lab/conjectures/R-1.json'))['counterexamples']
+c = [x for x in cs if x['witness'] == 'n=99'][0]
+sys.exit(0 if (c['verified_by'] == 'UNVERIFIED'
+               and c['verification_level'] == 'empirical') else 1)"
 
 # ---------------------------------------------------------------- 能力探测
 echo "capabilities —— 必需层"
@@ -929,10 +989,12 @@ chk "1 登记猜想"              0 $BIN/opl-conj add --id E-1 --title "PC(2,3) 
 chk "2 编码并双后端互相证伪"   0 $BIN/opl-encode --spec $FIX/spec-pc23.json --check-consistency
 chk "3 搜索（sat 侧，出见证）" 0 $BIN/opl-search --spec $FIX/spec-pc23.json \
     --cnf-out "$work/e2e/m.cnf" --witness-out "$work/e2e/witness.json"
+# 复核见证并**产出结构化证据记录**：裸的 witness.json 不是证据——它既没法证明
+# 「谁复核的」，也没法证明「复核的是这份见证」。台账升档要求 opl.evidence/1。
 chk "4 独立复核见证"          0 $BIN/opl-encode --spec $FIX/spec-pc23.json \
-    --eval-witness "$work/e2e/witness.json"
+    --eval-witness "$work/e2e/witness.json" --evidence-out "$work/e2e/ev-witness.json"
 chk "5 台账定案"              0 $BIN/opl-conj set E-1 --formal-status refuted \
-    --evidence "$work/e2e/witness.json" --verification-level exact_certificate
+    --evidence "$work/e2e/ev-witness.json" --verification-level exact_certificate
 chk "终态与证据指针正确"       0 python3 -c "
 import json, subprocess, os, sys
 # 注意：status 是*派生*字段，按设计不落盘——必须向工具要，不能从文件里读。

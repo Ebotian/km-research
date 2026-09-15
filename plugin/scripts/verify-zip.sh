@@ -87,9 +87,10 @@ chk "1 登记"          0 "$root/bin/opl-conj" add --id Z-1 --title "PC(2,3)" \
 chk "2 编码一致"      0 "$root/bin/opl-encode" --spec "$F/spec-pc23.json" --check-consistency
 chk "3 搜索出见证"    0 "$root/bin/opl-search" --spec "$F/spec-pc23.json" \
     --cnf-out "$work/m.cnf" --witness-out "$work/w.json"
-chk "4 独立复核"      0 "$root/bin/opl-encode" --spec "$F/spec-pc23.json" --eval-witness "$work/w.json"
+chk "4 独立复核"      0 "$root/bin/opl-encode" --spec "$F/spec-pc23.json" \
+    --eval-witness "$work/w.json" --evidence-out "$work/ev-witness.json"
 chk "5 定案"          0 "$root/bin/opl-conj" set Z-1 --formal-status refuted \
-    --evidence "$work/w.json" --verification-level exact_certificate
+    --evidence "$work/ev-witness.json" --verification-level exact_certificate
 chk "unsat 侧出证明"  0 "$root/bin/opl-search" --spec "$F/spec-pc43.json" \
     --cnf-out "$work/u.cnf" --proof-out "$work/u.drat"
 chk "包内 drat-trim 复核" 0 "$root/bin/opl-certcheck" --formula "$work/u.cnf" \

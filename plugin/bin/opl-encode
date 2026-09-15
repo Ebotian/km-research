@@ -23,11 +23,13 @@ import argparse
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
 from opl_common import (PASS, REJECT, UNKNOWN, MISSING, USAGE,  # noqa: E402
                         MissingBackend, c, ensure_modules, out_json, s)
+from opl_ledger import sha256_file  # noqa: E402
 from opl_spec import Spec, SpecError, load_witness  # noqa: E402
 import opl_encode  # noqa: E402
 from opl_encode import EncodeError, SolverMissing  # noqa: E402
@@ -41,6 +43,9 @@ def main() -> int:
     ap.add_argument("--check-consistency", action="store_true",
                     help="两种独立编码各求解一次并交叉验证见证")
     ap.add_argument("--eval-witness", help="用规格直接求值一份见证（与编码器无关）")
+    ap.add_argument("--evidence-out",
+                    help="把复核结果写成 opl.evidence/1 记录（台账升档要求这种记录，"
+                         "裸的 witness.json 不是证据）")
     ap.add_argument("--sat-backend", default="glucose42",
                     help="PySAT 求解器名（默认 glucose42：它能出可复核的 DRAT）")
     ap.add_argument("--timeout", type=float, default=60.0)
@@ -117,6 +122,25 @@ def do_eval_witness(spec: Spec, args) -> int:
         c(str(exc))
         return USAGE
     ok, why = spec.eval(assign)
+    # 见证复核也要落**结构化证据记录**，否则台账只拿到一个裸的 witness.json：
+    # 它既没法证明「谁复核的」，也没法证明「复核的是这份见证」。台账现在要求升档
+    # 必须附 `opl.evidence/1`，这条路径就得自己产出它，而不是让调用方手写。
+    if args.evidence_out:
+        rec = {
+            "schema": "opl.evidence/1",
+            "kind": "witness_eval",
+            "verdict": "VERIFIED" if ok else "NOT VERIFIED",
+            "verification_level": "exact_certificate" if ok else "none",
+            "spec": os.path.abspath(args.spec),
+            "spec_sha256": sha256_file(args.spec),
+            "witness": os.path.abspath(args.eval_witness),
+            "witness_sha256": sha256_file(args.eval_witness),
+            "n_assignments": len(assign),
+            "n_constraints": len(spec.constraints),
+            "detail": None if ok else (why or ""),
+            "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        out_json(rec, args.evidence_out)
     if ok:
         s("WITNESS_OK", f"{len(assign)} 个变量全部满足 {len(spec.constraints)} 条约束")
         return PASS

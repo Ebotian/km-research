@@ -84,11 +84,17 @@ $OPL/opl-search --spec lab/C-0001.spec.json \
 ### 4a. 复核见证（sat 侧）
 
 ```bash
-$OPL/opl-encode --spec lab/C-0001.spec.json --eval-witness lab/runs/C-0001/witness.json
+$OPL/opl-encode --spec lab/C-0001.spec.json \
+  --eval-witness lab/runs/C-0001/witness.json \
+  --evidence-out lab/evidence/C-0001.json
 ```
 
 退出码 `0` 才算反例成立。这条路径是**规格的直接求值**，与任何编码器无关——
 求解器说 sat 时它可能已经错了（编码把解排掉、或反解码翻错），这一步是唯一的裁决。
+
+`--evidence-out` 是关键的一半：它把这句「复核过了」写成 `opl.evidence/1` 记录，
+里面绑定了**规格与见证各自的 sha256**。裸的 `witness.json` 不是证据——它既证明不了
+「谁复核的」，也证明不了「复核的是这份见证」。台账只认这种记录。
 
 ### 4b. 复核证明（unsat 侧）
 
@@ -101,18 +107,36 @@ $OPL/opl-certcheck --formula lab/runs/C-0001/formula.cnf \
 退出码 `0` 才算「该域内无反例」。`3` 表示无法判定（格式未识别、解析不完整、解压器坏了）——
 **不许当成「证明无效」**，那是两件事。`1` 才是真的无效。
 
-### 5. 定案
+### 5. 定案 —— **两支的结论不同，别共用一条命令**
+
+这是最容易写错的一步。sat 侧推翻的是**猜想**，unsat 侧推翻的只是**「该有限域内有反例」**：
 
 ```bash
+# sat 侧：找到反例 → 猜想被推翻
 $OPL/opl-conj set C-0001 --formal-status refuted \
+  --evidence lab/evidence/C-0001.json --verification-level exact_certificate
+
+# unsat 侧：该域内无解 → **不是**「猜想被推翻」，而是「这个范围内没有反例」
+$OPL/opl-conj set C-0001 --formal-status no_counterexample_in_range \
+  --verified-range 1..100 --method sat \
   --evidence lab/evidence/C-0001.json --verification-level exact_certificate
 ```
 
+`no_counterexample_in_range` 之所以必须绑 `--verified-range`：**「没找到」只在说清
+在哪个范围内时才有意义**。不写范围就写成 refuted，会把「我没有找到」记成「它不成立」。
+
 **不带 `--evidence` 会被拒绝写入（退出码 `2`）。** 这条纪律由工具强制，不是约定。
 
-`verification_level` 只填你实际拿到的档：
-`empirical` < `exact_certificate` < `lean_checked` < `human_peer_reviewed`。
-只有见证经直接求值复核、或证明经独立检查器复核，才算 `exact_certificate`。
+`verification_level` 只填你实际拿到的档，而且**升档要证据支撑**：
+`exact_certificate` 要求证据记录的 `verdict` 是 `VERIFIED`（`lean_checked` 要求
+`proved`），记录里引用的文件还必须与哈希对得上。指针非空 ≠ 复核过。
+
+`human_peer_reviewed` 与 `faithfulness_checked` 是**人的判断**，要 `--confirmed-by`：
+
+```bash
+$OPL/opl-conj set C-0001 --verification-level human_peer_reviewed \
+  --confirmed-by "谁" --confirmation-note "看了什么、为什么认可"
+```
 
 ## 禁止事项
 

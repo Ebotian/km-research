@@ -15,8 +15,16 @@
 退出码：0 有结果；2 用法错误；5 无结果（记录不存在或 list 为空）。
 REJECT 在本工具中永不出现——台账不推翻断言，只记录断言。
 
-写死的一条纪律：任何状态变更必须带 --evidence。没有证据指针的状态变更是这个
-项目最想防的自欺，因此它不是一个约定，而是被工具拒绝的操作（见 opl_ledger）。
+写死的两条纪律，都由工具拒绝而不是靠提示词劝：
+
+1. **任何状态变更必须带 --evidence**——没有证据指针的状态变更是这个项目最想防的自欺。
+2. **档位不能没有依据地升**：升到 `exact_certificate` / `lean_checked` 时，指针必须
+   指向一份判决支撑该档位的 `opl.evidence/1` 记录（由 `opl-certcheck` /
+   `opl-leancheck` / `opl-encode --eval-witness` 产出）。**指针非空 ≠ 复核过**——
+   以前只要字符串非空就能升档，那是把「填了」当成了「验过」。
+
+`faithfulness_checked` 与 `human_peer_reviewed` 是**人的判断**，要 `--confirmed-by`
+签字并单独记进 `human_confirmations`，不与机器判决混在一列。
 """
 
 from __future__ import annotations
@@ -89,7 +97,8 @@ def cmd_set(args) -> int:
         statement_formal=args.statement_formal, decl=args.decl,
         verified_range=args.verified_range, method=args.method,
         add_bound=args.add_bound, add_counterexample=args.add_counterexample,
-        verification_level=args.verification_level)
+        verification_level=args.verification_level,
+        confirmed_by=args.confirmed_by, confirmation_note=args.confirmation_note)
     for w in warnings:
         c(f"警告：{w}")
     c(f"wrote {save(rec, args.lab)}")
@@ -135,6 +144,10 @@ def main() -> int:
     t.add_argument("--add-counterexample", action="append")
     t.add_argument("--verification-level")
     t.add_argument("--evidence")
+    t.add_argument("--confirmed-by",
+                   help="人工确认者的名字。写 faithfulness_checked 或升到 "
+                        "human_peer_reviewed 时必须给——机器判决不能替代人的复核")
+    t.add_argument("--confirmation-note")
     t.add_argument("--run-id")
     t.set_defaults(func=cmd_set)
 

@@ -81,7 +81,16 @@ $OPL/opl-conj set C-0001 --formalization-status compiles \
   --evidence lab/lean/C0001.lean
 ```
 
-工具会提示 `faithfulness_checked` 是人工项——那是刻意的，不是可以绕过的流程。
+工具**拒绝**在没有签字的情况下写 `faithfulness_checked`（退出码 `2`）——那是刻意的，
+不是可以绕过的流程。第 1–4 步的复核做完之后，由人签字：
+
+```bash
+$OPL/opl-conj set C-0001 --formalization-status faithfulness_checked \
+  --confirmed-by "谁" --confirmation-note "逐条对过那十条清单，第 7 条按 ∃N 保留"
+```
+
+签字会记进独立的 `human_confirmations`，**不与机器判决混在同一列**。理由就是这张
+清单的意义：编译通过看不出那 24% 的语义偏差，而「谁确认的」必须可查。
 
 ## 已经踩过的坑
 

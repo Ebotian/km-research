@@ -48,7 +48,7 @@
 | 命令 | 一个职责 |
 |---|---|
 | `opl-capabilities` | 探测后端，产出 `capabilities.json`。含 Python 模块探测、解释器分裂检测与**功能性沙箱探测** |
-| `opl-conj` | 猜想台账。一题一文件；**状态变更必须带 `--evidence`**，否则拒绝写入（退出码 `2`） |
+| `opl-conj` | 猜想台账。一题一文件；状态变更必须带 `--evidence`，且**升档必须附判决支撑该档位的 `opl.evidence/1` 记录**，否则拒绝写入（退出码 `2`） |
 | `opl-encode` | 规格 → CNF / CP-SAT；双后端一致性检查；见证直接求值 |
 | `opl-search` | 跑搜索，产出见证或 DRAT 证明 |
 | `opl-certcheck` | 用独立校验器复核证书 |
@@ -160,12 +160,15 @@ plugin/bin/opl-search --spec "$SPEC" \
   --cnf-out lab/runs/C-0001/formula.cnf \
   --witness-out lab/runs/C-0001/witness.json --timeout 300
 
-# 4 独立复核：sat 侧用规格直接求值（这条路径与任何编码器无关）
-plugin/bin/opl-encode --spec "$SPEC" --eval-witness lab/runs/C-0001/witness.json
+# 4 独立复核：sat 侧用规格直接求值（这条路径与任何编码器无关）。
+#   同时也产出**证据记录**——裸的 witness.json 不是证据：它证明不了「谁复核的」，
+#   也证明不了「复核的是这份见证」
+plugin/bin/opl-encode --spec "$SPEC" --eval-witness lab/runs/C-0001/witness.json \
+  --evidence-out lab/evidence/C-0001.json
 
-# 5 定案（不带 --evidence 会被拒绝写入，退出码 2）
+# 5 定案（不带 --evidence 会被拒；档位也要证据支撑，退出码 2）
 plugin/bin/opl-conj set C-0001 --formal-status refuted \
-  --evidence lab/runs/C-0001/witness.json --verification-level exact_certificate
+  --evidence lab/evidence/C-0001.json --verification-level exact_certificate
 ```
 
 unsat 侧把第 3、4 步换成 `--proof-out` 与 `opl-certcheck`（`spec-pc43.json` 是
@@ -299,14 +302,14 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 110 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 120 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
 plugin/scripts/verify-zip.sh     # 47 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
 回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
-`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `96 通过 / 0 失败 / 14 跳过`），
+`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `106 通过 / 0 失败 / 14 跳过`），
 `verify-zip.sh` 在同样情形下报 `42 通过 / 0 失败 / 5 跳过`。
 跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
 
