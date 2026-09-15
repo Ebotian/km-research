@@ -88,9 +88,21 @@ plugin/bin/opl-capabilities --json | grep -A5 lean_project
 同一条 `lake --version` 在无 `lean-toolchain` 的目录里实测三轮分别耗
 **5.0/3.0/5.0、12.0/3.0/9.9、7.4/3.8/1.3 秒**（跨度 1.3–12 秒，最坏一次撞上 12 秒
 上限），定点目录里为 **21/20/20 ms**——差两个到三个数量级，且哪一次卡住纯看网络。
-`opl-leancheck` 因此**拒绝**在未定点的目录里运行（退出码 `2`），而不是替你触发一次
-工具链下载。
-`opl-capabilities` 会报 `pinned` / `pinned_fast`（`probe_ms` 超过 1 秒即说明仍在联网）。
+
+两侧的应对是**同一条**：**有定点就用，没定点不探**。
+
+- `opl-leancheck` 在未定点的目录里**拒绝运行**（退出码 `2`），而不是替你触发一次
+  工具链下载。
+- `opl-capabilities` 在**没有定点项目**时，`lean` / `lake` 两个可执行文件只报
+  「在不在 PATH 上」这个文件系统事实（`probe_skipped: "unpinned"`），**一次都不调用**
+  它们，并把推荐做法（`advice`）与不含子进程的环境事实（`env`：elan 装了哪些
+  toolchain、`default_toolchain` 解析到哪个）一并给出。有定点项目时则**在那个目录里
+  探**，`probe_ms` 是 20 毫秒量级；`pinned_fast` 为此保留了它唯一有意义的场景——
+  「看着定点、其实仍在联网」（比如项目里的 `lean-toolchain` 被删了）。
+
+这条不是洁癖，是实测数字：未定点的 cwd 里跑一次完整的 `opl-capabilities`，原先
+30 秒（`lean_project`）+ 5 秒 ×2（通用探针）**合计 40 秒**，换回三个
+`probe_timeout`、零条有效信息；现在 0.1 秒出结果，且该给的信息一样不少。
 
 本机链的是 `~/Downloads/emsx/leanproof`（`leanprover/lean4:v4.33.0-rc1`，
 Mathlib 已构建 8,279 个 `.olean`）。**那个仓库不含 Lean 项目**——它是指向本机路径
@@ -234,14 +246,14 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 70 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 71 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
 plugin/scripts/verify-zip.sh     # 32 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
 回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
-`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `56 通过 / 0 失败 / 14 跳过`），
+`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `57 通过 / 0 失败 / 14 跳过`），
 `verify-zip.sh` 在同样情形下报 `27 通过 / 0 失败 / 5 跳过`。
 跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
 

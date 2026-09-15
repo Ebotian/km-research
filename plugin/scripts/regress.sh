@@ -148,6 +148,71 @@ if r2.get('error') != 'probe_timeout':
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+# Lean 未定点时一次都不许探：那次调用会让 elan 联网解析 `stable`，本机没装过时还会
+# 把它下下来——一条自称只读的诊断命令不该有这种副作用。
+#
+# 用 PATH 注入一个会记录自己被调用过的假 `lake`，于是「有没有探」变成一个可断言的
+# 事实，而不是「看着像没探」。这条用例**不依赖 Lean 是否安装**，所以永远真跑。
+chk "未定点不探 Lean（零次调用）" 0 python3 -c "
+import os, sys, tempfile, time
+sys.path.insert(0, '$plugin/lib')
+from opl_probe import build_snapshot
+
+d = tempfile.mkdtemp(prefix='opl-fakelake.')
+marker = os.path.join(d, 'calls.txt')
+fake = os.path.join(d, 'lake')
+with open(fake, 'w') as fh:
+    fh.write('#!/bin/sh\necho \"\$@\" >> ' + marker
+             + '\necho \"Lake version FAKE (Lean version 4.0.0)\"\n')
+os.chmod(fake, 0o755)
+os.environ['PATH'] = d + os.pathsep + os.environ['PATH']
+
+def calls():
+    return open(marker).read().split() if os.path.exists(marker) else []
+
+why = []
+# ---- 甲：未定点（项目存在，但自己与祖先都没有 lean-toolchain）----
+unp = tempfile.mkdtemp(prefix='opl-unpinned.')
+os.environ['OPL_LEAN_PROJECT'] = unp
+t0 = time.monotonic()
+snap, _ = build_snapshot(layers=['lean'], do_python=False)
+el = time.monotonic() - t0
+lp = snap['lean_project']
+# 1 一次都没调（这是本用例的核心）
+if calls():
+    why.append('未定点却调了假 lake：%r' % (calls(),))
+# 2 「没问出来」不能报成「不可用」——None 与 False 是两件事
+if lp.get('available') is not None:
+    why.append('available 应为 None（未探测），实为 %r' % (lp.get('available'),))
+if lp.get('pinned') is not False or lp.get('probe_skipped') != 'unpinned':
+    why.append('pinned/probe_skipped 不对：%r/%r'
+               % (lp.get('pinned'), lp.get('probe_skipped')))
+# 3 要给出推荐，而不是只说一句「不知道」
+if not lp.get('advice'):
+    why.append('未给 advice')
+# 4 环境事实要能拿到（这是允许的那部分探测：纯文件系统，不启进程）
+envf = lp.get('env') or {}
+if 'installed_toolchains' not in envf or 'default_toolchain' not in envf:
+    why.append('env 事实不全：%r' % (sorted(envf),))
+# 5 不许再有 30 秒/5 秒的卡顿——那是本用例存在的原因
+if el > 3.0:
+    why.append('耗时 %.1fs，说明又去联网了' % el)
+
+# ---- 乙：正向对照，证明守卫不是「永远不探」----
+pin = tempfile.mkdtemp(prefix='opl-pinned.')
+with open(os.path.join(pin, 'lean-toolchain'), 'w') as fh:
+    fh.write('leanprover/lean4:v4.33.0-rc1\n')
+os.environ['OPL_LEAN_PROJECT'] = pin
+open(marker, 'w').close()
+snap2, _ = build_snapshot(layers=['lean'], do_python=False)
+if not calls():
+    why.append('定点时竟然没探——守卫写成了永远不探')
+if not (snap2['tools']['lake'].get('version', '') or '').startswith('Lake version FAKE'):
+    why.append('定点时没拿到版本：%r' % (snap2['tools']['lake'].get('version'),))
+
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
 
 # ---------------------------------------------------------------- 编码
 echo "encode —— 规格到模型，双后端互相证伪"

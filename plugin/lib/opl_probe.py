@@ -1,7 +1,7 @@
 """opl_probe —— 后端能力探测。
 
 一个职责：把「本机现在有什么」变成可查询的事实，而不是假设。
-只做只读探测，不安装任何东西、不修改系统。
+只做只读探测：不安装任何东西、不修改系统，**也不发起会触发安装的调用**。
 
 三条来自实测的要求：
 
@@ -17,6 +17,20 @@
   系统 3.14 有 `z3` / `sympy`、另一个 venv（基于 uv 下载的 3.12）有 `cvc5` / `ortools`，
   没有任何一个解释器同时看得见两者。这种分裂会让「缺 cvc5」的降级路径被无谓触发。
 
+== Lean 另有一条规则：未定点就一次都不探 ==
+
+上面第一条（硬超时）是对**其它**工具的规则。Lean 不行——超时只能限制等待，
+**限制不了副作用**：在**没有 `lean-toolchain`** 的目录及其祖先里调用 `lean` / `lake`，
+elan 会去联网解析 `stable`，本机若没装过它就会**把那个 toolchain 下下来**（几百 MB）。
+一条自称只读的诊断命令不该干这个。实测代价也难看：未定点的 cwd 里跑一次
+`opl-capabilities`，`probe_lean_project` 等满 30 秒超时、两个通用探针各卡 5 秒，
+合计 **40 秒**换回三个 `probe_timeout`、零条有效信息。
+
+所以凡是 Lean 相关探测（`probe_lean_project`，以及 `LAYERS["lean"]` 里的
+`lean` / `lake`）在未定点时**一次都不调用** `lake`，只报三样：为什么没探、
+怎么修（`advice`）、以及不含子进程的环境事实（elan 装了哪些 toolchain、
+默认会解析到哪个）。**定点了就照常探**——那时 `lake --version` 是 0.02 秒的本地调用。
+
 本模块不打印任何东西：探测函数返回结构化结果，`build_snapshot` 额外返回日志行，
 由 `bin/opl-capabilities` 负责输出。这样它可 import、可单测、可被类型检查。
 """
@@ -31,6 +45,10 @@ import time
 from typing import Any
 
 from opl_common import find_tool, plugin_root, run
+# 「向上找 lean-toolchain」是 Lean 的定制规则（找的是哪个文件名、找到了算什么），
+# 所以它住在 opl_lean 里。这里借用而不是复制一份——两份实现必然会分叉，
+# 而分叉的后果是「opl-capabilities 说有定点、opl-leancheck 说没有」。
+from opl_lean import find_toolchain
 
 # 可执行文件层。required 层缺任何一个即视为环境不完整；其余层按「存在即启用」降级。
 LAYERS: dict[str, list[tuple[str, str | None]]] = {
@@ -105,14 +123,28 @@ def fixtures_dir() -> str:
 # ------------------------------------------------------------------ 可执行文件
 
 
-def probe_executable(name: str, varg: str | None, timeout: float) -> dict[str, Any]:
-    """先试 `--version`，失败则试无参调用并取首行。一律带超时。"""
+def probe_executable(name: str, varg: str | None, timeout: float, *,
+                     cwd: str | None = None,
+                     skip_version: str | None = None) -> dict[str, Any]:
+    """先试 `--version`，失败则试无参调用并取首行。一律带超时。
+
+    `skip_version` 给出理由时**不启进程**：只报「在不在 PATH 上」这个文件系统事实。
+    Lean 的两个可执行文件在没有定点项目时走这条路（见模块 docstring）——那时调用
+    `lake --version` 会让 elan 联网解析并可能安装 `stable`，硬超时挡不住那件事。
+
+    `cwd` 是子进程的工作目录。对 Lean 而言**它是必需能力而非便利**：只有落在一个
+    定点了 `lean-toolchain` 的目录里，`lake --version` 才是 0.02 秒的本地调用。
+    其它工具不需要它，留 None 即继承调用方的 cwd（与既有行为一致）。
+    """
     path = find_tool(name)
     if path is None:
         return {"available": False, "error": "not_found"}
+    if skip_version:
+        return {"available": True, "path": path, "version": "",
+                "probe_skipped": "unpinned", "note": skip_version}
     for argv in ([[varg]] if varg else []) + [[]]:
         t0 = time.monotonic()
-        rc, out, err = run([path, *argv], timeout=timeout)
+        rc, out, err = run([path, *argv], timeout=timeout, cwd=cwd)
         if rc is None:
             return {"available": False, "path": path, "error": "probe_timeout",
                     "probe_ms": int((time.monotonic() - t0) * 1000),
@@ -151,42 +183,133 @@ def probe_decompress(timeout: float = 10.0) -> dict[str, Any]:
 
 # ------------------------------------------------------------------ Lean 项目
 
+# 「为什么未定点就不探」的那段理由，两个调用点共用一份，免得说法分叉。
+UNPINNED_ADVICE = (
+    "在这个项目（或它的任一祖先目录）里放一个 lean-toolchain，"
+    "或把 OPL_LEAN_PROJECT 指向一个已定点的项目。未定点时不探测：elan 的 "
+    "default_toolchain 会让每次 lean/lake 调用联网解析（实测 1.3–12 秒且随机，"
+    "本机 30 秒超时都拿不到版本），本机没装过时还会把那个 toolchain 下下来。"
+)
+
+
+def lean_pin(root: str) -> tuple[bool, str, str | None]:
+    """`root` 及其祖先里有没有 `lean-toolchain`。纯文件系统，不启进程。
+
+    返回 (是否定点, toolchain 内容, 提供它的目录)。「祖先里也算」不是宽松，而是
+    跟事实对齐：elan 自己往上找，`opl_lean.resolve_project()` 也是这么找的。
+    """
+    found = find_toolchain(root)
+    if found is None:
+        return False, "", None
+    where, content = found
+    return bool(content), content, where
+
+
+def lean_context() -> dict[str, Any]:
+    """Lean 探测的上下文：有效的项目目录 + 是否定点。纯文件系统，不启进程。
+
+    有效项目取 `OPL_LEAN_PROJECT`，否则 `<plugin>/lean`——与
+    `opl_lean.resolve_project()` 同一套规则。两条命令对「哪个项目」必须给同一个
+    答案，否则会出现「capabilities 说有定点、leancheck 说没有」。
+    """
+    proj = os.environ.get("OPL_LEAN_PROJECT") or os.path.join(plugin_root(), "lean")
+    exists = os.path.isdir(proj)
+    pinned, toolchain, pinned_by = lean_pin(proj) if exists else (False, "", None)
+    return {"project": proj, "exists": exists, "pinned": pinned,
+            "toolchain": toolchain, "pinned_by": pinned_by}
+
+
+def lean_probe_cwd(ctx: dict[str, Any]) -> str | None:
+    """在哪个目录里探 `lean`/`lake` 才安全。
+
+    定点了就返回**装着 lean-toolchain 的那个目录**（`pinned_by`）——elan 在那里
+    不用联网，`lake --version` 是 0.02 秒的本地调用。没定点返回 None，调用方据此
+    走「不探只报存在性」那条路。
+
+    为什么不直接用项目目录：`lean-toolchain` 可能在上层（monorepo 常见），
+    落到 `pinned_by` 是最紧的保证。
+    """
+    if not ctx.get("pinned"):
+        return None
+    return ctx.get("pinned_by") or ctx.get("project")
+
+
+def elan_env() -> dict[str, Any]:
+    """不含子进程的 elan 环境事实。全部只读，用来回答「那我该定点到哪个版本」。"""
+    home = os.environ.get("ELAN_HOME") or os.path.join(os.path.expanduser("~"), ".elan")
+    facts: dict[str, Any] = {"elan_home": home, "exists": os.path.isdir(home)}
+    settings = os.path.join(home, "settings.toml")
+    if os.path.isfile(settings):
+        try:
+            text = open(settings, encoding="utf-8").read()
+            m = re.search(r'^\s*default_toolchain\s*=\s*"([^"]*)"', text, re.M)
+            facts["default_toolchain"] = m.group(1) if m else None
+        except OSError as exc:
+            facts["default_toolchain"] = None
+            facts["settings_error"] = str(exc)
+    tc_dir = os.path.join(home, "toolchains")
+    if os.path.isdir(tc_dir):
+        try:
+            facts["installed_toolchains"] = sorted(os.listdir(tc_dir))
+        except OSError:
+            pass
+    facts["lean_on_path"] = find_tool("lean")
+    facts["lake_on_path"] = find_tool("lake")
+    return facts
+
 
 def probe_lean_project(timeout: float = 30.0) -> dict[str, Any]:
     """探测 Lean 项目上下文。
+
+    未定点时**一次都不调用 lake**（原因见模块 docstring）——那时只报三样：为什么
+    没探、怎么修、以及不含子进程的环境事实。定点了才真的去问版本，那时是 0.02 秒
+    的本地调用。
 
     为什么不能只探 `lean --version`：见模块 docstring。探测必须在一个*定点*的目录里
     做，并把「是否定点」本身当成事实报出来——`pinned_fast` 就是用来在它退化回联网时
     报警的。
     """
-    proj = os.environ.get("OPL_LEAN_PROJECT") or os.path.join(plugin_root(), "lean")
+    proj = lean_context()["project"]
     info: dict[str, Any] = {
         "project": proj,
         "resolved": os.path.realpath(proj) if os.path.exists(proj) else None,
     }
     if not os.path.isdir(proj):
         return info | {"available": False, "error": "no_project",
-                       "hint": "设 OPL_LEAN_PROJECT，或把 Lean 项目链到 <plugin>/lean"}
+                       "advice": "设 OPL_LEAN_PROJECT，或把 Lean 项目链到 <plugin>/lean",
+                       "env": elan_env()}
 
-    tc = os.path.join(proj, "lean-toolchain")
-    if os.path.isfile(tc):
-        try:
-            info["toolchain"] = open(tc, encoding="utf-8").read().strip()
-        except OSError as exc:
-            info["toolchain"] = None
-            info["toolchain_error"] = str(exc)
-        info["pinned"] = bool(info.get("toolchain"))
+    ctx = lean_context()
+    pinned = bool(ctx["pinned"])
+    info["pinned"] = pinned
+    if ctx["toolchain"]:
+        info["toolchain"] = ctx["toolchain"]
+    if ctx["pinned_by"]:
+        info["pinned_by"] = ctx["pinned_by"]
+    # Mathlib 是否已构建是纯文件系统事实，与「探不探 lake」无关，所以两条分支都给。
+    # 用代表性产物判断，避免遍历 8000+ 个 .olean。
+    mldir = os.path.join(proj, ".lake", "packages", "mathlib")
+    if os.path.isdir(mldir):
+        marker = os.path.join(mldir, ".lake", "build", "lib", "lean", "Mathlib.olean")
+        info["mathlib"] = {"present": True, "built": os.path.isfile(marker),
+                           "marker": marker if os.path.isfile(marker) else None}
     else:
-        info["pinned"] = False
-        info["note"] = ("无 lean-toolchain：elan 每次调用都要联网解析 stable，"
-                        "实测同一命令 1.3–12 秒且随机，定点后 0.02 秒")
+        info["mathlib"] = {"present": False}
+
+    if not pinned:
+        # 「没问出来」不是「不可用」：`available` 用 None 而不是 False。这与退出码
+        # 那套是同一条纪律——「无法判定」不能报成「后端缺失」。
+        return info | {"available": None, "probe_skipped": "unpinned",
+                       "advice": UNPINNED_ADVICE, "env": elan_env()}
 
     lake = find_tool("lake")
     if lake is None:
-        return info | {"available": False, "error": "lake_not_found"}
+        return info | {"available": False, "error": "lake_not_found", "env": elan_env()}
     t0 = time.monotonic()
-    # cwd 必须是项目目录本身，否则 elan 又去联网解析 stable。
-    rc, out, err = run([lake, "--version"], timeout=timeout, cwd=proj)
+    # cwd 必须是装着 lean-toolchain 的那个目录，否则 elan 又去联网解析 stable。
+    # 这一步只在*定点*之后才可能走到——未定点的那条路在上面已经返回了。
+    rc, out, err = run([lake, "--version"], timeout=timeout,
+                       cwd=lean_probe_cwd(ctx) or proj)
     ms = int((time.monotonic() - t0) * 1000)
     text = (out or err).decode("utf-8", "replace").strip().splitlines()
     info["lake"] = {"exit": rc, "probe_ms": ms,
@@ -194,16 +317,9 @@ def probe_lean_project(timeout: float = 30.0) -> dict[str, Any]:
                     "error": "probe_timeout" if rc is None else None}
     info["available"] = rc == 0
     # 定点之后 lake 本身应当在毫秒级；超过 1 秒说明仍在联网。
+    # 这条报警只在「看起来定点、实际仍在联网」时才有意义（比如项目里那个
+    # lean-toolchain 被删了），未定点的情形不靠它——那时 pinned=false 已经是结论。
     info["pinned_fast"] = ms < 1000
-
-    ml = os.path.join(proj, ".lake", "packages", "mathlib")
-    if os.path.isdir(ml):
-        # 用代表性产物判断，避免遍历 8000+ 个 .olean。
-        marker = os.path.join(ml, ".lake", "build", "lib", "lean", "Mathlib.olean")
-        info["mathlib"] = {"present": True, "built": os.path.isfile(marker),
-                           "marker": marker if os.path.isfile(marker) else None}
-    else:
-        info["mathlib"] = {"present": False}
     return info
 
 
@@ -277,16 +393,31 @@ def build_snapshot(*, layers: list[str] | None = None,
     log: list[str] = []
     t0 = time.monotonic()
     tools: dict[str, dict[str, Any]] = {}
+    # Lean 的两个可执行文件要特殊对待：有定点项目就**在那个目录里**探（0.02 秒的本地
+    # 调用，且答案正确），没有就一次都不探，只报存在性 + 推荐。判据不是「调用方当前
+    # 在哪个目录」而是「有没有可用定点项目」——在仓库根跑 opl-capabilities 时 cwd 祖先
+    # 没有 lean-toolchain，但 plugin/lean 里有一个，那时照样应该探，否则能力快照
+    # 会在最常用的场景下丢失版本信息。
+    lean_ctx = lean_context()
+    lean_cwd = lean_probe_cwd(lean_ctx)
     for layer in wanted:
         for name, varg in LAYERS[layer]:
             if name in tools:
                 continue
-            info = probe_executable(name, varg, timeout)
+            is_lean_bin = layer == "lean" and name in ("lean", "lake")
+            info = probe_executable(
+                name, varg, timeout,
+                cwd=lean_cwd if is_lean_bin else None,
+                skip_version=(UNPINNED_ADVICE if is_lean_bin and lean_cwd is None
+                              else None))
             info["layer"] = layer
             tools[name] = info
-            state = "ok" if info["available"] else info.get("error", "missing")
+            if info.get("probe_skipped"):
+                state = "presence-only"
+            else:
+                state = "ok" if info["available"] else info.get("error", "missing")
             log.append(f"{name:<16} {layer:<10} {state}"
-                       + (f"  {info.get('version', '')[:48]}" if info.get("available") else ""))
+                       + (f"  {info.get('version', '')[:48]}" if info.get("version") else ""))
 
     if "proof" in wanted:
         info = probe_decompress()
@@ -299,16 +430,21 @@ def build_snapshot(*, layers: list[str] | None = None,
     # 决定：只有定点了 toolchain 的目录里才不会联网。
     lean_project = probe_lean_project(python_timeout)
     if "lean" in wanted:
-        if lean_project.get("available"):
+        if lean_project.get("probe_skipped"):
+            # 没探不是没装。把「为什么没探」和「怎么修」直接打在日志里，
+            # 免得读者把这一行误读成 lean 不可用。
+            log.append(f"{'lean-project':<16} {'lean':<10} unpinned（未探测）")
+            log.append(f"{'':<16} {'':<10} → {lean_project.get('advice')}")
+        elif lean_project.get("available"):
             ms = (lean_project.get("lake") or {}).get("probe_ms")
             log.append(f"{'lean-project':<16} {'lean':<10} ok  "
                        f"{lean_project.get('toolchain', '?')}  lake {ms}ms"
                        f"{'' if lean_project.get('pinned_fast') else '  ← 偏慢，疑似仍在联网'}")
-            ml = lean_project.get("mathlib") or {}
-            log.append(f"{'mathlib':<16} {'lean':<10} "
-                       f"{'built' if ml.get('built') else ('present_unbuilt' if ml.get('present') else 'absent')}")
         else:
             log.append(f"{'lean-project':<16} {'lean':<10} {lean_project.get('error')}")
+        ml = lean_project.get("mathlib") or {}
+        log.append(f"{'mathlib':<16} {'lean':<10} "
+                   f"{'built' if ml.get('built') else ('present_unbuilt' if ml.get('present') else 'absent')}")
 
     interpreters: dict[str, dict[str, Any]] = {}
     py_layers: dict[str, dict[str, Any]] = {}
