@@ -479,6 +479,20 @@ def parse_where(items: list[str] | None) -> dict[str, Any] | None:
     return out
 
 
+def _unique_path(base: str) -> str:
+    """给 `base` 找一个**当前不存在**的名字：`base` 被占就依次试 `base-2`、`base-3`…
+
+    为什么需要：归档用 `os.replace()`，它是**覆盖式**的。备份名原先只精确到秒，
+    同一秒里第二次重建就会把第一次的备份原地吃掉（第四轮审阅实测），而两份备份之间
+    恰好是「另一个实验」——吃掉哪一份都等于丢历史。
+    """
+    cand, n = base, 1
+    while os.path.exists(cand):
+        n += 1
+        cand = f"{base}-{n}"
+    return cand
+
+
 def lab_paths(lab: str) -> dict[str, str]:
     d = os.path.join(os.path.abspath(lab), EVOLVE_DIR)
     return {"dir": d,
@@ -489,8 +503,14 @@ def lab_paths(lab: str) -> dict[str, str]:
             "db": os.path.join(d, "programs.sqlite")}
 
 
-def check_evaluator_protocol(p: dict[str, str], *, timeout: float = 60.0) -> str | None:
+def check_evaluator_protocol(evaluator: str, skeleton: str, problem: str, *,
+                             timeout: float = 60.0) -> str | None:
     """评估器是否符合**两阶段协议**。返回 None 表示符合，否则返回原因。
+
+    参数是**三个文件的路径**，而不是实验目录：`init_lab` 要能在**动活库之前**拿源文件
+    探一次（第四轮审阅 F3：旧版先归档活库、后探协议，于是一次不合规的重建把正常实验的
+    库挪走了）。原来从实验目录拼 `evaluator.py` 的写法还顺手忽略了自己收下的
+    `p["evaluator"]`——路径给了却不看，是下一处「看着对」的温床。
 
     这是**功能性**探测，不是查 `--help`：真拿骨架跑一次 `extract`，要求它**产出数据**。
 
@@ -503,11 +523,13 @@ def check_evaluator_protocol(p: dict[str, str], *, timeout: float = 60.0) -> str
 
     「存在性不等于可用」这条在本项目已经应验过五次，这是第六次。
     """
-    ev = os.path.join(p["dir"], "evaluator.py")
+    ev = evaluator
     if not os.path.isfile(ev):
-        return f"实验目录里没有评估器：{ev}"
-    if not os.path.isfile(p["skeleton"]):
-        return f"实验目录里没有骨架：{p['skeleton']}"
+        return f"没有评估器：{ev}"
+    if not os.path.isfile(skeleton):
+        return f"没有骨架：{skeleton}"
+    if not os.path.isfile(problem):
+        return f"没有实验定义：{problem}"
     import tempfile
 
     from opl_run import RunSpec, execute
@@ -515,14 +537,14 @@ def check_evaluator_protocol(p: dict[str, str], *, timeout: float = 60.0) -> str
     with tempfile.TemporaryDirectory(prefix="opl-proto.") as tmp:
         work = os.path.join(tmp, "work")
         os.makedirs(work, exist_ok=True)
-        shutil.copyfile(p["skeleton"], os.path.join(work, "candidate.py"))
+        shutil.copyfile(skeleton, os.path.join(work, "candidate.py"))
         spec = RunSpec(
             argv=[SANDBOX_PYTHON, "/opt/evaluator.py", "extract",
                   "--problem", "/opt/problem.json", "--candidate", "/work/candidate.py",
                   "--artifacts", "/work/artifacts"],
             workdir=work, run_id="protocol-probe", runner_dir=os.path.join(tmp, "run"),
             timeout=timeout,
-            ro_binds=[(ev, "/opt/evaluator.py"), (p["problem"], "/opt/problem.json")])
+            ro_binds=[(ev, "/opt/evaluator.py"), (problem, "/opt/problem.json")])
         res = execute(spec)
         arts = os.path.join(work, "artifacts")
         produced = os.path.isdir(arts) and bool(os.listdir(arts))
@@ -670,28 +692,47 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
 
     p = lab_paths(lab)
     archived = None
-    if os.path.exists(p["db"]):
-        if not force:
-            raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
-        # **归档旧库**，不原地复用：换了实验定义之后，旧成绩与新的不可比，
-        # 而「同名指标不代表可直接比较」。原地保留会让 best() 把两个实验混在一起排。
-        archived = f"{p['db']}.bak-{time.strftime('%Y%m%dT%H%M%S')}"
-        os.replace(p["db"], archived)
+    # == 顺序：**先把新输入验完，再动活库** ==
+    #
+    # 第四轮审阅 F3：旧版先归档、后检查输入，于是一个**无效请求**（比如骨架路径写错）
+    # 已经把正常实验的 `programs.sqlite` 挪走了——报错退出，但活库不见了。一次失败的
+    # 重建不该改变现有实验的状态，这是「失败要失败得干净」的最低要求。
     for src, what in ((skeleton_src, "骨架"), (evaluator_src, "评估器"),
                       (problem_src, "实验定义")):
         if not os.path.isfile(src):
             raise EvolveError(f"{what}文件不存在：{src}")
     problem = load_problem(problem_src)  # 先校验，别把一个坏定义拷进去
-    os.makedirs(p["candidates"], exist_ok=True)
-    shutil.copyfile(skeleton_src, p["skeleton"])
-    shutil.copyfile(evaluator_src, p["evaluator"])
-    shutil.copyfile(problem_src, p["problem"])
 
     # 协议合规**正面探一次**，不合规就直接拒——别等到评估时把它误报成「候选被拒」：
     # 不合规的评估器收到 `extract` 时 argparse 会以 2 结束，而那正是「候选不可用」的码。
-    bad_proto = check_evaluator_protocol(p)
+    # 探测拿的是**源文件**（还没拷进实验目录），所以探测失败时实验目录一个字节都没动。
+    bad_proto = check_evaluator_protocol(evaluator_src, skeleton_src, problem_src,
+                                         timeout=timeout)
     if bad_proto:
         raise EvolveError(bad_proto)
+
+    if os.path.exists(p["db"]):
+        if not force:
+            raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
+        # **归档旧库**，不原地复用：换了实验定义之后，旧成绩与新的不可比，
+        # 而「同名指标不代表可直接比较」。原地保留会让 best() 把两个实验混在一起排。
+        #
+        # 名字要**唯一**：第四轮审阅实测，精确到秒的时间戳在一次循环里重建两次就会撞，
+        # 而 `os.replace` 是覆盖式的——第二次重建会静默吃掉第一次的备份。
+        archived = _unique_path(f"{p['db']}.bak-{time.strftime('%Y%m%dT%H%M%S')}")
+        os.replace(p["db"], archived)
+    try:
+        os.makedirs(p["candidates"], exist_ok=True)
+        shutil.copyfile(skeleton_src, p["skeleton"])
+        shutil.copyfile(evaluator_src, p["evaluator"])
+        shutil.copyfile(problem_src, p["problem"])
+    except OSError as exc:
+        # 归档之后、三份文件就位之前还可能失败（盘满、权限）。把库放回原处，
+        # 宁可退回「重建没发生」，也不要留一个没有库的实验目录。
+        if archived:
+            os.replace(archived, p["db"])
+        raise EvolveError(f"重建失败，已把旧库放回原处：{exc}") from exc
+
     code = open(p["skeleton"], encoding="utf-8").read()
     h, _ = code_hash(code)
     facts = _stage_and_evaluate(p, code, h, problem_path=p["problem"],
@@ -765,7 +806,7 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
     if not os.path.isfile(p["evaluator"]):
         raise EvolveError(f"实验目录里缺评估器：{p['evaluator']}")
     problem = load_problem(p["problem"])
-    bad_proto = check_evaluator_protocol(p)
+    bad_proto = check_evaluator_protocol(p["evaluator"], p["skeleton"], p["problem"])
     if bad_proto:
         raise EvolveError(bad_proto)
     summary = [problem.feasible_field] + (
