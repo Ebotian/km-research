@@ -32,7 +32,7 @@ $OPL/opl-leancheck --file lab/lean/C0001.lean --decl opl_C0001
 
 | 判决 | 退出码 | 含义 | 动作 |
 |---|---|---|---|
-| `PROVED` | 0 | 内核接受，且公理 ⊆ `{propext, Classical.choice, Quot.sound}` | 可以定案为 `lean_checked` |
+| `PROVED` | 0 | 内核接受，且公理 ⊆ `{propext, Classical.choice, Quot.sound}` | 可以定案为 `proved`；**必须点名声明被证的是哪条定理**（见下） |
 | `SORRY_AX` | 1 | 文件里有 `sorry`，或某定理依赖 `sorryAx` | 补证明；**不得**当作「基本完成」 |
 | `UNPROVED_AXIOMS` | 1 | 无 sorry，但依赖白名单外公理 | 多半是 `native_decide`；见下 |
 | `FAILED` | 1 | 编译不过 | 先修编译 |
@@ -66,11 +66,42 @@ $OPL/opl-leancheck --file lab/lean/C0001.lean --decl opl_C0001
 `#print axioms` 只报告**被点名那条定理**的公理。所以：
 
 - 想审计哪条定理，就 `--decl <定理名>`（可重复）。工具会把它追加到**临时副本**，
-  原文件不动。
+  原文件不动。点过的名字会写进证据记录的 `decls`——那张名单是「这份证据审的是哪个
+  命题」的唯一凭据，后面的定案要照着它点名。
 - 文件里其他没被点名的 `sorry` 不会被漏掉——工具另有一条**文件级**通道
   （`kind == "hasSorry"` 诊断），只要文件里有 `sorry` 就判 `SORRY_AX`。
   实测这个组合能抓到「被点名的定理干净、但旁边有个 ghost 带 sorry」的情形。
 - 定理名打错时 `#print axioms` 会报 `Unknown constant` 且退出码 1 → `FAILED`。
+
+## 定案为 `proved` 必须点名声明
+
+判决不会自己变成结论，落台账时要点名说出「被证明的是哪条定理」：
+
+```bash
+# 出证据：--decl 点的是这次审计的定理，--subject 是这份证据为哪个猜想而出
+$OPL/opl-leancheck --file lab/lean/C0001.lean --decl opl_C0001 \
+  --evidence-out lab/evidence/C0001.json --subject C-0001
+
+# 定案：再点一次名，这一次点的是被证明的对象
+$OPL/opl-conj set C-0001 --formal-status proved \
+  --statement-formal lab/lean/C0001.lean --decl opl_C0001 \
+  --evidence lab/evidence/C0001.json --verification-level lean_checked
+```
+
+- `--decl` 必须是证据里 `decls` 记着的名字之一。不点名，或点同一个文件里的**另一个**
+  声明，都被拒（退出码 `2`）。理由是**路径一致不代表被证明的对象没变**——同一个
+  `.lean` 文件里换一个定理就是换了一个命题，只比文件路径分不出这两件事。
+- `--statement-formal` 的 `file` 按**绝对路径**与证据里的 `file` 比对，所以写相对路径
+  不会误伤同一个文件（证据记的是绝对路径，两种写法指的是同一个文件）。
+- 证据的 `subject` 要与猜想 id 相同，否则也拒（退出码 `2`）——一份真证据不能给另一个
+  猜想背书。
+
+## 定案之后，证据每次写入都要重新核
+
+记录里的 `evidence` 只是路径 + 哈希 + 几个字段的摘要，**摘要不是证据**：每次写入都会
+重新加载那份证据，核对它自己的哈希、它引用的输入（这里就是那个 Lean 文件）的哈希、
+以及种类 / 判决 / 对象是否仍与结论相称。所以「把 Lean 文件的内容换掉、路径不动」不再
+能让记录继续挂着 `proved`——核不过就整笔拒绝（退出码 `2`），一个字段都不写。
 
 ## 已经踩过的坑
 

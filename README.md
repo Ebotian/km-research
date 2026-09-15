@@ -48,13 +48,13 @@
 | 命令 | 一个职责 |
 |---|---|
 | `opl-capabilities` | 探测后端，产出 `capabilities.json`。含 Python 模块探测、解释器分裂检测与**功能性沙箱探测** |
-| `opl-conj` | 猜想台账。一题一文件；状态变更必须带 `--evidence`，证据还要与结论**绑对象、绑方向、绑范围、绑输入哈希**；改动先在副本上应用完再校验整条记录，不自洽就整笔拒绝、一个字段都不写（退出码 `2`） |
+| `opl-conj` | 猜想台账。一题一文件；状态变更必须带 `--evidence`，证据还要与结论**绑对象、绑方向、绑范围、绑输入哈希**；改动先在副本上应用完再校验整条记录，不自洽就整笔拒绝、一个字段都不写（退出码 `2`）。校验读的不是记录里抄下的摘要，而是**当场重新加载**的那份证据（含它引用的见证/公式/Lean 文件的哈希）。反例的复核章要求种类 `witness_eval`、判决 `VERIFIED`、对象是本猜想、被验见证逐字相同，四条全过才写 `independent`，缺哪条就记 `UNVERIFIED` 并警告；章在**每次写入**时都重核一遍，核不过整笔拒绝。结论是 `proved` 时必须点名声明（`--statement-formal F.lean --decl NAME`），且那个声明必须在该证据审过的声明里 |
 | `opl-encode` | 规格 → CNF / CP-SAT；双后端一致性检查；见证直接求值 |
 | `opl-search` | 跑搜索，产出见证或 DRAT 证明 |
 | `opl-certcheck` | 用独立校验器复核证书 |
 | `opl-leancheck` | 编译 Lean 文件并审计证明状态（公理白名单 + `sorry` 检测） |
 | `opl-run` | 在沙箱里跑一条命令，落四份快照（`cmd`/`env`/`capabilities`/`metrics`），支持 `--detach` / `--wait` |
-| `opl-evolve-init` | 建程序库：拷入骨架与评估器，并把骨架作为第 0 代**带指标**入库；`--force` 重建时把旧库归档成 `programs.sqlite.bak-<时间戳>`，不原地复用 |
+| `opl-evolve-init` | 建程序库：拷入骨架与评估器，并把骨架作为第 0 代**带指标**入库；`--force` 重建时**先把三份新输入与两阶段协议全部验完，再归档旧库**——无效的重建请求不会先移走正常实验的库；归档名撞了就顺延成 `-2`、`-3`，不原地复用也不覆盖上一份备份 |
 | `opl-evolve-suggest` | 出一份变异任务书（可进化区 + 带理由的亲本 + 提交时会执行的约束） |
 | `opl-evolve-eval` | 在沙箱里评估一份候选并入库；区外越界、重复各有各的退出码 |
 | `opl-evolve-show` | 看程序库；`--best` 必须配 `--where`，否则可能选出不可行的程序；它只比较**当前实验定义与评估器指纹一致**的成绩，跳过的条数会报出来 |
@@ -162,9 +162,10 @@ plugin/bin/opl-search --spec "$SPEC" \
 
 # 4 独立复核：sat 侧用规格直接求值（这条路径与任何编码器无关）。
 #   同时也产出**证据记录**——裸的 witness.json 不是证据：它证明不了「谁复核的」，
-#   也证明不了「复核的是这份见证」
+#   也证明不了「复核的是这份见证」；`--subject` 则把它绑到某个猜想上，
+#   少了它这份证据可以给**另一个**猜想背书，台账会拒收
 plugin/bin/opl-encode --spec "$SPEC" --eval-witness lab/runs/C-0001/witness.json \
-  --evidence-out lab/evidence/C-0001.json
+  --subject C-0001 --evidence-out lab/evidence/C-0001.json
 
 # 5 定案（不带 --evidence 会被拒；档位也要证据支撑，退出码 2）
 plugin/bin/opl-conj set C-0001 --formal-status refuted \
@@ -178,7 +179,7 @@ unsat 侧把第 3、4 步换成 `--proof-out` 与 `opl-certcheck`（`spec-pc43.j
 plugin/bin/opl-search --spec plugin/tests/fixtures/spec-pc43.json \
   --cnf-out lab/runs/C-0002/formula.cnf --proof-out lab/runs/C-0002/proof.drat
 plugin/bin/opl-certcheck --formula lab/runs/C-0002/formula.cnf \
-  --cert lab/runs/C-0002/proof.drat --evidence-out lab/evidence/C-0002.json
+  --cert lab/runs/C-0002/proof.drat --subject C-0002 --evidence-out lab/evidence/C-0002.json
 # 退出码 0 且 stdout 为 `s VERIFIED` 才算「该域内无反例」
 ```
 
@@ -198,9 +199,11 @@ plugin/bin/opl-conj add --id C-0003 --title "前 n 个奇数之和等于 n²" \
 plugin/bin/opl-leancheck --file plugin/tests/fixtures/lean-real.lean \
   --decl oddSum_eq_sq --evidence-out lab/evidence/C-0003.json
 
-# 4 台账定案
+# 4 台账定案：结论是 proved 就必须点名声明，且必须是第 3 步审过的那个
+#   —— 同一文件里换一个声明就是换了一个被证明的命题，不点名会被拒
 plugin/bin/opl-conj set C-0003 --formal-status proved \
-  --evidence lab/evidence/C-0003.json --verification-level lean_checked
+  --evidence lab/evidence/C-0003.json --verification-level lean_checked \
+  --statement-formal plugin/tests/fixtures/lean-real.lean --decl oddSum_eq_sq
 ```
 
 第 3 步里「证明检查」与「独立内核复核」是同一条命令的两件事：编译告诉你能不能被
@@ -238,7 +241,10 @@ plugin/bin/opl-evolve-show --lab lab --best comparators --where sorts=true
 （`comparators`、`loss`）不再是同一件事，所以 `--best` 只考虑「最近一次评估用的实验
 定义 sha256 + 评估器 sha256」与当前实验一致的成绩，跳过多少条会打印出来。重建库时
 `--force` 把旧库归档而不是原地复用，是同一条理由的另一半：不归档，旧成绩会继续参与
-排名，于是「最好的一条」来自一个已经不存在的实验。
+排名，于是「最好的一条」来自一个已经不存在的实验。归档因此**排在新输入验完之后**——
+骨架路径写错、评估器不合协议这类无效请求，不该在报错之前先把正常实验的库挪走；
+归档名也按「不存在就取下一个」来定，同一秒里重建两次不会覆盖掉上一份备份。归档之后
+若拷贝失败，会把库放回原处。
 
 **评估器是两阶段的（硬约定）**：`extract` 跑候选、只把产物写成数据；`verify` 读数据、
 **独立判定**。插件把两步跑在两个独立沙箱进程里，`verify` 那一侧**没有候选**。
@@ -304,7 +310,7 @@ per-run cgroup**（内存/进程数限额 + 收口 + OOM 归因）。三条实�
 
 
 ```bash
-plugin/scripts/build-zip.sh      # -> plugin/dist/open-problem-lab-<版本>.zip（约 285 KB）
+plugin/scripts/build-zip.sh      # -> plugin/dist/open-problem-lab-<版本>.zip（约 390 KB）
 plugin/scripts/verify-zip.sh     # 解压到干净目录并跑通两条链（反例侧 + 证明侧）
 ```
 
@@ -328,8 +334,8 @@ Python 有 `z3`/`sympy`，另一个 venv 有 `cvc5`/`ortools`，两边都缺对�
 plugin/                 插件本体
   kimi.plugin.json      清单（skills 显式列出）
   THIRD-PARTY-NOTICES.md  随包分发的第三方许可声明
-  bin/                  十个命令（含 third-party/，由脚本安装，不入库）
-  lib/                  全部逻辑（3,960 行），可类型检查、可单测
+  bin/                  十一个命令（含 third-party/，由脚本安装，不入库）
+  lib/                  全部逻辑（4,998 行），可类型检查、可单测
   skills/               opl-entry · opl-refute · opl-formalize · opl-prove · opl-evolve
   scripts/              typecheck · regress · build-zip · verify-zip
                         setup-third-party · update-third-party-notices · install-hooks
@@ -347,15 +353,15 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 146 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 152 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
-plugin/scripts/verify-zip.sh     # 47 项：解压到干净目录并跑通两条链
+plugin/scripts/verify-zip.sh     # 48 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
 回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
-`lake` 或没有定点项目时**不跑**（`regress.sh` 那时报 `132 通过 / 0 失败 / 14 跳过`，
-环境齐备时报 `146 通过 / 0 失败 / 0 跳过`），`verify-zip.sh` 在同样情形下报
+`lake` 或没有定点项目时**不跑**（`regress.sh` 那时报 `136 通过 / 0 失败 / 16 跳过`，
+环境齐备时报 `152 通过 / 0 失败 / 0 跳过`），`verify-zip.sh` 在同样情形下报
 `42 通过 / 0 失败 / 5 跳过`。
 跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
 
@@ -383,8 +389,8 @@ plugin/scripts/install-hooks.sh  # 挂成提交前钩子
   Glucose42 无效（设成 0 仍照常解完）。超时只能用 `--timeout`（墙钟 + 子进程）。
 - **类型检查有盲区**：`bin/` 下的命令没有 `.py` 扩展名（Unix 可执行文件本该如此），
   于是 `mypy` 报 `Cannot find implementation`、`ty` 报 `unresolved-import`。
-  修法不是改名，而是把逻辑下沉到 `lib/`——**六个命令现已全部下沉**（`bin/` 合计
-  889 行，只剩 argv 与退出码翻译；逻辑 2,228 行全在 `lib/` 内）。但盲区本身没有消失：
+  修法不是改名，而是把逻辑下沉到 `lib/`——**命令都已全部下沉**（`bin/` 合计
+  1,519 行，只剩 argv 与退出码翻译；逻辑 4,998 行全在 `lib/` 内）。但盲区本身没有消失：
   往 `bin/` 里新写一段逻辑，它照样不会被任何检查器看到，只能靠自律。
 - **Lean 侧依赖外部项目**：`plugin/lean` 是本机软链，仓库不含那个项目。
   压缩包因此开箱跑不了证明侧链路（会如实报 `2`/`4` 并降级）。这是刻意的——
@@ -397,16 +403,17 @@ plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 
 ## 状态
 
-**版本 `0.2.1`**（清单里的 `version` 是真源，压缩包名跟着它走）：
+**版本 `0.2.2`**（清单里的 `version` 是真源，压缩包名跟着它走）：
 
 | 版本 | 覆盖 | 破坏性改动 |
 |---|---|---|
 | `0.1.0` | M0 契约与骨架、M1 编码与搜索、M2 反例搜索闭环 | — |
 | `0.2.0` | 加上 M3 证明侧（`opl-leancheck` + 两个技能）与 M4 程序搜索（`opl-run` + `opl-evolve-*` + 技能），并修掉一批**假成功路径** | 两处：**证据记录**必须带 `subject` / `kind` / `range` 并绑定输入哈希（`opl-conj` 会核对）；**评估器**必须是两阶段协议（`extract` / `verify`），单阶段的会在 `init` 被拒 |
 | `0.2.1` | 台账改成**事务式校验**（校验改完的整条记录，不再逐个参数补条件），评估器**退出码与指标矛盾**时不下判决，`--force` 重建归档旧库，`--best` 只比较同一实验的成绩 | 一处：台账会**拒绝**以前能写进去的改动——只改 `--verified-range` 不换证据、证据缺 `kind` 的升档、给无关见证盖复核章（最后一种仍降级记录，只是不再盖章） |
+| `0.2.2` | 修掉两类**假成功**：**假复核**——反例的复核章现在要求种类 `witness_eval`、判决 `VERIFIED`、对象是本猜想、被验见证逐字相同，四条全过才写 `independent`，且每次写入都重新加载证据重核一遍，核不过整笔拒绝；**摘要当证据用**——台账不再拿记录里抄下的路径 + 哈希当依据，而是每次写入都重新加载那份证据并核对它引用的输入文件。结论是 `proved` 时必须点名声明，`--force` 重建改成**先验完新输入与协议、再动活库** | 两处：一份判决不是 `VERIFIED` 的见证、或属于**别的**猜想的证据，都不能再给反例盖 `independent`（降级为 `UNVERIFIED`）；结论是 `proved` 却不说证明了哪个声明（`--statement-formal F.lean --decl NAME`），或点的声明不在该证据审过的声明里，一律拒收（退出码 `2`） |
 
-0.x 里破坏性改动走 minor，所以是 `0.1.0 → 0.2.0`；`0.2.1` 是 patch——`0.2.0` 的调用
-方式照用，只是几条以前静默通过的写入现在会被拒或降级。
+0.x 里破坏性改动走 minor，所以是 `0.1.0 → 0.2.0`；`0.2.1` 与 `0.2.2` 都是 patch——
+`0.2.0` 的调用方式照用，只是几条以前静默通过的写入现在会被拒或降级。
 
 已实现并纳入回归：`opl-encode` / `opl-search` 与其下游的证书链（反例侧）；
 `opl-leancheck` 与其两个技能（证明侧）；`opl-run` 与 `opl-evolve-*` 四命令加
