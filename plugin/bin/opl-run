@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""opl-run —— 在受控进程里跑一条命令，落四份运行快照。薄壳：逻辑在 lib/opl_run.py。
+
+一个职责：把「跑一次」变成一份可复核的记录。不评估结果好坏（那是 opl-evolve 的事），
+也不判断数学。
+
+用法：
+    opl-run [--runs-dir DIR] [--id ID] --workdir DIR [选项] -- CMD [ARG...]
+
+选项：
+    --timeout S        墙钟上限（默认 60）
+    --mem-mb N         内存上限（MB）。只在 cgroup 可写时生效，否则快照里如实记
+                       「未生效」而不是假装设了
+    --pids-max N       进程数上限（默认 256）
+    --allow-net        不禁网（默认禁）
+    --no-sandbox       不套 bwrap。只给自己诊断用，快照里会记下这个事实
+    --deep-capabilities  连功能性沙箱探测一起做（默认只记版本，不启额外进程）
+
+退出码（与其他命令共用一套约定）：
+    0  PASS            命令跑完且自己退出 0
+    1  REJECT          命令跑完但自己退出非 0 —— 「这个任务成功了」被推翻
+    2  USAGE           参数错误、工作目录不存在
+    3  UNKNOWN         **没有判决**：超时 / 被 OOM 杀 / 被信号杀 / 沙箱起不来。
+                       注意 3 不是「失败」——把「没跑出来」记成「跑出来是错的」
+                       正是本工具最不能犯的错
+    4  MISSING         找不到 bwrap。不降级到裸跑——那会静默丢掉整个隔离保证
+
+`stdout` 输出一行 `s <KIND>`；诊断走 `stderr`；快照落在 `runs/<id>/` 下。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+
+from opl_common import PASS, REJECT, UNKNOWN, MISSING, USAGE, c, s  # noqa: E402
+from opl_run import (BACKEND_MISSING, NO_VERDICT, OK, PAYLOAD_FAILED, RunSpec,  # noqa: E402
+                     execute, write_snapshots)
+
+KIND_EXIT = {
+    OK: PASS,
+    PAYLOAD_FAILED: REJECT,
+    BACKEND_MISSING: MISSING,
+}
+# 其余（timeout / oom / oom_inferred / signal / sandbox_error）都是「没有判决」。
+# 单列一张表而不是兜底成某个数：兜底会悄悄把一个新结局折进老桶里。
+for _k in NO_VERDICT:
+    KIND_EXIT.setdefault(_k, UNKNOWN)
+KIND_EXIT.setdefault("sandbox_error", UNKNOWN)
+
+
+def default_runs_dir() -> str:
+    lab = os.environ.get("OPL_LAB")
+    return os.path.join(lab, "runs") if lab else os.path.join(os.getcwd(), "runs")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--runs-dir", default=None)
+    ap.add_argument("--id", default=None)
+    ap.add_argument("--workdir", default=None)
+    ap.add_argument("--timeout", type=float, default=60.0)
+    ap.add_argument("--mem-mb", type=int, default=None)
+    ap.add_argument("--pids-max", type=int, default=256)
+    ap.add_argument("--allow-net", action="store_true")
+    ap.add_argument("--no-sandbox", action="store_true")
+    ap.add_argument("--deep-capabilities", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER,
+                    help="-- 之后是要跑的命令")
+    args = ap.parse_args()
+
+    cmd = args.cmd
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        c("缺少要跑的命令：写在 -- 之后")
+        return USAGE
+
+    workdir = os.path.abspath(args.workdir or os.getcwd())
+    if not os.path.isdir(workdir):
+        c(f"工作目录不存在：{workdir}")
+        return USAGE
+    run_id = args.id or f"run-{os.getpid()}"
+    runs_dir = os.path.abspath(args.runs_dir or default_runs_dir())
+    runner_dir = os.path.join(runs_dir, run_id)
+    os.makedirs(runner_dir, exist_ok=True)
+
+    spec = RunSpec(argv=cmd, workdir=workdir, run_id=run_id, runner_dir=runner_dir,
+                   timeout=args.timeout, mem_max_mb=args.mem_mb,
+                   pids_max=args.pids_max, net_off=not args.allow_net,
+                   sandboxed=not args.no_sandbox)
+    res = execute(spec)
+    files = write_snapshots(spec, res, deep_capabilities=args.deep_capabilities)
+
+    for note in res.notes:
+        c(f"注意：{note}")
+    c(f"运行目录 {runner_dir}")
+    if args.json:
+        out = {"run_id": run_id, "kind": res.kind, "elapsed_ms": res.elapsed_ms,
+               "payload_exit_code": res.payload_exit,
+               "payload_signal": res.payload_signal,
+               "cgroup": res.cgroup, "snapshots": files}
+        print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
+    s(res.kind.upper(), f"{res.elapsed_ms}ms  {runner_dir}")
+    return KIND_EXIT.get(res.kind, UNKNOWN)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

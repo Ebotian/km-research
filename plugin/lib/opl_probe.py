@@ -368,7 +368,7 @@ def probe_sandbox(timeout: float = 20.0) -> dict[str, Any]:
 
         # bwrap --unshare-net（预期：真的禁网）
         bw_rc, bw_msg = _run_rc(
-            sandbox.bwrap_argv(py, sandbox.NET_PROBE, workdir=d), timeout)
+            sandbox.bwrap_python_argv(py, sandbox.NET_PROBE, workdir=d), timeout)
         res["bwrap_net_off"] = {"isolated": net_verdict(bw_rc), "exit": bw_rc,
                                 "detail": bw_msg}
 

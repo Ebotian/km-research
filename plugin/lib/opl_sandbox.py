@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from typing import Any
 
 # 只读绑定的系统路径。这份清单是**实测过能跑通 python3** 的最小集合，不要凭直觉加：
 # 加一条就要重跑一次回归，理由和减一条一样。
@@ -76,13 +77,13 @@ def mem_probe_mb(mb: int) -> str:
     )
 
 
-def bwrap_argv(python: str, code: str, *, workdir: str, net_off: bool = True,
+def bwrap_argv(inner: list[str], *, workdir: str, net_off: bool = True,
                unshare_pid: bool = True, ro_binds: list[tuple[str, str]] | None = None,
                rw_binds: list[tuple[str, str]] | None = None) -> list[str]:
-    """构造 bwrap 命令行。
+    """构造 bwrap 命令行：`inner` 是**沙箱内**要跑的命令行。
 
     `workdir` 会以**读写**方式绑到 `/work` 并 chdir 过去——候选程序要能写自己的
-    产物目录，而快照只认这个目录里的东西。
+    产物目录，而快照只认这个目录里的东西。`inner` 里引用它请用 `/work/...`。
 
     `unshare_pid` 默认开：它同时提供「收口」（见模块 docstring）与「候选看不见宿主
     进程」。别为了省一个参数关掉它，那会把收口能力一起关掉。
@@ -107,7 +108,12 @@ def bwrap_argv(python: str, code: str, *, workdir: str, net_off: bool = True,
     # 父进程（我们的 runner）死掉时不要让沙箱活在世上。
     argv += ["--die-with-parent"]
     argv += ["--bind", workdir, "/work", "--chdir", "/work", "--tmpfs", "/tmp"]
-    return argv + [python, "-c", code]
+    return argv + inner
+
+
+def bwrap_python_argv(python: str, code: str, **kw: Any) -> list[str]:
+    """跑一段 `-c` 代码的便捷包装（探测与一次性任务用）。"""
+    return bwrap_argv([python, "-c", code], **kw)
 
 
 def scope_argv(argv: list[str], *, unit: str, mem_max_mb: int | None = None,

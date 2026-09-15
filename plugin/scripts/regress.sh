@@ -265,7 +265,7 @@ if (mem.get('MemoryMax only') or {}).get('killed'):
 # ---- 乙：变异检查。去掉 --unshare-net，探测必须改口 ----
 d = tempfile.mkdtemp(prefix='opl-sbxtest.')
 try:
-    rc_up = subprocess.run(sb.bwrap_argv(py, sb.NET_PROBE, workdir=d, net_off=False),
+    rc_up = subprocess.run(sb.bwrap_python_argv(py, sb.NET_PROBE, workdir=d, net_off=False),
                            capture_output=True, timeout=25).returncode
     if rc_up != 0:
         why.append('去掉 --unshare-net 后仍连不出去（rc=%r）：探测对隔离与否不敏感，'
@@ -283,6 +283,125 @@ if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
 fi
+
+# ---------------------------------------------------------------- 沙箱执行（opl-run）
+# 判据 1/2/3/4/5 在这里落地。核心不是「跑起来了」，而是**结局分得开**：
+# 超时/被 OOM 杀 与「payload 自己失败」在退出码上必须不同（3 vs 1），
+# 否则「没跑出来」会被读成「跑出来是错的」——那是本工具最不能犯的错。
+echo "opl-run —— 沙箱执行与四份快照"
+mkdir -p "$work/runwd"
+R="$work/runs"
+chk "死循环 -> 3（超时不是失败）" 3 $BIN/opl-run --runs-dir "$R" --id T1 --timeout 2 \
+    --workdir "$work/runwd" -- /usr/bin/python3 -c "while True: pass"
+chk "payload 自己失败 -> 1"       1 $BIN/opl-run --runs-dir "$R" --id T2 \
+    --workdir "$work/runwd" -- /usr/bin/python3 -c "import sys; sys.exit(7)"
+chk "脏 stdout -> 0（污染不越界）" 0 $BIN/opl-run --runs-dir "$R" --id T3 \
+    --workdir "$work/runwd" -- /usr/bin/python3 -c "
+import sys
+sys.stdout.write(chr(0) + 'junk' * 500)
+sys.stderr.write('err' * 500)
+print('still ok')"
+chk "禁网：沙箱内连不出去"        0 $BIN/opl-run --runs-dir "$R" --id T4 \
+    --workdir "$work/runwd" -- /usr/bin/python3 -c "
+import socket
+try:
+    socket.create_connection(('1.1.1.1', 443), timeout=3)
+    print('NET_UP')
+except OSError:
+    print('NET_DOWN')"
+if [ "$net_ok" = 1 ]; then
+  chk "沙箱内输出确为 NET_DOWN"     0 grep -q NET_DOWN "$R/T4/stdout.txt"
+else
+  skip=$((skip + 1))
+  printf '  skip  %-46s 本机出不去网，此断言无从判定\n' "沙箱内输出确为 NET_DOWN"
+fi
+chk "内存上限：被 OOM 杀掉 -> 3"   3 $BIN/opl-run --runs-dir "$R" --id T5 --mem-mb 64 \
+    --workdir "$work/runwd" -- /usr/bin/python3 -c "
+buf = bytearray(192 * 1024 * 1024)
+for i in range(0, len(buf), 4096):
+    buf[i] = 1
+print('WROTE')"
+# 这条**两种环境都有断言**：cgroup 可用时必须给出内核记账；不可用时快照必须
+# 明确写出「限额未生效」。没有「什么都不查也算过」的分支。
+chk "四份快照齐全、来源可追、归因如实" 0 python3 -c "
+import json, os, sys
+R = '$R'
+why = []
+
+def load(rid, name):
+    p = os.path.join(R, rid, name + '.json')
+    if not os.path.isfile(p):
+        why.append('%s 缺 %s.json' % (rid, name))
+        return None
+    try:
+        return json.load(open(p))
+    except ValueError as e:
+        why.append('%s/%s.json 不是合法 JSON：%s' % (rid, name, e))
+        return None
+
+# ---- 判据 1：四份快照齐全 ----
+for name in ('cmd', 'env', 'capabilities', 'metrics'):
+    load('T3', name)
+
+# ---- 判据 1：metrics 的每个字段能追到具体产物文件 ----
+m = load('T3', 'metrics') or {}
+src = m.get('sources') or {}
+arts = m.get('artifacts') or {}
+for k, v in list(src.items()) + list(arts.items()):
+    if isinstance(v, str) and v.startswith('/') and not os.path.exists(v):
+        why.append('metrics.%s 指向不存在的路径：%s' % (k, v))
+for need in ('stdout', 'stderr', 'workdir', 'runner_dir'):
+    if need not in arts:
+        why.append('metrics.artifacts 缺 %s' % need)
+
+# ---- 判据 5：脏输出没有污染任何一份快照，也没有改变判决 ----
+t3 = load('T3', 'metrics') or {}
+if t3.get('verdict') != 'ok' or t3.get('payload_exit_code') != 0:
+    why.append('脏 stdout 影响了判决：%r/%r'
+               % (t3.get('verdict'), t3.get('payload_exit_code')))
+
+# ---- 判据 2：超时的记录里不许出现 payload 自己的退出码 ----
+t1 = load('T1', 'metrics') or {}
+if t1.get('verdict') != 'timeout' or t1.get('payload_exit_code') is not None:
+    why.append('超时被记成 %r / exit=%r：把「我们杀的」记成了「它自己退的」'
+               % (t1.get('verdict'), t1.get('payload_exit_code')))
+
+# ---- 判据 3：内存归因 ----
+t5 = load('T5', 'metrics') or {}
+c5 = load('T5', 'cmd') or {}
+cg = (c5.get('cgroup') or {})
+if cg.get('available'):
+    if t5.get('verdict') != 'oom':
+        why.append('cgroup 可用但判决是 %r（应为 oom）' % (t5.get('verdict'),))
+    if not (t5.get('oom_kill') or 0) >= 1:
+        why.append('cgroup 可用却没有内核记账 oom_kill=%r' % (t5.get('oom_kill'),))
+    if t5.get('payload_exit_code') is not None:
+        why.append('被 OOM 杀却记了 payload_exit_code=%r（那是 bwrap 的转写）'
+                   % (t5.get('payload_exit_code'),))
+else:
+    # 拿不到 cgroup 时必须**明确写出限额没生效**，不许静默当成功
+    blob = json.dumps(c5, ensure_ascii=False)
+    if '未生效' not in blob:
+        why.append('cgroup 不可用，但快照没有写明「内存限额未生效」')
+
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# 缺后端时报 4 而不是偷偷裸跑。BWRAP 是模块常量，用注入的方式模拟缺失——
+# 这条只能在 lib 层验，CLI 没有让调用方指定 bwrap 路径的开关（也不该有）。
+chk "缺 bwrap -> 4（不降级到裸跑）" 0 python3 -c "
+import os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_sandbox as sb
+sb.BWRAP = '/nonexistent/bwrap'
+from opl_run import BACKEND_MISSING, RunSpec, execute
+wd = tempfile.mkdtemp(prefix='opl-nobwrap.')
+res = execute(RunSpec(argv=['/bin/true'], workdir=wd, runner_dir=wd, run_id='x'))
+ok = (res.kind == BACKEND_MISSING
+      and any('bwrap' in n for n in res.notes))
+if not ok:
+    print('  实为 %r notes=%r' % (res.kind, res.notes), file=sys.stderr)
+sys.exit(0 if ok else 1)"
 echo "encode —— 规格到模型，双后端互相证伪"
 chk "纯编码到 CNF（不需求解器）" 0 $BIN/opl-encode --spec $FIX/spec-pc43.json --to cnf --out "$work/e.cnf"
 chk "见证成立"                0 $BIN/opl-encode --spec $FIX/spec-pc23.json --eval-witness $FIX/spec-pc23-witness.json
