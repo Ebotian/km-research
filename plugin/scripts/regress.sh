@@ -1075,25 +1075,33 @@ import json, os, sys, tempfile
 sys.path.insert(0, '$plugin/lib')
 import opl_evolve as E
 SN = '$SNF'
-MET = {'sorts': True, 'comparators': 5, 'zero_one_inputs_checked': 16}
 ORIG = E._stage_and_evaluate
 why = []
 # 契约：1=按约定不可行（结论）；2=拒收候选；>=3=评估器自身故障（不采信指标）
-CASES = (('payload_failed', 1, 0), ('payload_failed', 2, 2),
-         ('payload_failed', 3, 3), ('payload_failed', 137, 3), ('timeout', None, 3))
-for kind, pexit, want in CASES:
+# **退出码与指标矛盾时不下判决**（F4，审阅稿第三轮）：1 说不可行而指标说可行，
+# 或 0 说跑完而指标说不可行 —— 两份原始信息矛盾，任选一个当成功依据都是自欺。
+CASES = (('payload_failed', 1, True, 3),    # 1 + 指标说可行 -> 矛盾 -> UNKNOWN
+         ('payload_failed', 1, False, 1),   # 1 + 指标说不可行 -> 一致的结论
+         ('payload_failed', 0, True, 0),    # 0 + 指标说可行 -> 通过（对照）
+         ('payload_failed', 0, False, 3),   # 0 + 指标说不可行 -> 矛盾
+         ('payload_failed', 2, True, 2),
+         ('payload_failed', 3, True, 3), ('payload_failed', 137, True, 3),
+         ('timeout', None, True, 3))
+for kind, pexit, feas, want in CASES:
     d = tempfile.mkdtemp()
     E._stage_and_evaluate = ORIG
     E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
                problem_src=SN + '/problem.json')
-    def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _k=kind, _p=pexit):
+    def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _k=kind, _p=pexit, _f=feas):
         rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
-        json.dump(MET, open(rd + '/work/metrics.json', 'w'))
-        return E.RunFacts(MET, rd, _k, {}, _p, rd)
+        met = {'sorts': _f, 'comparators': 5, 'zero_one_inputs_checked': 16}
+        json.dump(met, open(rd + '/work/metrics.json', 'w'))
+        return E.RunFacts(met, rd, _k, {}, _p, rd)
     E._stage_and_evaluate = fake
     out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
     if out.exit_code != want:
-        why.append('kind=%s exit=%s -> 退出码 %d（应为 %d）' % (kind, pexit, out.exit_code, want))
+        why.append('kind=%s exit=%s feasible=%s -> 退出码 %d（应为 %d）'
+                   % (kind, pexit, feas, out.exit_code, want))
 E._stage_and_evaluate = ORIG
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
@@ -1520,6 +1528,177 @@ for need, what in (('problem writable: False', '冻结定义在沙箱内可写')
         why.append(what)
 if r.kind != 'ok':
     why.append('探针运行结局 %r' % r.kind)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# ---- R3：第三轮审阅的五条（共同点是**检查绑在参数上，而不是绑在记录上**）----
+#   R3-1 只改范围不换证据   → 把已经验证过的结论扩大 10 万倍
+#   R3-2 最小 JSON 升档     → 缺 kind 就没有「按种类必填」的集合，等于随便写个文件
+#   R3-3 追加反例给无关文件盖章 → 验证的是 A，章盖在 B 上
+#   R3-4 退出码与指标矛盾   → 任选一个当成功依据
+#   R3-5 --force 重建后旧成绩继续参与排名 → 同名指标 != 同一件事
+#
+# 修法是一次成型的：**先把改动全部应用到副本上，再校验修改后的完整记录**，不自洽就
+# 整笔拒绝。逐个参数补条件的写法会一直漏——每加一个入口就多一个缺口。
+chk "R3-1 先登记「1..1000 内无反例」（带证书）" 0 \
+    $BIN/opl-conj set R-1 --formal-status no_counterexample_in_range \
+    --verified-range 1..1000 --evidence "$work/ev-cert.json"
+chk "R3-1 只改范围不换证据 -> 2 且整笔不写" 0 python3 -c "
+import json, subprocess, sys, os
+env = dict(os.environ)
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-1', '--verified-range', '1..1000000'],
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 2:
+    why.append('退出码 %d（应为 2）' % r.returncode)
+if '范围' not in (r.stderr + r.stdout):
+    why.append('理由没点出范围与证据不一致：%r' % r.stderr.strip()[-120:])
+d = json.load(open('$work/lab/conjectures/R-1.json'))
+if (d.get('verified_range') or {}).get('hi') != 1000:
+    why.append('被拒之后记录里的范围仍是 %r——拒收必须整笔不写'
+               % (d.get('verified_range'),))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "R3-2 无 kind 的最小 JSON 升档 -> 2 且档位不动" 0 python3 -c "
+import json, subprocess, sys, os
+env = dict(os.environ)
+json.dump({'schema': 'opl.evidence/1', 'verdict': 'proved'}, open('$work/ev-nokind.json', 'w'))
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-1', '--verification-level', 'lean_checked',
+                    '--evidence', '$work/ev-nokind.json'], capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 2:
+    why.append('退出码 %d（应为 2）' % r.returncode)
+if 'kind' not in (r.stderr + r.stdout):
+    why.append('理由没点出缺 kind：%r' % r.stderr.strip()[-120:])
+d = json.load(open('$work/lab/conjectures/R-1.json'))
+if d['verification_level'] != 'exact_certificate':
+    why.append('档位被改成了 %r（应为原来的 exact_certificate）' % d['verification_level'])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "R3-3 追加反例：无关见证降级、正主才盖章" 0 python3 -c "
+import json, subprocess, sys, os
+env = dict(os.environ)
+# 证据里记着它到底验证了哪份见证 —— 章只能盖在这一份上
+wit = json.load(open('$work/ev-wit.json'))['witness']
+why = []
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-1',
+                    '--add-counterexample', '/nonexistent/other.json',
+                    '--evidence', '$work/ev-wit.json'], capture_output=True, text=True, env=env)
+if r.returncode != 0:
+    why.append('无关见证应降级记录（不拒收），却得到退出码 %d：%s' % (r.returncode, r.stderr[-100:]))
+else:
+    cs = json.load(open('$work/lab/conjectures/R-1.json'))['counterexamples']
+    c = [x for x in cs if x['witness'] == '/nonexistent/other.json'][0]
+    if c['verified_by'] != 'UNVERIFIED':
+        why.append('无关文件拿到了 %r' % c['verified_by'])
+# 正向对照：换成证据里那个见证，就该有章。没有这一半，守卫可能只是「永远不发章」。
+r2 = subprocess.run(['$BIN/opl-conj', 'set', 'R-1', '--add-counterexample', wit,
+                     '--evidence', '$work/ev-wit.json'], capture_output=True, text=True, env=env)
+if r2.returncode != 0:
+    why.append('正对该见证却得到退出码 %d：%s' % (r2.returncode, r2.stderr[-120:]))
+else:
+    cs = json.load(open('$work/lab/conjectures/R-1.json'))['counterexamples']
+    c = [x for x in cs if x['witness'] == wit][0]
+    if c['verified_by'] != 'independent':
+        why.append('正对该见证却记成了 %r（对照失败，守卫过严）' % c['verified_by'])
+# 丙：见证名**不是路径**时也不能豁免比对。「不是路径所以没法比」这条豁免等于
+# 「换个写法的见证名就能把章挪走」——实测过：早期版本的守卫只比路径形态的见证。
+r3 = subprocess.run(['$BIN/opl-conj', 'set', 'R-1', '--add-counterexample', 'n=12345',
+                     '--evidence', '$work/ev-wit.json'], capture_output=True, text=True, env=env)
+if r3.returncode != 0:
+    why.append('非路径见证应降级记录，却得到退出码 %d：%s' % (r3.returncode, r3.stderr[-100:]))
+else:
+    cs = json.load(open('$work/lab/conjectures/R-1.json'))['counterexamples']
+    c = [x for x in cs if x['witness'] == 'n=12345'][0]
+    if c['verified_by'] != 'UNVERIFIED':
+        why.append('非路径见证 n=12345 拿到了 %r（证据验证的是 %r）'
+                   % (c['verified_by'], wit))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "R3-4 退出码与指标矛盾 -> 不下判决" 0 python3 -c "
+import os, sys
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+p = E.load_problem('$SNF/problem.json')
+why = []
+# 协议：0=跑完（可行性看指标），1=按约定不可行（结论）。两者矛盾时两份信息都得留着。
+CASES = ((1, True, 3), (0, False, 3), (0, True, 0), (1, False, 1))
+for pexit, feas, want in CASES:
+    j = E.judge_run(kind='payload_failed', payload_exit=pexit,
+                    metrics={'sorts': feas, 'comparators': 5, 'zero_one_inputs_checked': 16},
+                    problem=p)
+    if j.exit_code != want:
+        why.append('exit=%s sorts=%s -> %d（应为 %d）' % (pexit, feas, j.exit_code, want))
+    elif want == 3 and not j.reason:
+        why.append('exit=%s sorts=%s 判为 UNKNOWN 却没说理由' % (pexit, feas))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "R3-5 --force 归档旧库，best() 不混用不同实验" 0 python3 -c "
+import json, os, shutil, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+d = tempfile.mkdtemp(prefix='opl-force.')
+why = []
+try:
+    open(d + '/skel.py', 'w').write('# EVOLVE-BLOCK-START\ndef f(x):\n    return 1\n# EVOLVE-BLOCK-END\n')
+    # 指标跟着**题目参数**走：换了参数，旧成绩就不再是同一件事的成绩
+    open(d + '/ev.py', 'w').write('''
+import argparse, json, os, sys
+ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest='stage', required=True)
+e = sub.add_parser('extract'); e.add_argument('--problem'); e.add_argument('--candidate'); e.add_argument('--artifacts')
+v = sub.add_parser('verify'); v.add_argument('--problem'); v.add_argument('--artifacts'); v.add_argument('--metrics-out')
+a = ap.parse_args()
+if a.stage == 'extract':
+    os.makedirs(a.artifacts, exist_ok=True)
+    open(os.path.join(a.artifacts, 'a.json'), 'w').write('{}')
+    sys.exit(0)
+k = json.load(open(a.problem))['params']['k']
+m = {'schema': 'opl.evolve.metrics/1', 'ok': True, 'score': k}
+if a.metrics_out: json.dump(m, open(a.metrics_out, 'w'))
+sys.exit(0)
+''')
+    def problem(k):
+        json.dump({'schema': 'opl.evolve.problem/1', 'params': {'k': k},
+                   'metrics': {'feasible': {'field': 'ok', 'equals': True},
+                               'objective': {'field': 'score', 'minimize': True},
+                               'required': {'ok': 'bool', 'score': 'number'}}},
+                  open(d + '/problem.json', 'w'))
+    problem(1)
+    E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py', problem_src=d + '/problem.json')
+    db = d + '/lab/evolve/programs.sqlite'
+    old_fp = None
+    with E.ProgramLibrary(db) as lib:
+        for rec in lib.all_programs():
+            old_fp = lib.latest_fingerprints(rec['id'])
+    problem(999)                       # 换了题目参数（同一份代码，另一个问题）
+    res = E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py',
+                     problem_src=d + '/problem.json', force=True)
+    if not res.archived_db or not os.path.exists(res.archived_db):
+        why.append('--force 没有归档旧库（archived_db=%r）' % res.archived_db)
+    with E.ProgramLibrary(db) as lib:
+        if lib.count() != 1:
+            why.append('重建后库里还有 %d 条（应为 1 条新基线）' % lib.count())
+        b = lib.best('score', minimize=True)
+        if (b or {}).get('metrics', {}).get('score') != 999:
+            why.append('best() 取到的是 %r（应为新实验的 999）' % ((b or {}).get('metrics'),))
+        # 指纹过滤：把一条**旧实验指纹**的成绩塞回来，带当前指纹的查询必须跳过它
+        ar = lib.add(code='# EVOLVE-BLOCK-START\ndef f(x):\n    return 2\n# EVOLVE-BLOCK-END\n',
+                     skeleton=open(d + '/skel.py').read())
+        if ar.accepted:
+            lib.add_evaluation(int(ar.program_id or 0), kind='ok', run_dir=None,
+                               metrics={'ok': True, 'score': 0}, feasible=True,
+                               problem_sha256=old_fp[0], evaluator_sha256=old_fp[1])
+            b2 = lib.best('score', minimize=True, fingerprints=('x', 'y'))
+            if b2 is not None and b2.get('metrics', {}).get('score') == 0:
+                why.append('带当前指纹的 best() 仍然选中了旧实验的成绩')
+            if not getattr(lib, 'skipped_incomparable', 0):
+                why.append('跳过了不可比的成绩却没有计数，用户看不到这件事')
+finally:
+    shutil.rmtree(d, ignore_errors=True)
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
