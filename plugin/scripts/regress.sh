@@ -685,6 +685,130 @@ finally:
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+# ---- 判据 7/8/9：命令层的退出码矩阵 ----
+# `opl-evolve-*` 的结局有四种，退出码必须分开：0 新增且通过 / 1 新增但不通过 /
+# 2 候选不合格 / 5 重复没有新增。混起来调用方就没法处置。
+echo "opl-evolve 命令 —— 退出码矩阵与「改进」的可追性"
+EL="$work/elab"
+SNF="$FIX/sortnet"
+chk "init -> 0"                    0 $BIN/opl-evolve-init --lab "$EL" \
+    --skeleton "$SNF/skeleton.py" --evaluator "$SNF/evaluator.py"
+chk "init 重复 -> 2"               2 $BIN/opl-evolve-init --lab "$EL" \
+    --skeleton "$SNF/skeleton.py" --evaluator "$SNF/evaluator.py"
+chk "show 库非空 -> 0"             0 $BIN/opl-evolve-show --lab "$EL"
+chk "show 不存在的 id -> 5"        5 $BIN/opl-evolve-show --lab "$EL" --id 999
+chk "eval 最优候选 -> 0"           0 $BIN/opl-evolve-eval --lab "$EL" \
+    --candidate "$SNF/candidate-opt5.py" --generation 1 --operation mutate
+chk "同一份再来 -> 5（判据 8）"    5 $BIN/opl-evolve-eval --lab "$EL" \
+    --candidate "$SNF/candidate-opt5.py" --generation 1
+# 区外被改的候选：只把 `N = 4` 改成等长的 `N = 5`
+python3 -c "
+s = open('$SNF/candidate-opt5.py').read()
+open('$work/elab-oob.py', 'w').write(s.replace('N = 4', 'N = 5', 1))"
+chk "区外被改 -> 2（判据 9）"      2 $BIN/opl-evolve-eval --lab "$EL" \
+    --candidate "$work/elab-oob.py"
+# 少一个比较器：候选合法、入库，但评估不通过
+python3 -c "
+s = open('$SNF/candidate-opt5.py').read()
+open('$work/elab-bad.py', 'w').write(
+    s.replace('[(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)]', '[(0, 1), (2, 3), (0, 2), (1, 3)]'))"
+chk "不排序的候选 -> 1"            1 $BIN/opl-evolve-eval --lab "$EL" \
+    --candidate "$work/elab-bad.py" --generation 2
+# 判据 7 本体：改进必须**可追到 metrics_json 的具体字段**，且两个值都在库里。
+# 这里刻意先用一条「不过滤」的对照把坑亮出来：库里有一条不排序的 4 比较器候选，
+# `--best comparators` 不筛选时会选中它——数字最小不等于最好。改进的断言必须
+# 带可行性条件，否则「从 6 改进到 4」听起来像提升，其实是个坏程序。
+chk "不过滤会选中不可行者（如实）" 0 python3 -c "
+import json, os, subprocess, sys
+env = dict(os.environ)
+r = subprocess.run(['$BIN/opl-evolve-show', '--lab', '$EL', '--best', 'comparators'],
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 0:
+    why.append('退出码 %d' % r.returncode)
+else:
+    got = json.loads(r.stdout)
+    m = got.get('metrics') or {}
+    if m.get('comparators') != 4 or m.get('sorts') is not False:
+        why.append('期望选中那条 4 比较器且不排序的：%r' % m)
+    if '不可行' not in r.stderr:
+        why.append('选到不可行者却没有提示：%r' % r.stderr[-80:])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "改进可追：基线 6 -> 最好 5"   0 python3 -c "
+import json, os, subprocess, sqlite3, sys
+env = dict(os.environ)
+db = os.path.join('$EL', 'evolve', 'programs.sqlite')
+why = []
+con = sqlite3.connect(db)
+con.row_factory = sqlite3.Row
+rows = [dict(r) for r in con.execute('SELECT * FROM programs ORDER BY id')]
+con.close()
+if len(rows) != 3:
+    why.append('库容 %d（应为 3：基线 + 最优 + 不排序）' % len(rows))
+def metrics(rec):
+    return json.loads(rec['metrics_json']) if rec['metrics_json'] else None
+m = {r['id']: metrics(r) for r in rows}
+base = [v for v in m.values() if v and v.get('comparators') == 6]
+best = [v for v in m.values() if v and v.get('comparators') == 5]
+if not base:
+    why.append('库里没有 comparators=6 的基线（改进就没有可比对象）')
+if not best:
+    why.append('库里没有 comparators=5 的候选')
+# 每个数字都要能在库里逐条指认，而不是只出现在命令输出里
+for v in base + best:
+    if 'zero_one_inputs_checked' not in v:
+        why.append('指标缺 zero_one_inputs_checked：判决没有依据可查')
+    if v.get('sorts') is not True:
+        why.append('入库的候选 sorts=%r' % v.get('sorts'))
+# 带可行性条件的 best 必须选到 5，且它是被搜索出来的（不是基线）
+r = subprocess.run(['$BIN/opl-evolve-show', '--lab', '$EL', '--best', 'comparators',
+                    '--where', 'sorts=true'], capture_output=True, text=True, env=env)
+if r.returncode != 0:
+    why.append('show --best --where 退出码 %d' % r.returncode)
+else:
+    got = json.loads(r.stdout)
+    gm = got.get('metrics') or {}
+    if gm.get('comparators') != 5:
+        why.append('best(comparators,where sorts) = %r（应为 5）' % gm.get('comparators'))
+    if gm.get('sorts') is not True:
+        why.append('选出的最好那条 sorts=%r' % gm.get('sorts'))
+    if got.get('operation') != 'mutate':
+        why.append('最好的那条 op=%r（应为 mutate，即它是被搜索出来的）' % got.get('operation'))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# 两道前置检查（区外比对、code_hash 去重）在**结局**上都由第二层兜住——`add()` 里
+# 也会比对区外，唯一索引也会拦重复。所以它们省下的是**沙箱开销**，不是改变判决。
+# 那就要把「不花冤枉钱」变成可断言的，否则这两道前置检查等于没人测。
+chk "不合格/重复的候选不花沙箱的钱" 0 python3 -c "
+import os, subprocess, sys
+env = dict(os.environ)
+runs = os.path.join('$EL', 'evolve', 'runs')
+def snap():
+    return sorted(os.listdir(runs)) if os.path.isdir(runs) else []
+why = []
+before = snap()
+r1 = subprocess.run(['$BIN/opl-evolve-eval', '--lab', '$EL',
+                     '--candidate', '$work/elab-oob.py'],
+                    capture_output=True, text=True, env=env)
+if r1.returncode != 2:
+    why.append('区外被改的候选退出码 %d（应为 2）' % r1.returncode)
+mid = snap()
+if mid != before:
+    why.append('区外被改的候选仍然跑了沙箱：%r -> %r' % (before, mid))
+r2 = subprocess.run(['$BIN/opl-evolve-eval', '--lab', '$EL',
+                     '--candidate', '$SNF/candidate-opt5.py'],
+                    capture_output=True, text=True, env=env)
+if r2.returncode != 5:
+    why.append('重复候选退出码 %d（应为 5）' % r2.returncode)
+after = snap()
+if after != mid:
+    why.append('重复候选仍然跑了沙箱：%r -> %r' % (mid, after))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
 echo "encode —— 规格到模型，双后端互相证伪"
 chk "纯编码到 CNF（不需求解器）" 0 $BIN/opl-encode --spec $FIX/spec-pc43.json --to cnf --out "$work/e.cnf"
 chk "见证成立"                0 $BIN/opl-encode --spec $FIX/spec-pc23.json --eval-witness $FIX/spec-pc23-witness.json

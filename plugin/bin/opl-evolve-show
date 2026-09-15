@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""opl-evolve-show —— 看程序库。薄壳：逻辑在 lib/opl_evolve.py。
+
+用法：
+    opl-evolve-show --lab DIR [--id N | --best METRIC] [--limit N] [--json]
+
+`stdout` 只出 JSON（与其他命令的流约定一致）；人看的摘要走 `stderr`。
+
+退出码：
+    0  有结果
+    2  参数错或实验目录不存在
+    5  EMPTY：库是空的，或指定的 id 不在库里
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+
+from opl_common import PASS, USAGE, EMPTY, c  # noqa: E402
+from opl_evolve import (EvolveError, ProgramLibrary, lab_paths,  # noqa: E402
+                        parse_where)
+
+SUMMARY_KEYS = ("sorts", "comparators", "zero_one_inputs_checked")
+
+
+def brief(rec: dict) -> str:
+    m = rec.get("metrics") or {}
+    bits = " ".join(f"{k}={m[k]}" for k in SUMMARY_KEYS if k in m) or "无指标"
+    return (f"id={rec['id']:<4} 第{rec['generation']}代  {bits}  "
+            f"op={rec.get('operation') or '-'}  {rec['code_hash'][:12]}…")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--lab", required=True)
+    ap.add_argument("--id", type=int, default=None)
+    ap.add_argument("--best", default=None, help="按某个 metrics 字段取最好的一条")
+    ap.add_argument("--where", action="append", default=None, metavar="KEY=VALUE",
+                    help="只在此条件成立的行里取最好（可重复）。"
+                         "**不加它是危险的**：数字最小不等于最好，"
+                         "实测会选中一条不排序的 4 比较器网络")
+    ap.add_argument("--minimize", action="store_true", default=True)
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    p = lab_paths(args.lab)
+    if not os.path.isfile(p["db"]):
+        c(f"实验目录不存在：{p['db']}（先跑 opl-evolve-init）")
+        return USAGE
+
+    with ProgramLibrary(p["db"]) as lib:
+        if args.id is not None:
+            rec = lib.get(args.id)
+            if rec is None:
+                c(f"库里没有 id={args.id}")
+                return EMPTY
+            print(json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True))
+            c(brief(rec))
+            return PASS
+        if args.best:
+            try:
+                where = parse_where(args.where)
+            except EvolveError as exc:
+                c(str(exc))
+                return USAGE
+            rec = lib.best(args.best, minimize=args.minimize, where=where)
+            if rec is None:
+                c(f"没有任何程序带指标 {args.best!r}"
+                  + (f" 且满足 {where}" if where else "")
+                  + ("；注意不加 --where 时不可行的程序也会参与比较" if not where else ""))
+                return EMPTY
+            print(json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True))
+            c(f"best({args.best}) → " + brief(rec))
+            if not where:
+                c("提示：未加 --where，选出的可能是不可行的程序（数字最小不等于最好）")
+            return PASS
+        rows = lib.all_programs(limit=args.limit)
+        if not rows:
+            c("库是空的")
+            return EMPTY
+        out = {"schema": "opl.evolve.show/1", "count": len(rows),
+               "programs": [{k: r[k] for k in ("id", "parent_id", "generation",
+                                               "island", "cell_key", "code_hash",
+                                               "hash_mode", "operation", "created_at")}
+                            | {"metrics": r.get("metrics")} for r in rows]}
+        print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
+        for r in rows:
+            c(brief(r))
+        return PASS
+
+
+if __name__ == "__main__":
+    sys.exit(main())

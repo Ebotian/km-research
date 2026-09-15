@@ -45,6 +45,7 @@ import io
 import json
 import os
 import sqlite3
+import sys
 import time
 import tokenize
 from dataclasses import dataclass, field
@@ -174,6 +175,240 @@ def code_hash(code: str) -> tuple[str, str]:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest(), mode
 
 
+# ------------------------------------------------------------------ 实验目录
+
+EVOLVE_DIR = "evolve"
+
+# 沙箱里能用的 python 必须**另行指定**，不能直接用 `sys.executable`：本机的
+# `sys.executable` 在 `plugin/.venv/bin/` 下，而 bwrap 只绑了 `/usr` / `/etc` / `/lib64`
+# 与工作目录——那个路径在沙箱里根本不存在。用 `/usr/bin/python3` 是「沙箱内确实有」
+# 的那个，找不到时才退回 `sys.executable`（那就可能失败，失败会如实报出来）。
+SANDBOX_PYTHON = "/usr/bin/python3" if os.path.exists("/usr/bin/python3") else sys.executable
+
+
+@dataclass
+class InitResult:
+    lab_dir: str
+    db_path: str
+    skeleton: str
+    evaluator: str
+    seeded_id: int | None = None
+    already_existed: bool = False
+    metrics: dict[str, Any] | None = None
+    baseline_note: str | None = None
+    run_dir: str = ""
+
+
+@dataclass
+class EvalOutcome:
+    exit_code: int
+    kind: str = ""
+    program_id: int | None = None
+    code_hash: str = ""
+    metrics: dict[str, Any] | None = None
+    duplicate: bool = False
+    reason: str | None = None
+    run_dir: str = ""
+
+
+def coerce_scalar(v: str) -> Any:
+    """把命令行上的 `KEY=VALUE` 里的 VALUE 变成有类型的值。
+
+    不这么做的话 `--where sorts=true` 比不过 `True`（字符串 "true" ≠ 布尔 True），
+    而那种失败是静默的——过滤掉了一切，`best` 于是返回 None。
+    """
+    low = v.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("none", "null"):
+        return None
+    for cast in (int, float):
+        try:
+            return cast(v)
+        except ValueError:
+            continue
+    return v
+
+
+def parse_where(items: list[str] | None) -> dict[str, Any] | None:
+    """把 `["sorts=true", "comparators=5"]` 解析成 `{"sorts": True, "comparators": 5}`。"""
+    if not items:
+        return None
+    out: dict[str, Any] = {}
+    for it in items:
+        if "=" not in it:
+            raise EvolveError(f"--where 需要 KEY=VALUE 形式：{it!r}")
+        k, v = it.split("=", 1)
+        out[k.strip()] = coerce_scalar(v)
+    return out
+
+
+def lab_paths(lab: str) -> dict[str, str]:
+    d = os.path.join(os.path.abspath(lab), EVOLVE_DIR)
+    return {"dir": d,
+            "skeleton": os.path.join(d, "skeleton.py"),
+            "evaluator": os.path.join(d, "evaluator.py"),
+            "candidates": os.path.join(d, "candidates"),
+            "db": os.path.join(d, "programs.sqlite")}
+
+
+def _stage_and_evaluate(p: dict[str, str], code: str, h: str, *,
+                        timeout: float, mem_max_mb: int | None,
+                        ) -> tuple[dict[str, Any] | None, str, str]:
+    """把候选拷进沙箱工作目录、跑评估器、读回 metrics。
+
+    返回 (metrics 或 None, 运行目录, 沙箱结局)。**不**在拿不到 metrics 时编一个空的：
+    「没有结论」与「结论是空的」是两回事，调用方要能分开。
+    """
+    from opl_run import RunSpec, execute
+
+    # 运行目录**不覆盖**：同一个 hash 第二次跑（比如上次超时、这次给了更长的预算）
+    # 会拿到 `-2`、`-3` 这样的后缀。覆盖会静默销毁上一次的证据，而运行快照正是
+    # 这个工具要留存的东西。实测正是这一点让「重复候选没花沙箱的钱」变得可断言：
+    # 按 hash 命名时，一次真实的重复评估与「什么都没跑」在目录清单上看起来一样。
+    base_id = h[:16]
+    run_id, run_dir = base_id, os.path.join(p["dir"], "runs", base_id)
+    n = 1
+    while os.path.exists(run_dir):
+        n += 1
+        run_id = f"{base_id}-{n}"
+        run_dir = os.path.join(p["dir"], "runs", run_id)
+
+    os.makedirs(p["candidates"], exist_ok=True)
+    staged = os.path.join(p["candidates"], f"{base_id}.py")
+    with open(staged, "w", encoding="utf-8") as fh:
+        fh.write(code)
+    metrics_rel = f"candidates/{run_id}.metrics.json"
+    metrics_host = os.path.join(p["dir"], metrics_rel)
+
+    spec = RunSpec(
+        argv=[SANDBOX_PYTHON, "/work/evaluator.py", "--candidate",
+              f"/work/candidates/{base_id}.py", "--metrics-out", f"/work/{metrics_rel}"],
+        workdir=p["dir"], run_id=run_id, runner_dir=run_dir,
+        timeout=timeout, mem_max_mb=mem_max_mb)
+    res = execute(spec)
+    metrics: dict[str, Any] | None = None
+    if os.path.isfile(metrics_host):
+        try:
+            with open(metrics_host, encoding="utf-8") as fh:
+                metrics = json.load(fh)
+        except ValueError:
+            metrics = None
+    return metrics, run_dir, res.kind
+
+
+def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *,
+             force: bool = False, timeout: float = 60.0,
+             mem_max_mb: int | None = None) -> InitResult:
+    """建实验目录：把骨架与评估器**拷进来**，评估骨架，再把骨架作为第 0 代入库。
+
+    为什么拷贝而不是记录路径：区外比对的基准必须是**稳定的**。指着一个会被编辑的
+    外部文件，今天和明天比对的是两份不同的骨架，而「区外没变」这个判断就失去意义。
+
+    为什么 init 就评估骨架：不评估的话库里第 0 代**没有指标**，于是 `best(comparators)`
+    一开始空着，而「比骨架好」这件事就没有可比对象——更糟的是你**没法补评估**：
+    同一份代码再次提交会被 `code_hash` 判为重复（实测踩到）。所以基线必须在建库时
+    就带着指标进来。
+    """
+    import shutil
+
+    p = lab_paths(lab)
+    if os.path.exists(p["db"]) and not force:
+        raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
+    for src, what in ((skeleton_src, "骨架"), (evaluator_src, "评估器")):
+        if not os.path.isfile(src):
+            raise EvolveError(f"{what}文件不存在：{src}")
+    os.makedirs(p["candidates"], exist_ok=True)
+    shutil.copyfile(skeleton_src, p["skeleton"])
+    shutil.copyfile(evaluator_src, p["evaluator"])
+
+    code = open(p["skeleton"], encoding="utf-8").read()
+    h, _ = code_hash(code)
+    metrics, run_dir, kind = _stage_and_evaluate(p, code, h, timeout=timeout,
+                                                mem_max_mb=mem_max_mb)
+    note = None
+    if metrics is None:
+        # 沙箱起不来时仍要能建库（否则没法做别的事），但必须标明基线**没有指标**。
+        note = (f"骨架未取得指标（沙箱结局 {kind}）；第 0 代没有 metrics，"
+                f"best() 在补测之前对它视而不见")
+    with ProgramLibrary(p["db"]) as lib:
+        res = lib.add(code=code, skeleton=None, generation=0, operation="init",
+                      metrics=metrics)
+    return InitResult(lab_dir=p["dir"], db_path=p["db"], skeleton=p["skeleton"],
+                      evaluator=p["evaluator"], seeded_id=res.program_id,
+                      already_existed=force, metrics=metrics, baseline_note=note,
+                      run_dir=run_dir)
+
+
+def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
+                   parent_id: int | None = None, operation: str | None = None,
+                   timeout: float = 60.0, mem_max_mb: int | None = None) -> EvalOutcome:
+    """评估一份候选并入库。这是判据 8/9 在命令层的落点。
+
+    顺序是刻意的：**先做便宜且确定的检查，再花沙箱的钱**。
+    区外改动是候选不合格（该去修候选），重复是「已经知道」（该换个变异），
+    沙箱没给出判决是「还不知道」——三种结局的退出码各不相同，混起来就没法处置。
+    """
+    from opl_common import EMPTY, MISSING, PASS, REJECT, UNKNOWN, USAGE
+    from opl_run import PAYLOAD_FAILED, OK
+
+    p = lab_paths(lab)
+    if not os.path.isfile(p["db"]):
+        raise EvolveError(f"实验目录不存在：{p['db']}（先跑 opl-evolve-init）")
+    if not os.path.isfile(candidate):
+        raise EvolveError(f"候选文件不存在：{candidate}")
+    if not os.path.isfile(p["evaluator"]):
+        raise EvolveError(f"实验目录里缺评估器：{p['evaluator']}")
+
+    code = open(candidate, encoding="utf-8").read()
+    skeleton = open(p["skeleton"], encoding="utf-8").read()
+    # 1 便宜且确定的：区外不许变（判据 9）
+    assert_only_block_changed(skeleton, code)
+
+    # 2 去重：命中就不必花钱跑沙箱了（判据 8）。唯一索引仍是最终保证，见 add()。
+    h, _ = code_hash(code)
+    with ProgramLibrary(p["db"]) as lib:
+        dup = lib.by_hash(h)
+    if dup:
+        return EvalOutcome(exit_code=EMPTY, kind="duplicate", code_hash=h,
+                           program_id=dup["id"], duplicate=True,
+                           metrics=dup.get("metrics"),
+                           reason=f"duplicate: code_hash 命中 {h[:12]}…"
+                                  f"（已有 id={dup['id']}，第 {dup['generation']} 代）")
+
+    # 3 花沙箱的钱
+    metrics, run_dir, kind = _stage_and_evaluate(p, code, h, timeout=timeout,
+                                                mem_max_mb=mem_max_mb)
+    if kind == "backend_missing":
+        return EvalOutcome(exit_code=MISSING, kind=kind, code_hash=h,
+                           reason="找不到 bwrap：不降级到裸跑", run_dir=run_dir)
+    if metrics is None:
+        # 超时 / OOM / 被杀 / 沙箱起不来：**没有判决**，不要读成「候选不行」
+        return EvalOutcome(exit_code=UNKNOWN, kind=kind, code_hash=h,
+                           reason=f"沙箱结局 {kind}，评估器没写出 metrics", run_dir=run_dir)
+
+    with ProgramLibrary(p["db"]) as lib:
+        added = lib.add(code=code, skeleton=skeleton, parent_id=parent_id,
+                        generation=generation, operation=operation, metrics=metrics)
+    if not added.accepted:
+        # `add()` 是**第二道**关，它也会做区外检查（纵深防御）。所以这里不能一律
+        # 当成「重复」——把「候选不合格」记成「已经知道」会让调用方去换变异，
+        # 而它其实该去修候选。按 add() 给的理由分类，而不是按我们的猜测。
+        reason = added.rejected_reason or ""
+        if reason.startswith("duplicate"):
+            return EvalOutcome(exit_code=EMPTY, kind="duplicate", code_hash=h,
+                               duplicate=True, metrics=metrics,
+                               reason=reason, run_dir=run_dir)
+        return EvalOutcome(exit_code=USAGE, kind="candidate_invalid", code_hash=h,
+                           metrics=metrics, reason=reason, run_dir=run_dir)
+    sorts = bool(metrics.get("sorts"))
+    return EvalOutcome(exit_code=PASS if sorts else REJECT,
+                       kind="evaluated" if sorts else "not_sorting",
+                       program_id=added.program_id, code_hash=h, metrics=metrics,
+                       run_dir=run_dir)
+
+
+
 # ------------------------------------------------------------------ 程序库
 
 
@@ -270,17 +505,26 @@ class ProgramLibrary:
             args.append(limit)
         return [self._decode(dict(r)) for r in self.conn.execute(q, args)]
 
-    def best(self, metric: str, *, minimize: bool = True,
-             island: str | None = None) -> dict[str, Any] | None:
+    def best(self, metric: str, *, minimize: bool = True, island: str | None = None,
+             where: dict[str, Any] | None = None) -> dict[str, Any] | None:
         """按 `metrics_json` 里的某个字段取最好的一条。
 
-        **没有可比指标的行被跳过，而不是当成 0。** 把「没测出这个指标」当成最小值，
-        正好会在「改进」这件事上造出假结论——那是最不能出现的一类错。
+        **两条如实记录的坑，都是实测踩出来的：**
+
+        * **没有可比指标的行被跳过，而不是当成 0。** 把「没测出这个指标」当成最小值，
+          正好会在「改进」这件事上造出假结论。
+        * **不过滤的话，数字最小不等于最好。** 实测：库里有一条 4 个比较器的候选，
+          它**并不排序**（`sorts=False`）。`best("comparators", minimize=True)` 会选中它
+          ——于是「从 6 个改进到 4 个」听起来像一次提升，实际上是一个坏程序。所以
+          可行性必须由调用方以 `where` 显式给出（比如 `{"sorts": True}`）；这个原语
+          刻意不替调用方猜哪个字段意味着「可行」。
         """
         cands: list[tuple[float, dict[str, Any]]] = []
         for rec in self.all_programs(island=island):
             m = rec.get("metrics") or {}
             if metric not in m or not isinstance(m[metric], (int, float)):
+                continue
+            if where and any(m.get(k) != v for k, v in where.items()):
                 continue
             cands.append((float(m[metric]), rec))
         if not cands:
