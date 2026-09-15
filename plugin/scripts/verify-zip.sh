@@ -69,7 +69,8 @@ chk "证明侧夹具在位"  0 test -f "$root/tests/fixtures/lean-real.lean"
 # 排序网络是运行时夹具（opl-evolve 的玩具问题），漏了它判据 7 在包里就无从跑起。
 chk "排序网络夹具在位" 0 test -f "$root/tests/fixtures/sortnet/evaluator.py" -a \
     -f "$root/tests/fixtures/sortnet/skeleton.py" -a \
-    -f "$root/tests/fixtures/sortnet/candidate-opt5.py"
+    -f "$root/tests/fixtures/sortnet/candidate-opt5.py" -a \
+    -f "$root/tests/fixtures/sortnet/problem.json"
 chk "第三方许可声明在位" 0 test -f "$root/THIRD-PARTY-NOTICES.md"
 chk "声明含 drat-trim 条款" 0 grep -qF "Permission is hereby granted, free of charge" "$root/THIRD-PARTY-NOTICES.md"
 chk "声明含 cake_lpr 条款" 0 grep -qF "CakeML is free software" "$root/THIRD-PARTY-NOTICES.md"

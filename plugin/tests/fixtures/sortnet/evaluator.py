@@ -2,9 +2,13 @@
 """0-1 原理评估器：判定一个比较器网络是否真的排序，并数比较器个数。
 
 用法：
-    evaluator.py --candidate CAND.py [--metrics-out P.json] [--n 4]
+    evaluator.py --candidate CAND.py --problem P.json [--metrics-out P.json]
 
 候选契约：文件里要有 `N`（整数）与 `build_network()`，后者返回 `(i, j)` 序列。
+**`N` 必须等于冻结定义里的 `params.n`**——题目参数由 `--problem` 给出，不由候选说了算。
+理由（实测）：把 `N = 0` 放进可进化区重新绑定，就能让评估器看到一个零路问题并报
+`sorts=true, comparators=0`，而区外文本一字未改。**区外不变不代表题目不变。**
+
 评估器 `exec` 候选文件、调用 `build_network`，然后：
 
 * **0-1 原理**：网络能排序所有输入 ⟺ 它能排序所有 `2^n` 个 0-1 序列。
@@ -25,6 +29,15 @@ import itertools
 import json
 import os
 import sys
+
+
+def load_problem(path: str) -> dict:
+    """读冻结的实验定义。缺 `params.n` 就报错——**不取默认值**，默认值会让定义悄悄变松。"""
+    with open(path, encoding="utf-8") as fh:
+        prob = json.load(fh)
+    if not isinstance(prob, dict) or "n" not in (prob.get("params") or {}):
+        raise ValueError(f"实验定义缺 params.n：{path}")
+    return prob
 
 
 def load_candidate(path: str) -> tuple[int, object]:
@@ -85,16 +98,26 @@ def evaluate(net: list[tuple[int, int]], n: int) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--candidate", required=True)
+    ap.add_argument("--problem", required=True,
+                    help="冻结的实验定义（只读挂入）；题目参数以它为准")
     ap.add_argument("--metrics-out")
-    ap.add_argument("--n", type=int, default=None, help="覆盖候选里的 N")
+    ap.add_argument("--n", type=int, default=None,
+                    help="覆盖冻结定义里的 n（诊断用；正式评估不要传）")
     args = ap.parse_args()
 
     if not os.path.isfile(args.candidate):
         print(f"候选不存在：{args.candidate}", file=sys.stderr)
         return 2
     try:
+        problem = load_problem(args.problem)
+        n_frozen = int(problem.get("params", {}).get("n"))
         n_declared, builder = load_candidate(args.candidate)
-        n = args.n or n_declared
+        n = args.n or n_frozen
+        if args.n is None and n_declared != n_frozen:
+            # 候选改了题目参数 → 直接拒，**不要**用冻结值替它算一遍再报「通过」
+            print(f"候选声明的 N={n_declared} 与冻结定义的 n={n_frozen} 不一致："
+                  f"题目参数不许由候选改动", file=sys.stderr)
+            return 2
         net = validate(builder(), n)
     except (ValueError, SyntaxError, TypeError, OSError) as exc:
         # 候选**本身有问题**与「候选排序失败」是两件事，退出码必须分开。
@@ -106,6 +129,7 @@ def main() -> int:
         "schema": "opl.evolve.metrics/1",
         "candidate": os.path.abspath(args.candidate),
         "n": n,
+        "n_frozen": n_frozen,
         "n_declared": n_declared,
         **res,
     }

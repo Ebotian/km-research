@@ -97,6 +97,107 @@ class AddResult:
     notes: list[str] = field(default_factory=list)
 
 
+# ------------------------------------------------------------------ 冻结的实验定义
+
+PROBLEM_SCHEMA = "opl.evolve.problem/1"
+# 指标字段的类型白名单。**`bool` 是独立的类型，不是「真值」**：字符串 "false"
+# 在 Python 里是真值，实测它曾被判成通过。所以这里按 `isinstance` 判，而不是按真假。
+METRIC_TYPES = ("bool", "int", "number", "string")
+
+
+@dataclass
+class Problem:
+    """冻结的实验定义：题目参数 + 指标契约。
+
+    为什么需要它（审阅稿 F2/F4 都指到这里）：**可进化区之外文本不变，不代表题目不变**。
+    实测把 `N = 0` 放进区内重新绑定，就能让评估器看到一个零路问题并报 `sorts=True`、
+    `comparators=0`。区外逐字节比对抓不到这个——它比的是文本，而题目是**运行时行为**。
+
+    另外，插件的判决原先硬编码 `sorts`，一个返回 `{"feasible": true, "loss": …}` 的
+    通用评估器其候选会被判 `NOT_SORTING`。可行性现在由本定义给出，插件不认识 `sorts`。
+    """
+
+    path: str
+    params: dict[str, Any]
+    feasible_field: str
+    feasible_equals: Any
+    objective_field: str | None
+    objective_minimize: bool
+    required: dict[str, str]
+    title: str = ""
+
+    def check_metrics(self, metrics: Any) -> list[str]:
+        """校验指标的形状与类型。返回违规列表，空列表表示合格。
+
+        **类型不对就报违规，不猜**：`sorts: "false"` 既不是真也不是假——它是错的。
+        按真假猜会把一个坏记录变成一条判决。
+        """
+        why: list[str] = []
+        if not isinstance(metrics, dict):
+            return [f"metrics 应为对象，实为 {type(metrics).__name__}"]
+        if not metrics:
+            return ["metrics 是空的"]
+        for field, want in self.required.items():
+            if field not in metrics:
+                why.append(f"metrics 缺字段 {field!r}（定义要求 {want}）")
+                continue
+            v = metrics[field]
+            ok = {"bool": isinstance(v, bool),
+                  "int": isinstance(v, int) and not isinstance(v, bool),
+                  "number": isinstance(v, (int, float)) and not isinstance(v, bool),
+                  "string": isinstance(v, str)}.get(want, False)
+            if not ok:
+                why.append(f"metrics[{field!r}] 应为 {want}，实为 "
+                           f"{type(v).__name__}（值 {v!r}）——类型不对不是「假」")
+        if self.feasible_field not in metrics:
+            why.append(f"缺可行性字段 {self.feasible_field!r}")
+        elif metrics[self.feasible_field] != self.feasible_equals:
+            # 类型合法但值不等于要求：这是**不可行**，不是记录错误，交给调用方区分
+            pass
+        return why
+
+    def feasible(self, metrics: dict[str, Any]) -> bool:
+        return metrics.get(self.feasible_field) == self.feasible_equals
+
+
+def load_problem(path: str) -> Problem:
+    """读并校验冻结定义。字段缺失就报出来，不取默认值——默认值会让定义悄悄变松。"""
+    if not os.path.isfile(path):
+        raise EvolveError(f"实验定义不存在：{path}（先跑 opl-evolve-init --problem）")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise EvolveError(f"实验定义不是合法 JSON：{path}:{exc.lineno}: {exc.msg}") from exc
+    if not isinstance(raw, dict) or raw.get("schema") != PROBLEM_SCHEMA:
+        raise EvolveError(f"实验定义的 schema 应为 {PROBLEM_SCHEMA!r}：{path}")
+    m = raw.get("metrics")
+    if not isinstance(m, dict):
+        raise EvolveError("实验定义缺 metrics 段")
+    feas = m.get("feasible")
+    if not isinstance(feas, dict) or "field" not in feas or "equals" not in feas:
+        raise EvolveError("实验定义缺 metrics.feasible.{field,equals}——"
+                          "「什么算可行」必须由定义给出，不能由插件猜")
+    obj = m.get("objective") or {}
+    req = m.get("required") or {}
+    if not isinstance(req, dict) or not req:
+        raise EvolveError("实验定义缺 metrics.required——没有它就无法判断指标类型对不对")
+    for f, t in req.items():
+        if t not in METRIC_TYPES:
+            raise EvolveError(f"metrics.required[{f!r}] 的类型 {t!r} 不在 "
+                              f"{list(METRIC_TYPES)} 里")
+    params = raw.get("params") or {}
+    if not isinstance(params, dict):
+        raise EvolveError("实验定义的 params 应为对象")
+    return Problem(path=os.path.abspath(path), params=params,
+                   feasible_field=str(feas["field"]),
+                   feasible_equals=feas["equals"],
+                   objective_field=obj.get("field"),
+                   objective_minimize=bool(obj.get("minimize", True)),
+                   required={str(k): str(v) for k, v in req.items()},
+                   title=str(raw.get("title") or ""))
+
+
 # ------------------------------------------------------------------ 可进化区
 
 
@@ -192,6 +293,7 @@ class InitResult:
     db_path: str
     skeleton: str
     evaluator: str
+    problem: str = ""
     seeded_id: int | None = None
     already_existed: bool = False
     metrics: dict[str, Any] | None = None
@@ -209,6 +311,8 @@ class EvalOutcome:
     duplicate: bool = False
     reason: str | None = None
     run_dir: str = ""
+    # 该打哪几个字段给用户看：来自**实验定义**，不由壳硬编码指标名（判据 F4）。
+    summary_fields: list[str] = field(default_factory=list)
 
 
 def coerce_scalar(v: str) -> Any:
@@ -248,45 +352,52 @@ def lab_paths(lab: str) -> dict[str, str]:
     return {"dir": d,
             "skeleton": os.path.join(d, "skeleton.py"),
             "evaluator": os.path.join(d, "evaluator.py"),
+            "problem": os.path.join(d, "problem.json"),
             "candidates": os.path.join(d, "candidates"),
             "db": os.path.join(d, "programs.sqlite")}
 
 
-def _stage_and_evaluate(p: dict[str, str], code: str, h: str, *,
+def _stage_and_evaluate(p: dict[str, str], code: str, h: str, *, problem_path: str,
                         timeout: float, mem_max_mb: int | None,
-                        ) -> tuple[dict[str, Any] | None, str, str]:
-    """把候选拷进沙箱工作目录、跑评估器、读回 metrics。
+                        ) -> tuple[dict[str, Any] | None, str, str, dict[str, str]]:
+    """把候选与冻结定义**只读**挂进沙箱、跑评估器、读回指标。
 
-    返回 (metrics 或 None, 运行目录, 沙箱结局)。**不**在拿不到 metrics 时编一个空的：
-    「没有结论」与「结论是空的」是两回事，调用方要能分开。
+    == 沙箱里挂什么，是个安全问题，不是整理问题 ==
+
+    原先把整个实验目录以读写方式挂到 `/work`（`skeleton.py`、`programs.sqlite`、
+    `runs/` 全在里面），实测候选可以改写它们——包括改写基线骨架与历史证据。现在：
+
+        /work               ← 本次运行自己的目录，**唯一可写**的地方
+        /opt/evaluator.py   ← 从实验目录只读挂入
+        /opt/problem.json   ← 冻结定义，只读挂入
+
+    实验目录本身、数据库、历史运行目录**都不在沙箱的视野里**。候选要能跑就得能写
+    `/work`，但它伸不到别处。冻结定义只读这一点尤其要紧——**一个能改定义的候选等于
+    自己出题自己判**。
+
+    返回 (metrics 或 None, 运行目录, 沙箱结局, 快照路径)。**不**在拿不到 metrics 时
+    编一个空的：「没有结论」与「结论是空的」是两回事。
     """
-    from opl_run import RunSpec, execute
+    from opl_run import RunSpec, execute, write_snapshots
 
-    # 运行目录**不覆盖**：同一个 hash 第二次跑（比如上次超时、这次给了更长的预算）
-    # 会拿到 `-2`、`-3` 这样的后缀。覆盖会静默销毁上一次的证据，而运行快照正是
-    # 这个工具要留存的东西。实测正是这一点让「重复候选没花沙箱的钱」变得可断言：
-    # 按 hash 命名时，一次真实的重复评估与「什么都没跑」在目录清单上看起来一样。
-    base_id = h[:16]
-    run_id, run_dir = base_id, os.path.join(p["dir"], "runs", base_id)
-    n = 1
-    while os.path.exists(run_dir):
-        n += 1
-        run_id = f"{base_id}-{n}"
-        run_dir = os.path.join(p["dir"], "runs", run_id)
-
-    os.makedirs(p["candidates"], exist_ok=True)
-    staged = os.path.join(p["candidates"], f"{base_id}.py")
-    with open(staged, "w", encoding="utf-8") as fh:
+    run_dir = _next_run_dir(p, h)
+    work = os.path.join(run_dir, "work")
+    os.makedirs(work, exist_ok=True)
+    with open(os.path.join(work, "candidate.py"), "w", encoding="utf-8") as fh:
         fh.write(code)
-    metrics_rel = f"candidates/{run_id}.metrics.json"
-    metrics_host = os.path.join(p["dir"], metrics_rel)
+    metrics_host = os.path.join(work, "metrics.json")
 
     spec = RunSpec(
-        argv=[SANDBOX_PYTHON, "/work/evaluator.py", "--candidate",
-              f"/work/candidates/{base_id}.py", "--metrics-out", f"/work/{metrics_rel}"],
-        workdir=p["dir"], run_id=run_id, runner_dir=run_dir,
-        timeout=timeout, mem_max_mb=mem_max_mb)
+        argv=[SANDBOX_PYTHON, "/opt/evaluator.py", "--problem", "/opt/problem.json",
+              "--candidate", "/work/candidate.py", "--metrics-out", "/work/metrics.json"],
+        workdir=work, run_id=os.path.basename(run_dir), runner_dir=run_dir,
+        timeout=timeout, mem_max_mb=mem_max_mb,
+        ro_binds=[(os.path.join(p["dir"], "evaluator.py"), "/opt/evaluator.py"),
+                  (problem_path, "/opt/problem.json")])
     res = execute(spec)
+    # 每次运行都落四份快照：**指标与它的来源必须一起留存**，否则事后无法回答
+    # 「这个数字是怎么来的」。原先进化路径只调 execute()，运行目录里只有两个流文件。
+    files = write_snapshots(spec, res)
     metrics: dict[str, Any] | None = None
     if os.path.isfile(metrics_host):
         try:
@@ -294,63 +405,98 @@ def _stage_and_evaluate(p: dict[str, str], code: str, h: str, *,
                 metrics = json.load(fh)
         except ValueError:
             metrics = None
-    return metrics, run_dir, res.kind
+    return metrics, run_dir, res.kind, files
 
 
-def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *,
+def _tail(path: str, limit: int = 200) -> str:
+    """读一个文件的末尾若干行，压成一行——用来把评估器的拒绝理由带进错误信息。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+    except OSError:
+        return ""
+    return " / ".join(lines[-2:])[:limit]
+
+
+def _next_run_dir(p: dict[str, str], h: str) -> str:
+    """每次运行一个**新目录**：同一份程序可以跑很多次（补测、换预算、换机器），
+    覆盖会静默销毁上一次的证据。"""
+    base = os.path.join(p["dir"], "runs", h[:16])
+    run_dir, n = base, 1
+    while os.path.exists(run_dir):
+        n += 1
+        run_dir = f"{base}-{n}"
+    return run_dir
+
+
+def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: str,
              force: bool = False, timeout: float = 60.0,
              mem_max_mb: int | None = None) -> InitResult:
-    """建实验目录：把骨架与评估器**拷进来**，评估骨架，再把骨架作为第 0 代入库。
+    """建实验目录：把骨架、评估器、**冻结的实验定义**拷进来，评估骨架，入库。
 
-    为什么拷贝而不是记录路径：区外比对的基准必须是**稳定的**。指着一个会被编辑的
-    外部文件，今天和明天比对的是两份不同的骨架，而「区外没变」这个判断就失去意义。
+    为什么拷贝而不是记录路径：区外比对的基准、以及「什么算可行」的定义，都必须**稳定**。
+    指着会被编辑的外部文件，今天和明天比对的就不是同一个东西。
 
-    为什么 init 就评估骨架：不评估的话库里第 0 代**没有指标**，于是 `best(comparators)`
-    一开始空着，而「比骨架好」这件事就没有可比对象——更糟的是你**没法补评估**：
-    同一份代码再次提交会被 `code_hash` 判为重复（实测踩到）。所以基线必须在建库时
-    就带着指标进来。
+    为什么 init 就评估骨架：不评估的话第 0 代没有指标，「比骨架好」就没有可比对象——
+    而且**你没法补测**（同一份代码再提交会被 `code_hash` 判重复）。所以基线必须在建库
+    时就带着指标进来。沙箱起不来时仍能建库，但会明确标注「基线无指标」。
     """
     import shutil
 
     p = lab_paths(lab)
     if os.path.exists(p["db"]) and not force:
         raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
-    for src, what in ((skeleton_src, "骨架"), (evaluator_src, "评估器")):
+    for src, what in ((skeleton_src, "骨架"), (evaluator_src, "评估器"),
+                      (problem_src, "实验定义")):
         if not os.path.isfile(src):
             raise EvolveError(f"{what}文件不存在：{src}")
+    problem = load_problem(problem_src)  # 先校验，别把一个坏定义拷进去
     os.makedirs(p["candidates"], exist_ok=True)
     shutil.copyfile(skeleton_src, p["skeleton"])
     shutil.copyfile(evaluator_src, p["evaluator"])
+    shutil.copyfile(problem_src, p["problem"])
 
     code = open(p["skeleton"], encoding="utf-8").read()
     h, _ = code_hash(code)
-    metrics, run_dir, kind = _stage_and_evaluate(p, code, h, timeout=timeout,
-                                                mem_max_mb=mem_max_mb)
+    metrics, run_dir, kind, _files = _stage_and_evaluate(
+        p, code, h, problem_path=p["problem"], timeout=timeout, mem_max_mb=mem_max_mb)
+
     note = None
     if metrics is None:
-        # 沙箱起不来时仍要能建库（否则没法做别的事），但必须标明基线**没有指标**。
         note = (f"骨架未取得指标（沙箱结局 {kind}）；第 0 代没有 metrics，"
-                f"best() 在补测之前对它视而不见")
+                f"在补测之前 best() 对它视而不见")
+    else:
+        bad = problem.check_metrics(metrics)
+        if bad:
+            # 指标的**形状**不对：宁可留空也不入库一个坏记录
+            note = ("骨架的 metrics 不符合实验定义，未入库：" + "；".join(bad))
+            metrics = None
     with ProgramLibrary(p["db"]) as lib:
         res = lib.add(code=code, skeleton=None, generation=0, operation="init",
                       metrics=metrics)
     return InitResult(lab_dir=p["dir"], db_path=p["db"], skeleton=p["skeleton"],
-                      evaluator=p["evaluator"], seeded_id=res.program_id,
-                      already_existed=force, metrics=metrics, baseline_note=note,
-                      run_dir=run_dir)
+                      evaluator=p["evaluator"], problem=p["problem"],
+                      seeded_id=res.program_id, already_existed=force,
+                      metrics=metrics, baseline_note=note, run_dir=run_dir)
 
 
 def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
                    parent_id: int | None = None, operation: str | None = None,
                    timeout: float = 60.0, mem_max_mb: int | None = None) -> EvalOutcome:
-    """评估一份候选并入库。这是判据 8/9 在命令层的落点。
+    """评估一份候选并入库。这是判据 8/9 与两条判据（F3/F4）在命令层的落点。
 
-    顺序是刻意的：**先做便宜且确定的检查，再花沙箱的钱**。
-    区外改动是候选不合格（该去修候选），重复是「已经知道」（该换个变异），
-    沙箱没给出判决是「还不知道」——三种结局的退出码各不相同，混起来就没法处置。
+    判决的顺序是**先问「这次跑完了吗」，再问「它说行不行」**：
+
+        1 沙箱结局不是 ok/payload_failed  → 3（**即使产物存在也不采信**）
+        2 没有 metrics 产物                → 3
+        3 metrics 不符合实验定义（含类型） → 2（记录坏了，不是「不可行」）
+        4 可行性由**冻结定义**给出         → 0 / 1
+
+    第 1 步是这个顺序里最要紧的：实测「评估器先写了 metrics 再卡死」会被判成通过。
+    产物存在只说明写过文件，**不说明这次运行正常结束**。
     """
     from opl_common import EMPTY, MISSING, PASS, REJECT, UNKNOWN, USAGE
-    from opl_run import PAYLOAD_FAILED, OK
+    from opl_run import OK, PAYLOAD_FAILED
 
     p = lab_paths(lab)
     if not os.path.isfile(p["db"]):
@@ -359,6 +505,11 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
         raise EvolveError(f"候选文件不存在：{candidate}")
     if not os.path.isfile(p["evaluator"]):
         raise EvolveError(f"实验目录里缺评估器：{p['evaluator']}")
+    problem = load_problem(p["problem"])
+    summary = [problem.feasible_field] + (
+        [problem.objective_field] if problem.objective_field else []) + \
+        [f for f in problem.required if f not in (problem.feasible_field,
+                                                  problem.objective_field)]
 
     code = open(candidate, encoding="utf-8").read()
     skeleton = open(p["skeleton"], encoding="utf-8").read()
@@ -376,24 +527,41 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
                            reason=f"duplicate: code_hash 命中 {h[:12]}…"
                                   f"（已有 id={dup['id']}，第 {dup['generation']} 代）")
 
-    # 3 花沙箱的钱
-    metrics, run_dir, kind = _stage_and_evaluate(p, code, h, timeout=timeout,
-                                                mem_max_mb=mem_max_mb)
+    metrics, run_dir, kind, _files = _stage_and_evaluate(
+        p, code, h, problem_path=p["problem"], timeout=timeout, mem_max_mb=mem_max_mb)
+
+    # ---- F3：运行没正常结束就是「没有判决」，产物存在也不改这一条 ----
     if kind == "backend_missing":
         return EvalOutcome(exit_code=MISSING, kind=kind, code_hash=h,
                            reason="找不到 bwrap：不降级到裸跑", run_dir=run_dir)
-    if metrics is None:
-        # 超时 / OOM / 被杀 / 沙箱起不来：**没有判决**，不要读成「候选不行」
+    if kind not in (OK, PAYLOAD_FAILED):
+        extra = "（评估器写出了 metrics，但这次运行没有正常结束——不采信）" \
+            if metrics is not None else ""
         return EvalOutcome(exit_code=UNKNOWN, kind=kind, code_hash=h,
-                           reason=f"沙箱结局 {kind}，评估器没写出 metrics", run_dir=run_dir)
+                           reason=f"沙箱结局 {kind}{extra}", run_dir=run_dir,
+                           summary_fields=summary)
+    if metrics is None:
+        # 「评估器没写出指标」本身不是结论，但它往往**有**理由——比如评估器按冻结定义
+        # 拒了候选（实测：区内把 N 改成 0，评估器报「与冻结定义不一致」）。把那段
+        # stderr 带出来；否则用户只看到「没有指标」，得自己去翻运行目录才知道为什么。
+        tail = _tail(os.path.join(run_dir, "stderr.txt"))
+        return EvalOutcome(exit_code=UNKNOWN, kind="no_metrics", code_hash=h,
+                           reason=(f"评估器没写出指标（{run_dir}/work/metrics.json）"
+                                   + (f"；它的 stderr 末尾：{tail}" if tail else "")),
+                           run_dir=run_dir, summary_fields=summary)
+
+    # ---- F4：指标的合法性由**冻结定义**判定，插件不认识具体字段名 ----
+    bad = problem.check_metrics(metrics)
+    if bad:
+        return EvalOutcome(exit_code=USAGE, kind="metrics_invalid", code_hash=h,
+                           metrics=metrics, run_dir=run_dir,
+                           reason="评估器产出的 metrics 不符合实验定义：" + "；".join(bad),
+                           summary_fields=summary)
 
     with ProgramLibrary(p["db"]) as lib:
         added = lib.add(code=code, skeleton=skeleton, parent_id=parent_id,
                         generation=generation, operation=operation, metrics=metrics)
     if not added.accepted:
-        # `add()` 是**第二道**关，它也会做区外检查（纵深防御）。所以这里不能一律
-        # 当成「重复」——把「候选不合格」记成「已经知道」会让调用方去换变异，
-        # 而它其实该去修候选。按 add() 给的理由分类，而不是按我们的猜测。
         reason = added.rejected_reason or ""
         if reason.startswith("duplicate"):
             return EvalOutcome(exit_code=EMPTY, kind="duplicate", code_hash=h,
@@ -401,12 +569,12 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
                                reason=reason, run_dir=run_dir)
         return EvalOutcome(exit_code=USAGE, kind="candidate_invalid", code_hash=h,
                            metrics=metrics, reason=reason, run_dir=run_dir)
-    sorts = bool(metrics.get("sorts"))
-    return EvalOutcome(exit_code=PASS if sorts else REJECT,
-                       kind="evaluated" if sorts else "not_sorting",
-                       program_id=added.program_id, code_hash=h, metrics=metrics,
-                       run_dir=run_dir)
 
+    ok = problem.feasible(metrics)
+    return EvalOutcome(exit_code=PASS if ok else REJECT,
+                       kind="feasible" if ok else "infeasible",
+                       program_id=added.program_id, code_hash=h, metrics=metrics,
+                       run_dir=run_dir, summary_fields=summary)
 
 
 # ------------------------------------------------------------------ 出题

@@ -220,18 +220,34 @@ plugin/bin/opl-conj set C-0003 --formal-status proved \
 
 ```bash
 SN=plugin/tests/fixtures/sortnet       # 排序网络：骨架 6 个比较器，n=4 最优 5 个
-plugin/bin/opl-evolve-init --lab lab --skeleton $SN/skeleton.py --evaluator $SN/evaluator.py
+plugin/bin/opl-evolve-init --lab lab --skeleton $SN/skeleton.py \
+  --evaluator $SN/evaluator.py --problem $SN/problem.json
 plugin/bin/opl-evolve-suggest --lab lab --metric comparators --where sorts=true
 # …你按任务书改可进化区，交一份完整文件…
 plugin/bin/opl-evolve-eval --lab lab --candidate ./cand-01.py --generation 1 --operation mutate
 plugin/bin/opl-evolve-show --lab lab --best comparators --where sorts=true
 ```
 
-判决分四档，各自的动作不同：`0` 入库且评估通过 / `1` 入库但评估不通过（**换方向**，
-不是微调）/ `2` 候选不合格（去修候选）/ `5` `code_hash` 命中，没有新增。
-另有两种「没有判决」：`3` 沙箱没给出结论（超时/被 OOM 杀），`4` 找不到 bwrap。
+判决分四档，各自的动作不同：`0` 入库且按定义可行 / `1` 入库但不可行（这只否定
+**这一个候选**，不否定它的邻域或路线）/ `2` 候选不合格或**指标不符合实验定义**
+（前者修候选，后者修评估器）/ `5` `code_hash` 命中，没有新增。
+另有两种「没有判决」：`3` 沙箱没给出结论（超时 / 被 OOM 杀 / 没写出指标），
+`4` 找不到 bwrap。
 
-**两处刻意取严的约束，都有实测理由：**
+**判决顺序是先问「这次跑完了吗」，再问「它说行不行」。** 实测：评估器先写出
+`metrics` 再卡死，旧逻辑会因为「产物存在」而判为通过。产物存在只说明写过文件，
+**不说明这次运行正常结束**。同理，`sorts: "false"`（字符串）既不是真也不是假——
+它是**错的**，按真假猜会把一个坏记录变成一条判决。
+
+**四处刻意取严的约束，都有实测理由：**
+
+- **题目参数冻结在可信端（`--problem`）。** 区外逐字节比对只能保证**文本**没变，
+  保证不了**题目**没变：实测把 `N = 0` 放进可进化区重新绑定，评估器就看到一个零路
+  问题并报 `sorts=true, comparators=0`，而区外一字未改。所以题目参数由实验定义给出
+  （以**只读**方式挂给评估器），候选声明的值必须与之一致。
+- **可行性与指标契约来自实验定义，插件不认识 `sorts`。** 原先硬编码 `sorts`，一个
+  返回 `{"feasible": true, "loss": …}` 的通用评估器其候选会被判成「不可行」。
+
 
 - **区外逐字节不许变。** 「研究者写死骨架」得由工具执行，不能靠自觉。改一个空格
   也算改动——这会误拒「只重排格式」的候选，但绝不会放过一次真实的区外改动，
@@ -302,14 +318,14 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 120 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 125 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
 plugin/scripts/verify-zip.sh     # 47 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
 回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
-`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `106 通过 / 0 失败 / 14 跳过`），
+`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `111 通过 / 0 失败 / 14 跳过`），
 `verify-zip.sh` 在同样情形下报 `42 通过 / 0 失败 / 5 跳过`。
 跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
 

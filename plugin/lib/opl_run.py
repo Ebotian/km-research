@@ -231,6 +231,9 @@ class RunSpec:
     pids_max: int | None = 256
     net_off: bool = True
     sandboxed: bool = True        # False 只在诊断/自检时用，快照里会明确记下来
+    # 只读挂进沙箱的额外文件：`(宿主路径, 沙箱内路径)`。用途是把**可信的东西**
+    # （评估器、冻结的实验定义）递进去而不把整个实验目录暴露给候选。
+    ro_binds: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -361,7 +364,8 @@ def execute(spec: RunSpec) -> RunResult:
     res = RunResult(kind=SANDBOX_ERROR)
     res.sandbox = {"sandboxed": spec.sandboxed, "net_off": spec.net_off,
                    "mem_max_mb": spec.mem_max_mb, "swap_max_mb": spec.swap_max_mb,
-                   "pids_max": spec.pids_max, "timeout_s": spec.timeout}
+                   "pids_max": spec.pids_max, "timeout_s": spec.timeout,
+                   "ro_binds": [list(b) for b in spec.ro_binds]}
 
     if not os.path.isdir(spec.workdir):
         res.notes.append(f"工作目录不存在：{spec.workdir}")
@@ -378,7 +382,8 @@ def execute(spec: RunSpec) -> RunResult:
                 f"找不到 bwrap（{sandbox.BWRAP}）：无法提供禁网与进程隔离。"
                 f"不降级到「裸跑」——那会静默丢掉隔离这一整块保证。")
             return res
-        argv = sandbox.bwrap_argv(argv, workdir=spec.workdir, net_off=spec.net_off)
+        argv = sandbox.bwrap_argv(argv, workdir=spec.workdir, net_off=spec.net_off,
+                                  ro_binds=spec.ro_binds)
 
     cg = Cgroup.create(f"opl-run-{spec.run_id}", mem_max_mb=spec.mem_max_mb,
                        swap_max_mb=spec.swap_max_mb, pids_max=spec.pids_max)

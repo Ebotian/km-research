@@ -527,7 +527,7 @@ chk "W2 终态随后可取到"           0 $BIN/opl-run --runs-dir "$R" --id W2 
 echo "opl-evolve 夹具与约束（排序网络 + EVOLVE-BLOCK + code_hash）"
 mkdir -p "$work/sn"
 cp "$FIX/sortnet/evaluator.py" "$FIX/sortnet/skeleton.py" \
-   "$FIX/sortnet/candidate-opt5.py" "$work/sn/"
+   "$FIX/sortnet/candidate-opt5.py" "$FIX/sortnet/problem.json" "$work/sn/"
 # 负样本现造：少一个比较器（不排序）、比较器越界（候选本身不可用）
 cat > "$work/sn/broken.py" <<'EOF'
 N = 4
@@ -544,9 +544,11 @@ EV=("$BIN/opl-run" --runs-dir "$R" --timeout 30 --workdir "$work/sn" --
 # `--` 之后的一切都属于 payload，所以 run 的选项（--id）必须写在 `--` **之前**。
 # （第一版把 --id 写进了数组末尾，于是它被当成评估器的参数，argparse 报错退出 2，
 #   opl-run 报 1——三条用例一起红，正是回归该有的反应。）
+# 评估器现在**必须**拿到冻结定义（`--problem`）：题目参数由它给出，不由候选说了算。
 sn_eval() {  # $1=run id  $2=候选文件名
   "$BIN/opl-run" --runs-dir "$R" --id "$1" --timeout 30 --workdir "$work/sn" -- \
-    /usr/bin/python3 /work/evaluator.py --candidate "/work/$2" --metrics-out /work/EV-M.json
+    /usr/bin/python3 /work/evaluator.py --problem /work/problem.json \
+    --candidate "/work/$2" --metrics-out /work/EV-M.json
 }
 chk "骨架可评估 -> 0" 0 sn_eval E1 skeleton.py
 chk "已知最优可评估 -> 0" 0 sn_eval E2 candidate-opt5.py
@@ -619,6 +621,7 @@ env = dict(os.environ)
 r = subprocess.run(['$BIN/opl-run', '--runs-dir', '$R', '--id', 'E5',
                     '--timeout', '30', '--workdir', '$work/sn', '--',
                     '/usr/bin/python3', '/work/evaluator.py',
+                    '--problem', '/work/problem.json',
                     '--candidate', '/work/broken.py',
                     '--metrics-out', '/work/broken-metrics.json'],
                    capture_output=True, env=env)
@@ -752,9 +755,11 @@ echo "opl-evolve 命令 —— 退出码矩阵与「改进」的可追性"
 EL="$work/elab"
 SNF="$FIX/sortnet"
 chk "init -> 0"                    0 $BIN/opl-evolve-init --lab "$EL" \
-    --skeleton "$SNF/skeleton.py" --evaluator "$SNF/evaluator.py"
+    --skeleton "$SNF/skeleton.py" --evaluator "$SNF/evaluator.py" \
+    --problem "$SNF/problem.json"
 chk "init 重复 -> 2"               2 $BIN/opl-evolve-init --lab "$EL" \
-    --skeleton "$SNF/skeleton.py" --evaluator "$SNF/evaluator.py"
+    --skeleton "$SNF/skeleton.py" --evaluator "$SNF/evaluator.py" \
+    --problem "$SNF/problem.json"
 chk "show 库非空 -> 0"             0 $BIN/opl-evolve-show --lab "$EL"
 chk "show 不存在的 id -> 5"        5 $BIN/opl-evolve-show --lab "$EL" --id 999
 chk "eval 最优候选 -> 0"           0 $BIN/opl-evolve-eval --lab "$EL" \
@@ -866,6 +871,170 @@ if r2.returncode != 5:
 after = snap()
 if after != mid:
     why.append('重复候选仍然跑了沙箱：%r -> %r' % (mid, after))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# ---- F2/F3/F4：判决绑定到可信端（审阅稿的三条复现已进回归）----
+# 三条都指向同一类错误：**把「东西在那儿」当成了「事情成立」**。
+#   F2 区外文本没变   → 当成题目没变（候选在区内重绑定 N 就能改题目）
+#   F3 产物存在       → 当成运行正常结束（超时/OOM 也写了 metrics 就判通过）
+#   F4 字段名叫 sorts → 当成所有实验都是排序问题
+chk "F2 区内改题目参数 -> 拒绝" 0 python3 -c "
+import os, subprocess, sys
+env = dict(os.environ)
+# 改动**全部落在区内**：在块内重新绑定 N，覆盖区外的 N = 4
+src = open('$SNF/skeleton.py').read()
+cand = '$work/elab-params.py'
+open(cand, 'w').write(src.replace(
+    '    return [(0, 1), (1, 2), (2, 3), (0, 1), (1, 2), (0, 1)]',
+    '    return []\n\nN = 0', 1))
+r = subprocess.run(['$BIN/opl-evolve-eval', '--lab', '$EL', '--candidate', cand],
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode == 0:
+    why.append('区内改题目参数竟然通过了（sorts=True comparators=0 的假成功）')
+if '不一致' not in r.stderr:
+    why.append('拒绝理由没说清是题目参数不一致：%s' % r.stderr.strip()[-120:])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F3 超时/OOM 不得判为通过" 0 python3 -c "
+import json, os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+SN = '$SNF'
+why = []
+class R:  # 替身：注入「运行没正常结束」的结局，但产物照写
+    def __init__(self, kind): self.kind = kind; self.payload_exit = None
+    notes = []; cgroup = {}
+MET = {'sorts': True, 'comparators': 5, 'zero_one_inputs_checked': 16}
+for kind in ('timeout', 'oom', 'signal'):
+    d = tempfile.mkdtemp()
+    E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+               problem_src=SN + '/problem.json')
+    def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _k=kind):
+        rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
+        json.dump(MET, open(rd + '/work/metrics.json', 'w'))
+        return MET, rd, _k, {}
+    E._stage_and_evaluate = fake
+    import opl_run; opl_run.execute = lambda spec, _k=kind: R(_k)
+    out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
+    if out.exit_code != 3:
+        why.append('%s + 有 metrics 得到退出码 %d（应为 3 没有判决）' % (kind, out.exit_code))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F3 指标类型不对 -> 拒绝而非猜" 0 python3 -c "
+import json, os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+SN = '$SNF'
+why = []
+CASES = (
+    ('sorts 是字符串 false', {'sorts': 'false', 'comparators': 4, 'zero_one_inputs_checked': 16}),
+    ('缺 comparators 字段',   {'sorts': True, 'zero_one_inputs_checked': 16}),
+    ('comparators 是字符串',  {'sorts': True, 'comparators': '5', 'zero_one_inputs_checked': 16}),
+    ('metrics 是空对象',      {}))
+for label, metrics in CASES:
+    d = tempfile.mkdtemp()
+    E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+               problem_src=SN + '/problem.json')
+    def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _m=metrics):
+        rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
+        json.dump(_m, open(rd + '/work/metrics.json', 'w'))
+        return _m, rd, 'ok', {}
+    E._stage_and_evaluate = fake
+    out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
+    if out.exit_code != 2:
+        why.append('%s 得到退出码 %d（应为 2 记录不合格）' % (label, out.exit_code))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F4 通用评估器（feasible/loss）-> 可行" 0 python3 -c "
+import json, os, shutil, subprocess, sys, tempfile
+env = dict(os.environ)
+d = tempfile.mkdtemp(prefix='opl-generic.')
+why = []
+try:
+    open(d + '/skeleton.py', 'w').write(
+        '# EVOLVE-BLOCK-START\ndef predict(x):\n    return x * 0.5\n# EVOLVE-BLOCK-END\n')
+    EV = ('import argparse, json, sys\n'
+          'ap = argparse.ArgumentParser()\n'
+          'ap.add_argument(\"--candidate\", required=True)\n'
+          'ap.add_argument(\"--problem\", required=True)\n'
+          'ap.add_argument(\"--metrics-out\")\n'
+          'a = ap.parse_args()\n'
+          'ns = {}\n'
+          'exec(compile(open(a.candidate).read(), a.candidate, \"exec\"), ns)\n'
+          'loss = sum(abs(ns[\"predict\"](x) - x) for x in (1.0, 2.0, 3.0))\n'
+          'm = {\"schema\": \"opl.evolve.metrics/1\", \"feasible\": True, \"loss\": loss}\n'
+          'if a.metrics_out: json.dump(m, open(a.metrics_out, \"w\"))\n'
+          'print(json.dumps(m))\n'
+          'sys.exit(0)\n')
+    open(d + '/evaluator.py', 'w').write(EV)
+    # **没有 sorts 字段**：可行性叫 feasible，目标叫 loss
+    json.dump({'schema': 'opl.evolve.problem/1',
+               'metrics': {'feasible': {'field': 'feasible', 'equals': True},
+                           'objective': {'field': 'loss', 'minimize': True},
+                           'required': {'feasible': 'bool', 'loss': 'number'}}},
+              open(d + '/problem.json', 'w'))
+    open(d + '/cand.py', 'w').write(
+        '# EVOLVE-BLOCK-START\ndef predict(x):\n    return x * 0.4999\n# EVOLVE-BLOCK-END\n')
+    lab = d + '/lab'
+    r0 = subprocess.run(['$BIN/opl-evolve-init', '--lab', lab, '--skeleton', d + '/skeleton.py',
+                         '--evaluator', d + '/evaluator.py', '--problem', d + '/problem.json'],
+                        capture_output=True, text=True, env=env)
+    if r0.returncode != 0:
+        why.append('init 退出码 %d：%s' % (r0.returncode, r0.stderr[-140:]))
+    r = subprocess.run(['$BIN/opl-evolve-eval', '--lab', lab, '--candidate', d + '/cand.py'],
+                       capture_output=True, text=True, env=env)
+    if r.returncode != 0:
+        why.append('通用评估器判可行的候选得到退出码 %d：%s' % (r.returncode, r.stderr[-160:]))
+    if 'FEASIBLE' not in r.stdout:
+        why.append('stdout 里没有 FEASIBLE：%r' % r.stdout.strip())
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# F2b：候选伸不到实验目录（探针实测）。安全侧的硬断言，不是文档承诺。
+chk "F2b 候选不可写实验目录" 0 python3 -c "
+import os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+from opl_run import RunSpec, execute
+SN = '$SNF'
+d = tempfile.mkdtemp()
+E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+           problem_src=SN + '/problem.json')
+ev = d + '/lab/evolve'
+why = []
+probe = ('import os\n'
+         'print(\"sees skeleton:\", os.path.exists(\"/work/skeleton.py\"))\n'
+         'print(\"sees db:\", os.path.exists(\"/work/programs.sqlite\"))\n'
+         'print(\"sees runs:\", os.path.exists(\"/work/runs\"))\n'
+         'print(\"sees workdir:\", os.getcwd())\n'
+         'print(\"problem writable:\", os.access(\"/opt/problem.json\", os.W_OK))\n'
+         'print(\"evaluator writable:\", os.access(\"/opt/evaluator.py\", os.W_OK))\n')
+work = d + '/probe'
+os.makedirs(work)
+r = execute(RunSpec(argv=['/usr/bin/python3', '-c', probe], workdir=work,
+                    runner_dir=d + '/probe-run', run_id='p',
+                    ro_binds=[(ev + '/evaluator.py', '/opt/evaluator.py'),
+                              (ev + '/problem.json', '/opt/problem.json')]))
+out = open(d + '/probe-run/stdout.txt').read()
+print('  探针输出：' + out.strip().replace(chr(10), ' | '), file=sys.stderr)
+for bad, what in (('sees skeleton: True', '能看到 skeleton.py'),
+                  ('sees db: True', '能看到 programs.sqlite'),
+                  ('sees runs: True', '能看到 runs/')):
+    if bad in out:
+        why.append('候选' + what)
+for need, what in (('problem writable: False', '冻结定义在沙箱内可写'),
+                   ('evaluator writable: False', '评估器在沙箱内可写')):
+    if need not in out:
+        why.append(what)
+if r.kind != 'ok':
+    why.append('探针运行结局 %r' % r.kind)
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"

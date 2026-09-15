@@ -1,0 +1,22 @@
+{
+  "schema": "opl.evolve.problem/1",
+  "title": "n=4 排序网络：用最少的比较器排好所有 0-1 输入",
+  "params": {
+    "n": 4
+  },
+  "metrics": {
+    "feasible": {
+      "field": "sorts",
+      "equals": true
+    },
+    "objective": {
+      "field": "comparators",
+      "minimize": true
+    },
+    "required": {
+      "sorts": "bool",
+      "comparators": "int",
+      "zero_one_inputs_checked": "int"
+    }
+  }
+}

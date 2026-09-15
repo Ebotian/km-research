@@ -2,7 +2,13 @@
 """opl-evolve-init —— 建实验目录并把骨架作为第 0 代入库。薄壳：逻辑在 lib/opl_evolve.py。
 
 用法：
-    opl-evolve-init --lab DIR --skeleton PATH --evaluator PATH [--force] [--json]
+    opl-evolve-init --lab DIR --skeleton PATH --evaluator PATH --problem PATH
+                    [--force] [--json]
+
+`--problem` 是**冻结的实验定义**（题目参数 + 指标契约），会被拷进实验目录并以只读
+方式挂给评估器。为什么要它：**可进化区之外文本不变，不代表题目不变**——实测把
+`N = 0` 放进区内重新绑定，就能让评估器看到一个零路问题并报「通过」。题目参数必须
+由可信端给出。
 
 骨架与评估器会被**拷进**实验目录（`DIR/evolve/`），不记录外部路径——区外比对的
 基准必须稳定，指着一个会被编辑的外部文件会让「区外没变」这个判断失去意义。
@@ -30,12 +36,15 @@ def main() -> int:
     ap.add_argument("--lab", required=True)
     ap.add_argument("--skeleton", required=True)
     ap.add_argument("--evaluator", required=True)
+    ap.add_argument("--problem", required=True,
+                    help="冻结的实验定义 JSON（题目参数 + 指标契约）")
     ap.add_argument("--force", action="store_true", help="已有实验目录时重建")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     try:
-        res = init_lab(args.lab, args.skeleton, args.evaluator, force=args.force)
+        res = init_lab(args.lab, args.skeleton, args.evaluator,
+                       problem_src=args.problem, force=args.force)
     except EvolveError as exc:
         c(str(exc))
         return USAGE
@@ -43,6 +52,7 @@ def main() -> int:
     c(f"实验目录 {res.lab_dir}")
     c(f"骨架 {res.skeleton}")
     c(f"评估器 {res.evaluator}")
+    c(f"实验定义 {res.problem}")
     if res.metrics:
         c("骨架基线指标：" + " ".join(f"{k}={res.metrics[k]}" for k in
                                      ("sorts", "comparators", "zero_one_inputs_checked")
@@ -54,6 +64,7 @@ def main() -> int:
             "schema": "opl.evolve.init/1",
             "lab_dir": res.lab_dir, "db": res.db_path,
             "skeleton": res.skeleton, "evaluator": res.evaluator,
+            "problem": res.problem,
             "seeded_program_id": res.seeded_id,
             "baseline_metrics": res.metrics,
             "baseline_note": res.baseline_note,

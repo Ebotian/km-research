@@ -10,9 +10,9 @@
 沙箱没给出判决是「还不知道」。三种结局的退出码各不相同。
 
 退出码：
-    0  PASS     候补入库，且评估通过（`sorts` 为真）
-    1  REJECT   候补入库，但评估不通过 —— 「这份候选更好」被推翻
-    2  USAGE    候选不合格（缺标记 / 区外被改 / 评估器判定不可用）或参数错
+    0  PASS     候选入库，且**按冻结的实验定义**判定为可行
+    1  REJECT   候选入库，但判定为不可行 —— 「这份候选可用」被推翻
+    2  USAGE    候选不合格（缺标记 / 区外被改），或评估器产出的指标不符合实验定义
     3  UNKNOWN  沙箱**没有给出判决**（超时 / 被 OOM 杀 / 被杀 / 没写出产物）。
                 这不是「候选不行」——别读错
     4  MISSING  找不到 bwrap。不降级到裸跑
@@ -32,8 +32,8 @@ from opl_common import PASS, REJECT, UNKNOWN, MISSING, USAGE, EMPTY, c, s  # noq
 from opl_evolve import EvolveError, eval_candidate  # noqa: E402
 
 VERDICT_LINE = {
-    PASS: "EVALUATED",
-    REJECT: "NOT_SORTING",
+    PASS: "FEASIBLE",
+    REJECT: "INFEASIBLE",
     USAGE: "INVALID",
     UNKNOWN: "NO_VERDICT",
     MISSING: "SANDBOX_MISSING",
@@ -75,11 +75,13 @@ def main() -> int:
             "code_hash": out.code_hash, "duplicate": out.duplicate,
             "reason": out.reason, "metrics": out.metrics, "run_dir": out.run_dir,
         }, ensure_ascii=False, indent=2, sort_keys=True))
+    # 摘要只打**实验定义要求的那几个字段**，不硬编码具体指标名：插件不认识
+    # `sorts` 或 `comparators`，可行性由定义给出（判据 F4）。
     detail = ""
     if out.metrics:
-        bits = [f"{k}={out.metrics[k]}" for k in ("sorts", "comparators")
-                if k in out.metrics]
-        detail = "  " + " ".join(bits)
+        want = out.summary_fields or sorted(out.metrics)
+        bits = [f"{k}={out.metrics[k]}" for k in want if k in out.metrics]
+        detail = "  " + " ".join(bits[:4])
     s(VERDICT_LINE.get(rc, "UNKNOWN"), detail.strip())
     return rc
 
