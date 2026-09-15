@@ -20,7 +20,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/opl-verifyzip.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 unzip -q "$zip" -d "$work"
 # 顶层目录名取自 zip 内部（是插件名），不是 zip 文件名——两者不同：
-# zip 叫 open-problem-lab-0.1.0.zip，内部根目录是 open-problem-lab/。
+# zip 名带版本号（open-problem-lab-<ver>.zip），内部根目录只是插件名。
 top=$(unzip -Z1 "$zip" | head -1 | cut -d/ -f1)
 root="$work/$top"
 [ -d "$root" ] || { echo "解压后找不到顶层目录 $top" >&2; exit 1; }
