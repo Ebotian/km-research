@@ -38,8 +38,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
 from opl_common import PASS, REJECT, UNKNOWN, MISSING, USAGE, c, s  # noqa: E402
-from opl_run import (BACKEND_MISSING, NO_VERDICT, OK, PAYLOAD_FAILED, RunSpec,  # noqa: E402
-                     execute, write_snapshots)
+from opl_run import (BACKEND_MISSING, DONE, NO_VERDICT, OK, PAYLOAD_FAILED,  # noqa: E402
+                     RunSpec, dispatch, run_with_status, status_path,
+                     wait_status)
+
+_ = DONE  # 文档用得到，壳里不直接引用
 
 KIND_EXIT = {
     OK: PASS,
@@ -58,6 +61,44 @@ def default_runs_dir() -> str:
     return os.path.join(lab, "runs") if lab else os.path.join(os.getcwd(), "runs")
 
 
+def do_detach(spec, args) -> int:
+    """派发到后台，确认「已经跑起来」再返回。
+
+    返回 0 表示**派发成功**，不是任务成功——所以 stdout 那行是 `s RUNNING`
+    而不是 `s OK`。判决要问 `--wait`。
+    """
+    info = dispatch(spec)
+    st = info.get("status") or {}
+    if not info.get("confirmed"):
+        c(f"派发未能确认：{info.get('note') or '子进程退出或未写状态'}")
+        s("UNDISPATCHED", f"id={spec.run_id} pid={info.get('pid')}")
+        return UNKNOWN
+    c(f"已派发 id={spec.run_id} pid={info['pid']}")
+    s("RUNNING", f"id={spec.run_id}  {spec.runner_dir}")
+    return PASS
+
+
+def do_wait(runner_dir: str, run_id: str, args) -> int:
+    """轮询到终态。幂等：已经终态就立刻返回该终态，不重跑。"""
+    st = wait_status(runner_dir, timeout=args.wait_timeout)
+    if st is None:
+        c(f"读不到状态文件：{status_path(runner_dir)}")
+        s("UNKNOWN", f"id={run_id} 没有状态可读")
+        return UNKNOWN
+    if st.get("state") != DONE:
+        # 「还不知道」不是「失败」。这里必须给 3，不能给 0 也不能给 1。
+        c(f"{args.wait_timeout}s 内仍是 {st.get('state')!r}；这是「还没有结论」，"
+          f"不是失败")
+        s("RUNNING", f"id={run_id}")
+        return UNKNOWN
+    kind = str(st.get("kind") or "")
+    for note in st.get("notes") or []:
+        c(f"注意：{note}")
+    elapsed = st.get("elapsed_ms")
+    s(kind.upper(), f"id={run_id}  {elapsed}ms  {runner_dir}")
+    return KIND_EXIT.get(kind, UNKNOWN)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--runs-dir", default=None)
@@ -69,6 +110,11 @@ def main() -> int:
     ap.add_argument("--allow-net", action="store_true")
     ap.add_argument("--no-sandbox", action="store_true")
     ap.add_argument("--deep-capabilities", action="store_true")
+    ap.add_argument("--detach", action="store_true",
+                    help="派发到后台，写 runs/<id>/status.json")
+    ap.add_argument("--wait", action="store_true",
+                    help="轮询到终态（幂等，不重跑）")
+    ap.add_argument("--wait-timeout", type=float, default=3600.0)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("cmd", nargs=argparse.REMAINDER,
                     help="-- 之后是要跑的命令")
@@ -77,7 +123,7 @@ def main() -> int:
     cmd = args.cmd
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
-    if not cmd:
+    if not cmd and not args.wait:
         c("缺少要跑的命令：写在 -- 之后")
         return USAGE
 
@@ -94,9 +140,15 @@ def main() -> int:
                    timeout=args.timeout, mem_max_mb=args.mem_mb,
                    pids_max=args.pids_max, net_off=not args.allow_net,
                    sandboxed=not args.no_sandbox)
-    res = execute(spec)
-    files = write_snapshots(spec, res, deep_capabilities=args.deep_capabilities)
 
+    if args.wait:
+        # 只读轮询，**绝不重跑**——幂等的全部含义在这里。
+        return do_wait(runner_dir, run_id, args)
+
+    if args.detach:
+        return do_detach(spec, args)
+
+    res, files = run_with_status(spec, deep_capabilities=args.deep_capabilities)
     for note in res.notes:
         c(f"注意：{note}")
     c(f"运行目录 {runner_dir}")

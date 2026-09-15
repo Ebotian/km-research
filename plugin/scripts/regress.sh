@@ -402,6 +402,64 @@ ok = (res.kind == BACKEND_MISSING
 if not ok:
     print('  实为 %r notes=%r' % (res.kind, res.notes), file=sys.stderr)
 sys.exit(0 if ok else 1)"
+
+# ---- 判据 6：--detach / --wait ----
+# 长任务用文件承载状态（`doc/plan/02-architecture.typ` 定的形态），好处是「超时重发」
+# 天然变成续跑而非重跑。所以这里除了「能等」，还要**证明确实没重跑**——用一次副作用
+# 计数来断言，而不是看两次 wait 的返回码相同（那只能证明它没崩）。
+mkdir -p "$work/dw"
+chk "detach 派发 -> 0"            0 $BIN/opl-run --runs-dir "$R" --id W1 --detach \
+    --timeout 30 --workdir "$work/dw" -- /usr/bin/python3 -c "
+import time
+open('ran.log', 'a').write('exec\n')
+time.sleep(1.5)"
+chk "detach 后状态文件已出现"      0 python3 -c "
+import json, os, sys
+p = '$R/W1/status.json'
+if not os.path.isfile(p):
+    sys.exit(1)
+st = json.load(open(p))
+print('  state =', st.get('state'), file=sys.stderr)
+sys.exit(0 if st.get('schema') == 'opl.run.status/1'
+         and st.get('state') in ('dispatched', 'running', 'done') else 1)"
+chk "wait 到终态"                 0 $BIN/opl-run --runs-dir "$R" --id W1 --wait --wait-timeout 30
+chk "再 wait 两次：幂等且没重跑"   0 python3 -c "
+import json, os, subprocess, sys
+env = dict(os.environ)
+why = []
+first = json.load(open('$R/W1/status.json'))
+for i in (2, 3):
+    r = subprocess.run(['$BIN/opl-run', '--runs-dir', '$R', '--id', 'W1', '--wait',
+                        '--wait-timeout', '30'], capture_output=True, env=env)
+    if r.returncode != 0:
+        why.append('第 %d 次 wait 退出码 %d' % (i, r.returncode))
+again = json.load(open('$R/W1/status.json'))
+# 1 结论一致
+if (first.get('kind'), first.get('elapsed_ms')) != (again.get('kind'), again.get('elapsed_ms')):
+    why.append('两次读到的结论不同：%r vs %r' % (first.get('kind'), again.get('kind')))
+# 2 **没有重跑**：payload 的副作用只出现一次
+log = '$work/dw/ran.log'
+n = sum(1 for _ in open(log)) if os.path.isfile(log) else 0
+if n != 1:
+    why.append('payload 执行了 %d 次（应为 1）——wait 触发了重跑' % n)
+# 3 与前台跑同一件事得到同一结局
+fg = subprocess.run(['$BIN/opl-run', '--runs-dir', '$R', '--id', 'W1-fg',
+                     '--workdir', '$work/dw', '--', '/usr/bin/python3', '-c',
+                     \"open('fg.log','a').write('e\\\\n')\"], capture_output=True)
+if fg.returncode != 0:
+    why.append('前台对照组退出码 %d' % fg.returncode)
+if first.get('kind') != 'ok':
+    why.append('detach 的终态是 %r（应为 ok）' % first.get('kind'))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "detach 一个长任务（为下一行铺垫）" 0 $BIN/opl-run --runs-dir "$R" --id W2 --detach \
+    --timeout 30 --workdir "$work/dw" -- /usr/bin/python3 -c "
+import time
+time.sleep(4)"
+# 还在跑时 wait：必须给 3（「还没有结论」），既不是 0 也不是 1。
+chk "还在跑时 wait -> 3（不是失败）" 3 $BIN/opl-run --runs-dir "$R" --id W2 --wait --wait-timeout 1
+chk "W2 终态随后可取到"           0 $BIN/opl-run --runs-dir "$R" --id W2 --wait --wait-timeout 30
 echo "encode —— 规格到模型，双后端互相证伪"
 chk "纯编码到 CNF（不需求解器）" 0 $BIN/opl-encode --spec $FIX/spec-pc43.json --to cnf --out "$work/e.cnf"
 chk "见证成立"                0 $BIN/opl-encode --spec $FIX/spec-pc23.json --eval-witness $FIX/spec-pc23-witness.json

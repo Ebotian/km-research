@@ -100,6 +100,50 @@ sys.exit(0 if ok else 1)"
 #              这是这个项目最想防的那类错误——把「没跑」说成「跑通了」。
 #   有 Lean 时：用 OPL_LEAN_PROJECT 指向定点的项目，在*解压目录里*把证明侧
 #              链路完整跑一遍，终态落在 lean_checked。
+# ---------------------------------------------------------------- 沙箱执行（包内）
+# 判据 12 要「包内跑通含 opl-run 的链路」。这里不是验它「能启动」——而是验
+# **判决仍然分得开**：超时给 3、正常给 0。打包过程若漏了什么（bwrap 的参数、lib
+# 里的模块），最容易坏掉的正是这个区别。
+echo "沙箱执行（包内 opl-run）"
+# 本机能不能出网，决定「沙箱里连不出去」这条断言是否有意义。没网时如实跳过。
+net_ok=0
+if python3 -c "
+import socket, sys
+try:
+    socket.create_connection(('1.1.1.1', 443), timeout=4); sys.exit(0)
+except OSError:
+    sys.exit(1)" 2>/dev/null; then net_ok=1; fi
+chk "opl-run 正常 -> 0" 0 "$root/bin/opl-run" \
+    --runs-dir "$work/runs" --id Z-9 --workdir "$work" -- /bin/true
+chk "四份快照都在" 0 python3 -c "
+import os, sys
+d = os.path.join('$work', 'runs', 'Z-9')
+need = ['cmd.json', 'env.json', 'capabilities.json', 'metrics.json',
+        'status.json', 'stdout.txt', 'stderr.txt']
+miss = [n for n in need if not os.path.isfile(os.path.join(d, n))]
+if miss:
+    print('  缺：', miss, file=sys.stderr)
+sys.exit(0 if not miss else 1)"
+chk "超时 -> 3（不是失败）" 3 "$root/bin/opl-run" \
+    --runs-dir "$work/runs" --id Z-10 --timeout 2 --workdir "$work" \
+    -- /usr/bin/python3 -c "while True: pass"
+# 真去连一次，而不是只看「请求了禁网」——断言必须落在**效果**上。
+chk "包内禁网确实生效" 0 "$root/bin/opl-run" \
+    --runs-dir "$work/runs" --id Z-11 --workdir "$work" \
+    -- /usr/bin/python3 -c "
+import socket
+try:
+    socket.create_connection(('1.1.1.1', 443), timeout=3)
+    print('NET_UP')
+except OSError:
+    print('NET_DOWN')"
+if [ "$net_ok" = 1 ]; then
+  chk "包内沙箱输出为 NET_DOWN" 0 grep -q NET_DOWN "$work/runs/Z-11/stdout.txt"
+else
+  skip=$((skip + 1))
+  printf '  skip  %-40s 本机出不去网，此断言无从判定\n' "包内沙箱输出为 NET_DOWN"
+fi
+
 echo "Lean 路径（包内无 lean/，按设计）"
 chk "包内确实没有 lean/" 0 test ! -e "$root/lean"
 # 没有项目 -> 拒绝运行。期望 2（无定点项目）或 4（lake 都没装）；两种都算如实降级，

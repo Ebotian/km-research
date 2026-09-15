@@ -34,6 +34,13 @@
 `systemd-run -p CPUQuota=` 能限 CPU，但它把进程挪进 systemd 自己的树，我们就同时失去
 `memory.events` 这条硬信道——两者不可兼得，选了硬证据。
 
+== 给候选程序的一条约定：工作目录在沙箱里是 `/work` ==
+
+`bwrap` 把 `--workdir` 绑到 `/work` 并 chdir 过去，所以候选程序**必须用相对路径或
+`/work/...`**。写宿主绝对路径（比如 `/tmp/xxx/out.txt`）会在沙箱里找不到那个目录而
+失败——这一条我实测踩过：payload 用宿主绝对路径写文件，运行报 `payload_failed`，
+看起来像「候选写错了」，其实是路径约定没对上。
+
 == 停滞风险最大的两处，都有实测依据 ==
 
 * **不要用管道接 payload 的 stdout。** 孙子继承写端后管道不关，`communicate()`
@@ -240,6 +247,112 @@ class RunResult:
     notes: list[str] = field(default_factory=list)
 
 
+# ------------------------------------------------------------------ 状态文件
+#
+# 长任务不用句柄轮询，用文件——这是 `doc/plan/02-architecture.typ` 定的形态，也是
+# Unix 的既有做法。好处不只是省事：**「超时重发」天然变成续跑而非重跑**，因为状态
+# 落在盘上而不是某个进程的内存里。判据 6 要验的正是这一点（幂等，不重跑）。
+
+STATUS_SCHEMA = "opl.run.status/1"
+RUNNING = "running"
+DONE = "done"
+
+
+def status_path(runner_dir: str) -> str:
+    return os.path.join(runner_dir, "status.json")
+
+
+def write_status(runner_dir: str, **fields: Any) -> str:
+    """原子写状态。
+
+    为什么必须原子：`--wait` 是另一个进程在轮询这个文件，半截 JSON 会被读成
+    「文件坏了」。先写同目录临时文件再 `os.replace`（同一文件系统内是原子的），
+    读方要么看到旧内容、要么看到新内容，不会看到中间态。
+    """
+    os.makedirs(runner_dir, exist_ok=True)
+    path = status_path(runner_dir)
+    rec = {"schema": STATUS_SCHEMA, "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+    rec |= fields
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def read_status(runner_dir: str) -> dict[str, Any] | None:
+    """读状态。文件还没出现或读坏都返回 None——**不**把读不到当成某个结局。"""
+    try:
+        with open(status_path(runner_dir), encoding="utf-8") as fh:
+            obj = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def wait_status(runner_dir: str, *, timeout: float = 3600.0,
+                poll: float = 0.2) -> dict[str, Any] | None:
+    """轮询到终态。**只读，不重跑**——这是幂等的全部含义。
+
+    超时返回 None（「还不知道」，不是「失败」），由调用方翻成 UNKNOWN(3)。
+    """
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        st = read_status(runner_dir)
+        if st is not None and st.get("state") == DONE:
+            return st
+        if time.monotonic() >= deadline:
+            return st          # 可能 None，也可能是 running——都表示「还没结论」
+        time.sleep(poll)
+
+
+def dispatch(spec: RunSpec, *, confirm_timeout: float = 5.0) -> dict[str, Any]:
+    """后台跑同一个 run：起一个脱离会话的子进程，等它确认「已开始」再返回。
+
+    为什么要等确认而不是直接返回：盲派发无法区分「已经在跑」与「子进程根本没起来」。
+    确认的凭据是子进程自己写的 `status.json`（`state=running`）——它比父进程的猜测硬。
+    """
+    argv = [sys.executable, os.path.join(plugin_bin_dir(), "opl-run"),
+            "--runs-dir", os.path.dirname((spec.runner_dir or spec.workdir).rstrip("/")),
+            "--id", spec.run_id, "--workdir", spec.workdir,
+            "--timeout", str(spec.timeout)]
+    if spec.mem_max_mb is not None:
+        argv += ["--mem-mb", str(spec.mem_max_mb)]
+    if spec.pids_max is not None:
+        argv += ["--pids-max", str(spec.pids_max)]
+    if not spec.net_off:
+        argv += ["--allow-net"]
+    if not spec.sandboxed:
+        argv += ["--no-sandbox"]
+    argv += ["--", *spec.argv]
+
+    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    write_status(spec.runner_dir, run_id=spec.run_id, state="dispatched",
+                 started_at=started, argv=spec.argv)
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    deadline = time.monotonic() + confirm_timeout
+    while time.monotonic() < deadline:
+        st = read_status(spec.runner_dir)
+        if st is not None and st.get("state") == RUNNING:
+            return {"confirmed": True, "pid": proc.pid, "status": st}
+        if proc.poll() is not None:
+            # 子进程已经退了却还没写 running：它多半是当场失败了，如实报。
+            return {"confirmed": False, "pid": proc.pid, "returncode": proc.returncode,
+                    "status": read_status(spec.runner_dir)}
+        time.sleep(0.05)
+    return {"confirmed": False, "pid": proc.pid, "status": read_status(spec.runner_dir),
+            "note": f"{confirm_timeout}s 内没等到子进程写下 running"}
+
+
+def plugin_bin_dir() -> str:
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin")
+
+
 # ------------------------------------------------------------------ 执行
 
 
@@ -290,6 +403,36 @@ def execute(spec: RunSpec) -> RunResult:
     finally:
         cg.cleanup()
     return res
+
+
+def run_with_status(spec: RunSpec, *,
+                    deep_capabilities: bool = False) -> tuple[RunResult, dict[str, str]]:
+    """前台跑一次，并把 `running` → `done` 两态写进 `status.json`。
+
+    状态由**执行者自己**写，不由派发者代笔：代笔的话，`--detach` 的父进程退出时会
+    留下一个永远停在 `running` 的记录，而真正的跑者早已不在。
+
+    返回 (结局, 快照路径)。快照路径**直接返回**而不是让调用方回读 `status.json`
+    ——壳里少一处可能写错名字的地方（这里刚踩过：壳引用了未导入的 `read_status`，
+    类型检查器看不见 `bin/`，只有回归把它照出来了）。
+    """
+    started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    write_status(spec.runner_dir, run_id=spec.run_id, state=RUNNING,
+                 pid=os.getpid(), started_at=started, argv=spec.argv,
+                 workdir=spec.workdir, timeout_s=spec.timeout,
+                 mem_max_mb=spec.mem_max_mb, net_off=spec.net_off,
+                 sandboxed=spec.sandboxed)
+    res = execute(spec)
+    files = write_snapshots(spec, res, deep_capabilities=deep_capabilities)
+    write_status(spec.runner_dir, run_id=spec.run_id, state=DONE, kind=res.kind,
+                 pid=os.getpid(), started_at=started, argv=spec.argv,
+                 workdir=spec.workdir, timeout_s=spec.timeout,
+                 mem_max_mb=spec.mem_max_mb, net_off=spec.net_off,
+                 sandboxed=spec.sandboxed,
+                 elapsed_ms=res.elapsed_ms, payload_exit_code=res.payload_exit,
+                 payload_signal=res.payload_signal, cgroup=res.cgroup,
+                 notes=res.notes, snapshots=files)
+    return res, files
 
 
 def _spawn_and_wait(argv: list[str], spec: RunSpec,
