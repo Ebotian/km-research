@@ -234,6 +234,10 @@ plugin/bin/opl-evolve-show --lab lab --best comparators --where sorts=true
 另有两种「没有判决」：`3` 沙箱没给出结论（超时 / 被 OOM 杀 / 没写出指标），
 `4` 找不到 bwrap。
 
+**评估器的退出码是契约**：`0` 跑完 / `1` 结论是不可行 / `2` 拒收候选 /
+`3+` 评估器自身故障（含被信号杀）。`3+` 时**它写的指标一概不采信**——实测「按约定
+返回 1」与「写完指标后崩了」都表现为非零退出码，不区分就会把一次崩溃算成一条结论。
+
 **判决顺序是先问「这次跑完了吗」，再问「它说行不行」。** 实测：评估器先写出
 `metrics` 再卡死，旧逻辑会因为「产物存在」而判为通过。产物存在只说明写过文件，
 **不说明这次运行正常结束**。同理，`sorts: "false"`（字符串）既不是真也不是假——
@@ -325,7 +329,7 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 128 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 131 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
 plugin/scripts/verify-zip.sh     # 47 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
