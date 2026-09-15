@@ -844,8 +844,9 @@ else:
             why.append('亲本理由重复：%r' % whys)
     if len(d.get('constraints') or []) < 3:
         why.append('约束列得太少：%r' % d.get('constraints'))
-    # `evolve_block` 是**标记之间**的内容，标记本身在 immutable_outside 里。
+    # 注意 evolve_block 是**标记之间**的内容，标记本身在 immutable_outside 里。
     # （第一版把这条断言写成「evolve_block 里要有 EVOLVE-BLOCK」，错在没分清两者。）
+    # 这里刻意不用反引号：chk 的参数是双引号串，反引号会被 shell 当命令替换执行。
     blob = d.get('evolve_block') or ''
     if not blob.strip() or 'build_network' not in blob:
         why.append('任务书没给出可进化区的内容：%r' % blob[:40])
