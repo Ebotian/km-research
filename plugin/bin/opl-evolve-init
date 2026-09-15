@@ -54,8 +54,9 @@ def main() -> int:
     c(f"评估器 {res.evaluator}")
     c(f"实验定义 {res.problem}")
     if res.metrics:
-        c("骨架基线指标：" + " ".join(f"{k}={res.metrics[k]}" for k in
-                                     ("sorts", "comparators", "zero_one_inputs_checked")
+        # 打哪几个字段由**实验定义**决定，不在这里写死字段名（判据 F4）
+        keys = res.summary_fields or sorted(res.metrics)
+        c("骨架基线指标：" + " ".join(f"{k}={res.metrics[k]}" for k in keys
                                      if k in res.metrics))
     if res.baseline_note:
         c("注意：" + res.baseline_note)

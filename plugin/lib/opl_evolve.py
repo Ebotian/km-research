@@ -317,6 +317,8 @@ class InitResult:
     metrics: dict[str, Any] | None = None
     baseline_note: str | None = None
     run_dir: str = ""
+    # 打哪几个字段给用户看：来自实验定义，不由壳硬编码（与 EvalOutcome 同理）
+    summary_fields: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -504,10 +506,15 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
                 problem_sha256=sha256_file(p["problem"]),
                 evaluator_sha256=sha256_file(p["evaluator"]),
                 budget={"timeout_s": timeout, "mem_max_mb": mem_max_mb})
+    summary = [problem.feasible_field] + (
+        [problem.objective_field] if problem.objective_field else []) + \
+        [f for f in problem.required if f not in (problem.feasible_field,
+                                                 problem.objective_field)]
     return InitResult(lab_dir=p["dir"], db_path=p["db"], skeleton=p["skeleton"],
                       evaluator=p["evaluator"], problem=p["problem"],
                       seeded_id=res.program_id, already_existed=force,
-                      metrics=metrics, baseline_note=note, run_dir=run_dir)
+                      metrics=metrics, baseline_note=note, run_dir=run_dir,
+                      summary_fields=summary)
 
 
 def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
