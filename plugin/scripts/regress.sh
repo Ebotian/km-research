@@ -1702,6 +1702,170 @@ finally:
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+# ---- R4：第四轮审阅的三条 ----
+#   R4-1 不合格的见证（verdict=NOT VERIFIED）与别人的证据都能盖复核章
+#         →「证据读得出来」被当成了「证据说它成立」；对象根本没核对
+#   R4-2 记录只存摘要，不重读证据 → 把被验证的见证换掉，结论继续挂着 exact_certificate
+#   R4-3 重建先归档活库再验输入 → 一次无效请求就把正常实验的库挪走了
+$BIN/opl-conj add --id R-4 --statement "第四轮审阅" >/dev/null 2>&1
+# 一份**违反规格**的见证：把 y00 翻一位（规格只有一组满足赋值）
+chk "R4-0 备一份不合格见证与三份证据" 0 python3 -c "
+import json, subprocess, os
+w = json.load(open('$FIX/spec-pc23-witness.json'))
+w['y00'] = 1 - w['y00']
+json.dump(w, open('$work/bad-witness.json', 'w'))
+env = dict(os.environ)
+# 三份证据：合格的（本猜想）、不合格的（判决 NOT VERIFIED）、合格但**属于别人**的。
+# 第三份是关键：只用「不合格」那份测不出「对象没核对」——判决那道闸会先把它拦下，
+# 于是「去掉对象检查」这种注入不会变红（实测踩过，M2 没被抓住）。
+for wit, out, sub in (('$FIX/spec-pc23-witness.json', 'r4-good.json', 'R-4'),
+                      ('$work/bad-witness.json', 'r4-bad.json', 'R-4'),
+                      ('$FIX/spec-pc23-witness.json', 'r4-other.json', 'R-2')):
+    subprocess.run(['$BIN/opl-encode', '--spec', '$FIX/spec-pc23.json',
+                    '--eval-witness', wit, '--evidence-out', '$work/' + out,
+                    '--subject', sub], capture_output=True, env=env)
+bad = json.load(open('$work/r4-bad.json'))
+other = json.load(open('$work/r4-other.json'))
+if bad['verdict'] == 'VERIFIED':
+    raise SystemExit('这份见证居然通过了规格求值，夹具要换')
+if other['verdict'] != 'VERIFIED' or other['subject'] != 'R-2':
+    raise SystemExit('第三份证据不合用：%s / %s' % (other['verdict'], other['subject']))
+print('  不合格证据 verdict =', bad['verdict'], '；别人的证据 subject =', other['subject'])"
+chk "R4-1 不合格见证/别人的证据都不得盖章" 0 python3 -c "
+import json, subprocess, sys, os
+env = dict(os.environ)
+why = []
+def add(witness, evidence):
+    return subprocess.run(['$BIN/opl-conj', 'set', 'R-4', '--add-counterexample', witness,
+                           '--evidence', evidence], capture_output=True, text=True, env=env)
+
+# 甲：判决是 NOT VERIFIED 的见证 —— 该降级，不该盖章
+r = add('$work/bad-witness.json', '$work/r4-bad.json')
+if r.returncode != 0:
+    why.append('不合格见证应降级记录（不拒收），却得到 %d：%s' % (r.returncode, r.stderr[-90:]))
+else:
+    cs = json.load(open('$work/lab/conjectures/R-4.json'))['counterexamples']
+    c = [x for x in cs if x['witness'].endswith('bad-witness.json')][0]
+    if c['verified_by'] != 'UNVERIFIED':
+        why.append('不合格见证拿到了 %r' % c['verified_by'])
+
+# 乙：证据本身有效（verdict=VERIFIED），但 subject 是**别人**（r4-other.json 属于 R-2）。
+# 这一条单独测「对象」那道闸——用不合格的那份测不出来，它会被判决先拦下。
+w2 = json.load(open('$work/r4-other.json'))['witness']
+r = add(w2, '$work/r4-other.json')
+if r.returncode != 0:
+    why.append('对象不符应降级，却得到 %d：%s' % (r.returncode, r.stderr[-90:]))
+else:
+    cs = json.load(open('$work/lab/conjectures/R-4.json'))['counterexamples']
+    c = cs[-1]
+    if c['verified_by'] != 'UNVERIFIED':
+        why.append('别的猜想（R-2）的有效证据拿到了 %r' % c['verified_by'])
+
+# 丙：正向对照 —— 本猜想 + 合格见证 + 门当户对的证据，才该有章
+wit = json.load(open('$work/r4-good.json'))['witness']
+r = add(wit, '$work/r4-good.json')
+if r.returncode != 0:
+    why.append('正主见证得到 %d：%s' % (r.returncode, r.stderr[-90:]))
+else:
+    cs = json.load(open('$work/lab/conjectures/R-4.json'))['counterexamples']
+    # 取**最后一条**：乙那条的见证名与这份一样（都指向夹具见证），只是证据来自 R-2。
+    # 用第一条会读到乙的记录，把「守卫过严」误报出来——这正是对照要防的读错对象。
+    c = cs[-1]
+    if c['witness'] != wit:
+        why.append('对照读错了条目：%r' % c['witness'])
+    elif c['verified_by'] != 'independent':
+        why.append('正主见证却记成了 %r（对照失败，守卫过严）' % c['verified_by'])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "R4-2 见证被换掉后不得继续挂着原档位" 0 python3 -c "
+import json, os, shutil, subprocess, sys
+env = dict(os.environ)
+d = '$work/r4-wit'
+os.makedirs(d, exist_ok=True)
+wit = d + '/witness.json'
+shutil.copyfile('$FIX/spec-pc23-witness.json', wit)
+subprocess.run(['$BIN/opl-encode', '--spec', '$FIX/spec-pc23.json', '--eval-witness', wit,
+                '--evidence-out', d + '/ev.json', '--subject', 'R-4'],
+               capture_output=True, env=env)
+subprocess.run(['$BIN/opl-conj', 'set', 'R-4', '--formal-status', 'refuted',
+                '--evidence', d + '/ev.json'], capture_output=True, env=env)
+f = json.load(open('$work/lab/conjectures/R-4.json'))
+why = []
+if f['verification_level'] != 'exact_certificate':
+    why.append('前置条件没建立：档位是 %r' % f['verification_level'])
+# 把被验证的见证**换掉**：路径不变、内容变了。记录里存的摘要看不出这件事，
+# 只有重新加载那份证据、重算它引用的输入哈希才发现。
+json.dump({'y00': 1, 'y01': 1, 'y02': 0, 'y10': 1, 'y11': 1, 'y12': 0}, open(wit, 'w'))
+r = subprocess.run(['$BIN/opl-conj', 'set', 'R-4', '--add-bound', 'n>=4@by-hand'],
+                   capture_output=True, text=True, env=env)
+f2 = json.load(open('$work/lab/conjectures/R-4.json'))
+if r.returncode == 0 and f2['verification_level'] == 'exact_certificate':
+    why.append('见证内容被换掉，记录仍挂着 exact_certificate（摘要当证据用了）')
+if r.returncode != 0 and '核不过' not in (r.stderr + r.stdout):
+    why.append('拒绝理由没点出依据核不过：%r' % r.stderr.strip()[-120:])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "R4-3 无效重建不动活库；备份名不撞车" 0 python3 -c "
+import json, os, shutil, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+d = tempfile.mkdtemp(prefix='opl-r4.')
+why = []
+try:
+    open(d + '/skel.py', 'w').write('# EVOLVE-BLOCK-START\ndef f(x):\n    return 1\n# EVOLVE-BLOCK-END\n')
+    open(d + '/ev.py', 'w').write('''
+import argparse, json, os, sys
+ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest='stage', required=True)
+e = sub.add_parser('extract'); e.add_argument('--problem'); e.add_argument('--candidate'); e.add_argument('--artifacts')
+v = sub.add_parser('verify'); v.add_argument('--problem'); v.add_argument('--artifacts'); v.add_argument('--metrics-out')
+a = ap.parse_args()
+if a.stage == 'extract':
+    os.makedirs(a.artifacts, exist_ok=True)
+    open(os.path.join(a.artifacts, 'a.json'), 'w').write('{}')
+    sys.exit(0)
+m = {'schema': 'opl.evolve.metrics/1', 'ok': True, 'score': 1}
+if a.metrics_out: json.dump(m, open(a.metrics_out, 'w'))
+sys.exit(0)
+''')
+    json.dump({'schema': 'opl.evolve.problem/1', 'params': {},
+               'metrics': {'feasible': {'field': 'ok', 'equals': True},
+                           'objective': {'field': 'score', 'minimize': True},
+                           'required': {'ok': 'bool', 'score': 'number'}}},
+              open(d + '/problem.json', 'w'))
+    E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py', problem_src=d + '/problem.json')
+    db = d + '/lab/evolve/programs.sqlite'
+    # 甲：骨架路径写错 —— 一次**无效请求**不该改变现有实验的状态
+    try:
+        E.init_lab(d + '/lab', d + '/不存在.py', d + '/ev.py',
+                   problem_src=d + '/problem.json', force=True)
+        why.append('无效重建竟然成功了')
+    except E.EvolveError:
+        pass
+    if not os.path.exists(db):
+        why.append('无效重建把活库挪走了（报错退出，但实验已经不完整）')
+    # 乙：评估器不合协议 —— 同样要在**动活库之前**被拦下
+    open(d + '/bad-ev.py', 'w').write('import sys\nsys.exit(0)\n')
+    try:
+        E.init_lab(d + '/lab', d + '/skel.py', d + '/bad-ev.py',
+                   problem_src=d + '/problem.json', force=True)
+        why.append('不合协议的评估器没被拒')
+    except E.EvolveError:
+        pass
+    if not os.path.exists(db):
+        why.append('协议探测失败也把活库挪走了')
+    # 丙：同一秒里连续两次成功重建 —— 两份备份都要在（覆盖式 os.replace 会吃掉一份）
+    E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py', problem_src=d + '/problem.json', force=True)
+    E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py', problem_src=d + '/problem.json', force=True)
+    baks = sorted(x for x in os.listdir(d + '/lab/evolve') if '.bak-' in x)
+    if len(baks) != 2:
+        why.append('同一秒两次重建只留下 %d 份备份（应为 2）：%s' % (len(baks), baks))
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
 # ---- suggest + 技能（判据 7/13 的收口）----
 # `suggest` 的核心不是「输出点什么」，而是**亲本必须有理由、且最好的那条真的是最好的**。
 # 这里刻意先放一条更差的候选再问：排序方向写反过一次（把 comparators=6 当成了「当前
@@ -1975,8 +2139,10 @@ fi
 echo "端到端（证明侧）—— 形式化 → 证明检查 → 独立内核复核 → 台账定案"
 if [ "$lean_ready" != 1 ]; then
   # 跳过与通过是两件事：这几项*没跑*，必须如实计入 skip。
-  skip=$((skip + 7))
-  printf '  skip  %-46s 缺 lake 或 plugin/lean（无定点 toolchain）\n' "证明侧端到端七项"
+  # 数字要跟着块里的 `chk` 条数走：加了 6f1（不点名声明）与 6f2（点了别的声明）之后
+  # 就是九项——跳过的计数**漏掉谁，谁就会在「总数」里凭空消失**（实测：136+14=150≠152）。
+  skip=$((skip + 9))
+  printf '  skip  %-46s 缺 lake 或 plugin/lean（无定点 toolchain）\n' "证明侧端到端九项"
 else
   chk "6a 形式化：真命题就位（且非玩具）" 0 python3 -c "
 import sys
@@ -2011,14 +2177,23 @@ sys.exit(0 if sum(2 * i + 1 for i in range(n)) == n * n else 1)"
   chk "6e 台账登记该命题"          0 $BIN/opl-conj add --id E-3 \
       --title "前 n 个奇数之和等于 n²" \
       --statement "对任意自然数 n，1+3+5+…+(2n-1) = n²" --source $FIX/lean-real.lean
+  chk "6f1 不点名声明就不算定案 -> 2" 2 $BIN/opl-conj set E-3 --formal-status proved \
+      --evidence "$work/e2e/lab/evidence/E-3.json" --verification-level lean_checked
   chk "6f 台账定案 lean_checked"   0 $BIN/opl-conj set E-3 --formal-status proved \
+      --statement-formal "$FIX/lean-real.lean" --decl oddSum_eq_sq \
+      --evidence "$work/e2e/lab/evidence/E-3.json" --verification-level lean_checked
+  chk "6f2 点了别的声明 -> 2" 2 $BIN/opl-conj set E-3 --formal-status proved \
+      --statement-formal "$FIX/lean-real.lean" --decl 另一个定理 \
       --evidence "$work/e2e/lab/evidence/E-3.json" --verification-level lean_checked
   chk "6g 终态：proved + 证据指针"  0 python3 -c "
 import json, sys
 f = json.load(open('$work/e2e/lab/conjectures/E-3.json'))
 ok = (f['formal_status'] == 'proved'
       and f['verification_level'] == 'lean_checked'
+      and f['statement_formal']['decl'] == 'oddSum_eq_sq'
       and any('E-3.json' in str(h.get('evidence', '')) for h in f['history']))
+if not ok:
+    print(json.dumps(f.get('statement_formal'), ensure_ascii=False), file=sys.stderr)
 sys.exit(0 if ok else 1)"
 fi
 

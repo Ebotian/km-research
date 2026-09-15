@@ -187,6 +187,10 @@ sys.exit(0 if ok else 1)"
       --title "前 n 个奇数之和等于 n²" --statement "1+3+…+(2n-1) = n²" \
       --source "$F/lean-real.lean"
   chk "台账定案 lean_checked" 0 "$root/bin/opl-conj" set Z-3 --formal-status proved \
+      --statement-formal "$F/lean-real.lean" --decl oddSum_eq_sq \
+      --evidence "$work/lab/evidence/Z-3.json" --verification-level lean_checked
+  chk "台账定案点了别的声明 -> 2" 2 "$root/bin/opl-conj" set Z-3 --formal-status proved \
+      --statement-formal "$F/lean-real.lean" --decl 别的定理 \
       --evidence "$work/lab/evidence/Z-3.json" --verification-level lean_checked
   chk "终态 proved + lean_checked" 0 python3 -c "
 import json, sys
