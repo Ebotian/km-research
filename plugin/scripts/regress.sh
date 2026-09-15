@@ -464,7 +464,7 @@ chk "W2 终态随后可取到"           0 $BIN/opl-run --runs-dir "$R" --id W2 
 # 判据 7 的地基：玩具问题本身要成立——评估器确定性、骨架与最优之间有**真实余量**。
 # 这里不验「改进能不能跑出来」（那是判据 7 本体），只验评估器的判决有依据：
 # 判「排序成立」要给出查了多少个输入，判「不排序」要给出反例。
-echo "opl-evolve 夹具（排序网络）—— 判决要有依据"
+echo "opl-evolve 夹具与约束（排序网络 + EVOLVE-BLOCK + code_hash）"
 mkdir -p "$work/sn"
 cp "$FIX/sortnet/evaluator.py" "$FIX/sortnet/skeleton.py" \
    "$FIX/sortnet/candidate-opt5.py" "$work/sn/"
@@ -577,6 +577,111 @@ if m.get('first_counterexample') is None:
     why.append('判「不排序」却没给反例')
 if m.get('zero_one_inputs_checked') != 16:
     why.append('检查的输入数 %r（应为 16 = 2^4）' % m.get('zero_one_inputs_checked'))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+
+# ---- 判据 8/9：可进化区是真约束，code_hash 是去重的执行点 ----
+# 这两条都由 **lib 层**保证，不靠调用方自觉。所以用例也打在 lib 上：
+# 区外改动必须被拒（且指出在哪一行），重复程序必须由唯一索引拦下并给出理由。
+chk "code_hash：吸收写法差异，区分语义" 0 python3 -c "
+import sys
+sys.path.insert(0, '$plugin/lib')
+from opl_evolve import code_hash
+base = 'x = 1\ny = x + 1\n'
+h0, mode = code_hash(base)
+why = []
+if mode != 'tokens':
+    why.append('基准的归一化模式是 %r' % mode)
+# 该吸收的：写法差异
+for name, v in [
+    ('行尾补空格', 'x = 1   \ny = x + 1   \n'),
+    ('每行加注释', 'x = 1  # a\ny = x + 1  # b\n'),
+    ('空行改写', 'x = 1\n\n\ny = x + 1\n'),
+    ('CRLF', 'x = 1\r\ny = x + 1\r\n'),
+    ('制表缩进', 'if True:\n\tx = 1\ny = x + 1\n'),
+]:
+    if code_hash(v)[0] != h0 and not name.startswith('制表'):
+        why.append('%s 未被归一化吸收（哈希变了）' % name)
+# 该区分的：语义差异
+for name, v in [
+    ('改数字', 'x = 2\ny = x + 1\n'),
+    ('换写法', 'x = 1\ny = 1 + x\n'),
+]:
+    if code_hash(v)[0] == h0:
+        why.append('%s 被误判为同一程序（哈希没变）' % name)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "区外改动被拒且指出位置" 0 python3 -c "
+import sys
+sys.path.insert(0, '$plugin/lib')
+from opl_evolve import EvolveError, assert_only_block_changed, split_block
+skel = open('$FIX/sortnet/skeleton.py').read()
+b = split_block(skel)
+why = []
+if b.before + b.block + b.after != skel:
+    why.append('切块不能拼回原文')
+# 只在区内改：必须通过
+opt = open('$FIX/sortnet/candidate-opt5.py').read()
+try:
+    assert_only_block_changed(skel, opt)
+except EvolveError as exc:
+    why.append('合法候选被误拒：%s' % exc)
+# 区外改动：必须被拒，且理由要**具体**——要么指出在哪一行，要么点明标记本身有问题。
+for name, cand in [
+    ('区外改空格', skel.replace('N = 4', 'N  = 4')),
+    ('区外加注释', skel.replace('N = 4', '# 我加的\nN = 4')),
+    ('区外改 N', skel.replace('N = 4', 'N = 5')),
+    ('删掉标记行', skel.replace('# EVOLVE-BLOCK-START\n', '')),
+]:
+    try:
+        assert_only_block_changed(skel, cand)
+        why.append('%s 竟然通过了' % name)
+    except EvolveError as exc:
+        msg = str(exc)
+        # 「区外被改」要有行号；「标记缺失」没有行号可给，但必须点明是标记的问题。
+        if '行' not in msg and '标记' not in msg:
+            why.append('%s 被拒但理由不具体：%s' % (name, msg[:60]))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "重复提交被 code_hash 拒并给出理由" 0 python3 -c "
+import os, shutil, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+from opl_evolve import ProgramLibrary
+skel = open('$FIX/sortnet/skeleton.py').read()
+opt = open('$FIX/sortnet/candidate-opt5.py').read()
+d = tempfile.mkdtemp(prefix='opllib.')
+why = []
+try:
+    lib = ProgramLibrary(os.path.join(d, 'p.sqlite'))
+    r1 = lib.add(code=skel, skeleton=skel, generation=0, operation='init',
+                 metrics={'comparators': 6})
+    r2 = lib.add(code=opt, skeleton=skel, generation=1, operation='mutate',
+                 metrics={'comparators': 5})
+    r3 = lib.add(code=opt, skeleton=skel, generation=1, operation='mutate')
+    if not (r1.accepted and r2.accepted):
+        why.append('前两次提交应被接受：%r / %r' % (r1.rejected_reason, r2.rejected_reason))
+    if r3.accepted:
+        why.append('同一份候选第二次仍被接受——去重没生效')
+    elif 'code_hash' not in (r3.rejected_reason or ''):
+        why.append('被拒的理由里没提 code_hash：%r' % r3.rejected_reason)
+    if lib.count() != 2:
+        why.append('库容 %d（应为 2）' % lib.count())
+    # 区内加注释算同一程序（归一化吸收），不该占新位
+    commented = opt.replace('    return [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)]',
+                            '    return [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)]  # 最优')
+    r4 = lib.add(code=commented, skeleton=skel)
+    if r4.accepted or lib.count() != 2:
+        why.append('区内加注释被当成新程序（库容 %d）' % lib.count())
+    # best 必须跳过「没有该指标」的行，而不是当成 0
+    b = lib.best('comparators', minimize=True)
+    if not b or (b.get('metrics') or {}).get('comparators') != 5:
+        why.append('best(comparators,min) = %r（应为 5）' % (b and b.get('metrics')))
+    lib.close()
+finally:
+    shutil.rmtree(d, ignore_errors=True)
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"

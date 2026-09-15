@@ -53,7 +53,7 @@ if miss:
     print('  漏包：', ', '.join(miss), file=sys.stderr)
 sys.exit(0 if not miss else 1)"
 # 运行时库：这三个是下沉重构后新增的，bin/ 里的命令全都依赖它们。
-for m in opl_lean opl_certcheck opl_probe opl_ledger opl_sandbox opl_run; do
+for m in opl_lean opl_certcheck opl_probe opl_ledger opl_sandbox opl_run opl_evolve; do
   chk "lib/$m.py 在包里" 0 test -f "$root/lib/$m.py"
 done
 chk "opl-leancheck 在包里且可执行" 0 test -x "$root/bin/opl-leancheck"

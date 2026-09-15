@@ -246,14 +246,14 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 93 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 96 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
-plugin/scripts/verify-zip.sh     # 41 项：解压到干净目录并跑通两条链
+plugin/scripts/verify-zip.sh     # 42 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
 回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
-`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `79 通过 / 0 失败 / 14 跳过`），
+`lake` 或没有定点项目时**不跑**（`regress.sh` 报 `82 通过 / 0 失败 / 14 跳过`），
 `verify-zip.sh` 在同样情形下报 `27 通过 / 0 失败 / 5 跳过`。
 跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
 
