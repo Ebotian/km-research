@@ -460,6 +460,126 @@ time.sleep(4)"
 # 还在跑时 wait：必须给 3（「还没有结论」），既不是 0 也不是 1。
 chk "还在跑时 wait -> 3（不是失败）" 3 $BIN/opl-run --runs-dir "$R" --id W2 --wait --wait-timeout 1
 chk "W2 终态随后可取到"           0 $BIN/opl-run --runs-dir "$R" --id W2 --wait --wait-timeout 30
+# ---------------------------------------------------------------- 排序网络夹具
+# 判据 7 的地基：玩具问题本身要成立——评估器确定性、骨架与最优之间有**真实余量**。
+# 这里不验「改进能不能跑出来」（那是判据 7 本体），只验评估器的判决有依据：
+# 判「排序成立」要给出查了多少个输入，判「不排序」要给出反例。
+echo "opl-evolve 夹具（排序网络）—— 判决要有依据"
+mkdir -p "$work/sn"
+cp "$FIX/sortnet/evaluator.py" "$FIX/sortnet/skeleton.py" \
+   "$FIX/sortnet/candidate-opt5.py" "$work/sn/"
+# 负样本现造：少一个比较器（不排序）、比较器越界（候选本身不可用）
+cat > "$work/sn/broken.py" <<'EOF'
+N = 4
+def build_network():
+    return [(0, 1), (2, 3), (0, 2), (1, 3)]
+EOF
+cat > "$work/sn/oob.py" <<'EOF'
+N = 4
+def build_network():
+    return [(0, 4)]
+EOF
+EV=("$BIN/opl-run" --runs-dir "$R" --timeout 30 --workdir "$work/sn" --
+    /usr/bin/python3 /work/evaluator.py --metrics-out /work/EV-M.json)
+# `--` 之后的一切都属于 payload，所以 run 的选项（--id）必须写在 `--` **之前**。
+# （第一版把 --id 写进了数组末尾，于是它被当成评估器的参数，argparse 报错退出 2，
+#   opl-run 报 1——三条用例一起红，正是回归该有的反应。）
+sn_eval() {  # $1=run id  $2=候选文件名
+  "$BIN/opl-run" --runs-dir "$R" --id "$1" --timeout 30 --workdir "$work/sn" -- \
+    /usr/bin/python3 /work/evaluator.py --candidate "/work/$2" --metrics-out /work/EV-M.json
+}
+chk "骨架可评估 -> 0" 0 sn_eval E1 skeleton.py
+chk "已知最优可评估 -> 0" 0 sn_eval E2 candidate-opt5.py
+# 注意这一层是 `opl-run` 的判决：payload 非零 -> REJECT(1)。评估器自己的退出码
+# （1=有反例 / 2=候选不可用）保留在 metrics.payload_exit_code 里，由调用方解读——
+# 「进程层的结果」与「评估器层的判决」分开，是在 lib 层就定好的分工。
+chk "不排序的候选 -> 1" 1 sn_eval E3 broken.py
+chk "越界候选 -> 1（payload 退 2）" 1 sn_eval E4 oob.py
+chk "判决有依据：6 / 5 / 反例 / 2" 0 python3 -c "
+import json, os, sys
+why = []
+
+def load(rid):
+    p = '$R/%s/metrics.json' % rid
+    if not os.path.isfile(p):
+        return None
+    return json.load(open(p))
+
+def gone(rid):
+    p = '$work/sn/EV-M.json'
+    return json.load(open(p)) if os.path.isfile(p) else None
+
+# 评估器每次覆盖同一个 metrics 文件，所以判据取的是**每次运行的快照 + 最后一次产物**：
+# 快照里的 payload_exit_code 是每次各自的，产物文件里的数字是最后一次的。
+e1, e2, e3, e4 = (load(x) for x in ('E1', 'E2', 'E3', 'E4'))
+for rid, m in (('E1', e1), ('E2', e2), ('E3', e3), ('E4', e4)):
+    if m is None:
+        why.append('%s 缺 metrics.json' % rid)
+        continue
+    if m.get('verdict') != 'payload_failed' and rid in ('E3', 'E4'):
+        why.append('%s 应报 payload_failed，实为 %r' % (rid, m.get('verdict')))
+
+# payload 自己的退出码必须分得开：1=有反例，2=候选不可用
+if e3 and e3.get('payload_exit_code') != 1:
+    why.append('不排序的候选 payload_exit_code=%r（应为 1）' % e3.get('payload_exit_code'))
+if e4 and e4.get('payload_exit_code') != 2:
+    why.append('越界候选 payload_exit_code=%r（应为 2，与「排序失败」分开）'
+               % e4.get('payload_exit_code'))
+
+# 判据 7 的余量是真实存在的：骨架 6、最优 5
+if not (e1 and e2):
+    why.append('缺 E1/E2 的快照')
+else:
+    if e1.get('payload_exit_code') != 0 or e2.get('payload_exit_code') != 0:
+        why.append('骨架/最优应各自退出 0')
+# 直接从快照里的 stdout 读评估结论，避开「同一个产物文件被覆盖」的干扰
+import re
+def comparators_from_stdout(rid):
+    p = '$R/%s/stdout.txt' % rid
+    m = re.search(r'\"comparators\": (\d+)', open(p).read()) if os.path.isfile(p) else None
+    return int(m.group(1)) if m else None
+c1, c2 = comparators_from_stdout('E1'), comparators_from_stdout('E2')
+if c1 != 6:
+    why.append('骨架比较器数 %r（应为 6）' % c1)
+if c2 != 5:
+    why.append('最优比较器数 %r（应为 5）—— 余量不成立则判据 7 无从谈起' % c2)
+if not (c1 and c2 and c1 > c2):
+    why.append('骨架 %r 未严格多于最优 %r：没有可改进的余量' % (c1, c2))
+
+# 判「不排序」必须给出反例，而不是只给一个布尔
+bad = json.load(open('$work/sn/EV-M.json')) if os.path.isfile('$work/sn/EV-M.json') else {}
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "反例可查且沙箱链路完整" 0 python3 -c "
+import json, os, sys
+# 用坏候选再跑一次，专门看它给出的反例
+import subprocess
+env = dict(os.environ)
+r = subprocess.run(['$BIN/opl-run', '--runs-dir', '$R', '--id', 'E5',
+                    '--timeout', '30', '--workdir', '$work/sn', '--',
+                    '/usr/bin/python3', '/work/evaluator.py',
+                    '--candidate', '/work/broken.py',
+                    '--metrics-out', '/work/broken-metrics.json'],
+                   capture_output=True, env=env)
+why = []
+if r.returncode != 1:
+    why.append('退出码 %d（应为 1）' % r.returncode)
+d = os.path.join('$R', 'E5')
+miss = [n for n in ('cmd.json', 'env.json', 'capabilities.json', 'metrics.json',
+                    'status.json') if not os.path.isfile(os.path.join(d, n))]
+if miss:
+    why.append('E5 缺 %r' % miss)
+m = json.load(open(os.path.join('$work', 'sn', 'broken-metrics.json')))
+if m.get('sorts') is not False:
+    why.append('坏候选被判 sorts=%r' % m.get('sorts'))
+if m.get('first_counterexample') is None:
+    why.append('判「不排序」却没给反例')
+if m.get('zero_one_inputs_checked') != 16:
+    why.append('检查的输入数 %r（应为 16 = 2^4）' % m.get('zero_one_inputs_checked'))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
 echo "encode —— 规格到模型，双后端互相证伪"
 chk "纯编码到 CNF（不需求解器）" 0 $BIN/opl-encode --spec $FIX/spec-pc43.json --to cnf --out "$work/e.cnf"
 chk "见证成立"                0 $BIN/opl-encode --spec $FIX/spec-pc23.json --eval-witness $FIX/spec-pc23-witness.json
