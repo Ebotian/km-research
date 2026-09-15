@@ -874,6 +874,139 @@ if after != mid:
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+# ---- F3/F4：判决只有一处实现；方向跟随实验定义 ----
+# F3：`init_lab` 原先没有运行结局检查，一次 `timeout` 的结果会被当成可用基线
+#     （实测 `baseline_note=None`，指标写进 programs，而 evaluations 里记着 timeout）。
+# F4：`--minimize` 那个开关 `default=True` 且没有反向选项，定义说最大化时永远选反。
+chk "F3 初始化不得接纳超时/OOM 结果" 0 python3 -c "
+import json, os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+SN = '$SNF'
+MET = {'sorts': True, 'comparators': 6, 'zero_one_inputs_checked': 16}
+why = []
+def stub(kind, pexit):
+    def fake(p, code, h, *, problem_path, timeout, mem_max_mb):
+        rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
+        json.dump(MET, open(rd + '/work/metrics.json', 'w'))
+        return MET, rd, kind, {}, pexit
+    E._stage_and_evaluate = fake
+import sqlite3
+CASES = (('timeout', None), ('oom', None), ('payload_failed', 3), ('payload_failed', 137))
+for kind, pexit in CASES:
+    d = tempfile.mkdtemp()
+    stub(kind, pexit)
+    res = E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+                     problem_src=SN + '/problem.json')
+    if res.metrics is not None:
+        why.append('%s/%s 的指标被当成可用基线' % (kind, pexit))
+    if not res.baseline_note:
+        why.append('%s/%s 没有任何说明' % (kind, pexit))
+    con = sqlite3.connect(d + '/lab/evolve/programs.sqlite'); con.row_factory = sqlite3.Row
+    row = dict(list(con.execute('SELECT metrics_json FROM programs'))[0])
+    evk = [dict(r)['kind'] for r in con.execute('SELECT kind FROM evaluations')]
+    con.close()
+    if row['metrics_json'] is not None:
+        why.append('%s/%s：programs.metrics_json 有值，但这次运行没有判决' % (kind, pexit))
+    # 运行史记「发生了什么」（kind 是原始沙箱结局，那是事实），但**不能有判决**：
+    # feasible 与 metrics 都必须是空的
+    con = sqlite3.connect(d + '/lab/evolve/programs.sqlite'); con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute('SELECT feasible, metrics_json, note FROM evaluations')]
+    con.close()
+    if any(r['feasible'] is not None for r in rows):
+        why.append('%s/%s：运行史给了可行/不可行判决' % (kind, pexit))
+    if any(r['metrics_json'] is not None for r in rows):
+        why.append('%s/%s：运行史存了不可信的指标' % (kind, pexit))
+    if not any(r['note'] for r in rows):
+        why.append('%s/%s：运行史没有说明为什么没有判决' % (kind, pexit))
+# 对照：正常结局必须入库
+d = tempfile.mkdtemp(); stub('ok', 0)
+res = E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+                 problem_src=SN + '/problem.json')
+if res.metrics is None:
+    why.append('正常结局的基线竟然没入库')
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F3 评估器退出码契约（1/2/3/137）" 0 python3 -c "
+import json, os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+SN = '$SNF'
+MET = {'sorts': True, 'comparators': 5, 'zero_one_inputs_checked': 16}
+ORIG = E._stage_and_evaluate
+why = []
+# 契约：1=按约定不可行（结论）；2=拒收候选；>=3=评估器自身故障（不采信指标）
+CASES = (('payload_failed', 1, 0), ('payload_failed', 2, 2),
+         ('payload_failed', 3, 3), ('payload_failed', 137, 3), ('timeout', None, 3))
+for kind, pexit, want in CASES:
+    d = tempfile.mkdtemp()
+    E._stage_and_evaluate = ORIG
+    E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+               problem_src=SN + '/problem.json')
+    def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _k=kind, _p=pexit):
+        rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
+        json.dump(MET, open(rd + '/work/metrics.json', 'w'))
+        return MET, rd, _k, {}, _p
+    E._stage_and_evaluate = fake
+    out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
+    if out.exit_code != want:
+        why.append('kind=%s exit=%s -> 退出码 %d（应为 %d）' % (kind, pexit, out.exit_code, want))
+E._stage_and_evaluate = ORIG
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F4 --best 跟随实验定义的方向" 0 python3 -c "
+import json, os, shutil, subprocess, sys, tempfile
+env = dict(os.environ)
+d = tempfile.mkdtemp(prefix='opl-max.')
+why = []
+try:
+    open(d + '/skel.py', 'w').write('# EVOLVE-BLOCK-START\ndef score(x):\n    return 0\n# EVOLVE-BLOCK-END\n')
+    open(d + '/ev.py', 'w').write(
+        'import argparse, json, sys\n'
+        'ap = argparse.ArgumentParser()\n'
+        'ap.add_argument(\"--candidate\", required=True)\n'
+        'ap.add_argument(\"--problem\", required=True)\n'
+        'ap.add_argument(\"--metrics-out\")\n'
+        'a = ap.parse_args()\n'
+        'ns = {}\n'
+        'exec(compile(open(a.candidate).read(), a.candidate, \"exec\"), ns)\n'
+        'm = {\"schema\": \"opl.evolve.metrics/1\", \"ok\": True, \"score\": ns[\"score\"](0)}\n'
+        'if a.metrics_out: json.dump(m, open(a.metrics_out, \"w\"))\n'
+        'sys.exit(0)\n')
+    json.dump({'schema': 'opl.evolve.problem/1',
+               'metrics': {'feasible': {'field': 'ok', 'equals': True},
+                           'objective': {'field': 'score', 'minimize': False},
+                           'required': {'ok': 'bool', 'score': 'number'}}},
+              open(d + '/problem.json', 'w'))
+    lab = d + '/lab'
+    subprocess.run(['$BIN/opl-evolve-init', '--lab', lab, '--skeleton', d + '/skel.py',
+                    '--evaluator', d + '/ev.py', '--problem', d + '/problem.json'],
+                   capture_output=True, env=env)
+    for v in (0, 9):
+        open(d + ('/c%d.py' % v), 'w').write(
+            '# EVOLVE-BLOCK-START\ndef score(x):\n    return %d\n# EVOLVE-BLOCK-END\n' % v)
+        subprocess.run(['$BIN/opl-evolve-eval', '--lab', lab, '--candidate', d + ('/c%d.py' % v)],
+                       capture_output=True, env=env)
+    def best(*extra):
+        r = subprocess.run(['$BIN/opl-evolve-show', '--lab', lab, '--best', 'score',
+                            '--json'] + list(extra), capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            return None
+        return (json.loads(r.stdout).get('metrics') or {}).get('score')
+    if best() != 9:
+        why.append('定义说最大化，--best 却选中 %r（应 9）' % best())
+    if best('--minimize') != 0:
+        why.append('--minimize 选中 %r（应 0）' % best('--minimize'))
+    if best('--maximize') != 9:
+        why.append('--maximize 选中 %r（应 9）' % best('--maximize'))
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+
 # ---- F5：程序身份与评估运行分列（同一程序可多次评估，各留证据）----
 # 判据 8 要「重复提交被拒」，F5 要「同一程序能再评估一次」——两件事由**同一个动作**
 # 触发，所以必须能区分：默认拒绝（不花沙箱的钱），补测要显式 `--reevaluate`。
@@ -1029,7 +1162,7 @@ for kind in ('timeout', 'oom', 'signal'):
     def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _k=kind):
         rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
         json.dump(MET, open(rd + '/work/metrics.json', 'w'))
-        return MET, rd, _k, {}
+        return MET, rd, _k, {}, None
     E._stage_and_evaluate = fake
     import opl_run; opl_run.execute = lambda spec, _k=kind: R(_k)
     out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
@@ -1056,7 +1189,7 @@ for label, metrics in CASES:
     def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _m=metrics):
         rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
         json.dump(_m, open(rd + '/work/metrics.json', 'w'))
-        return _m, rd, 'ok', {}
+        return _m, rd, 'ok', {}, 0
     E._stage_and_evaluate = fake
     out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
     if out.exit_code != 2:

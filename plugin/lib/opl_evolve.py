@@ -294,6 +294,77 @@ def code_hash(code: str) -> tuple[str, str]:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest(), mode
 
 
+# ------------------------------------------------------------------ 运行判决
+#
+# == 评估器的退出码契约 ==
+#
+# 这是**插件与评估器之间的约定**，不是建议。写在这里是因为「跑到一半崩了」与
+# 「按约定说不可行」如果都靠一个非零退出码表达，就永远分不开——实测
+# `payload_failed` + 一份合法可行的指标曾经一路走到 `0 / feasible`。
+#
+#   0  跑完，指标有效      → 可行性由实验定义判
+#   1  跑完，候选不可行    → 这是**结论**，不是故障
+#   2  评估器拒收这个候选  → 候选不合格（去修候选）
+#   3+ 评估器自身故障      → **不采信它写的任何指标**，因为没有判决
+#
+EVAL_OK = 0
+EVAL_INFEASIBLE = 1
+EVAL_REJECT_CANDIDATE = 2
+EVAL_MIN_FAILURE = 3
+
+
+@dataclass
+class Judgement:
+    exit_code: int          # 调用方该用的退出码
+    kind: str               # 判决标签
+    reason: str | None = None
+    metrics: dict[str, Any] | None = None   # **只有在可信时才非空**
+    trust_metrics: bool = False
+
+
+def judge_run(*, kind: str, payload_exit: int | None, metrics: Any,
+              problem: "Problem", run_dir: str = "") -> Judgement:
+    """把「一次运行的原始结局」判成「结论」。**init 与 eval 共用这一个**。
+
+    共用是重点：上一版 `eval_candidate` 有运行结局检查而 `init_lab` 没有，
+    于是初始化把一次 `timeout` 的结果当成可用基线（实测：`baseline_note=None`，
+    指标写进了 `programs`，而 `evaluations` 里记着 `kind=timeout`——库同时保留
+    「运行超时」与「这是可用成绩」）。判决只能有一处实现。
+    """
+    from opl_common import EMPTY, MISSING, PASS, REJECT, UNKNOWN, USAGE
+
+    if kind == "backend_missing":
+        return Judgement(MISSING, "backend_missing", "找不到 bwrap：不降级到裸跑")
+    if kind not in ("ok", "payload_failed"):
+        extra = "（评估器写出了指标，但这次运行没有正常结束——不采信）" if metrics else ""
+        return Judgement(UNKNOWN, kind, f"沙箱结局 {kind}{extra}")
+    if kind == "payload_failed":
+        if payload_exit is not None and payload_exit >= EVAL_MIN_FAILURE:
+            return Judgement(UNKNOWN, "evaluator_failed",
+                             f"评估器退出码 {payload_exit}（≥{EVAL_MIN_FAILURE} 视为自身故障）"
+                             f"——它写的指标不采信")
+        if payload_exit == EVAL_REJECT_CANDIDATE:
+            # 把评估器自己的说法带出来。只说「拒收」会让实测里那句
+            # 「候选声明的 N=0 与冻结定义的 n=4 不一致」丢掉——理由从具体退化成笼统。
+            tail = _tail(os.path.join(run_dir, "stderr.txt")) if run_dir else ""
+            return Judgement(USAGE, "candidate_rejected",
+                             "评估器拒收了这个候选" + (f"：{tail}" if tail else ""))
+        if payload_exit is None:
+            return Judgement(UNKNOWN, "unknown_exit", "评估器非零退出但拿不到退出码")
+        # payload_exit == 1：按约定表示「不可行」，是**结论**
+    if metrics is None:
+        tail = _tail(os.path.join(run_dir, "stderr.txt")) if run_dir else ""
+        return Judgement(UNKNOWN, "no_metrics",
+                         "评估器没写出指标" + (f"；它的 stderr 末尾：{tail}" if tail else ""))
+    bad = problem.check_metrics(metrics)
+    if bad:
+        return Judgement(USAGE, "metrics_invalid",
+                         "评估器产出的 metrics 不符合实验定义：" + "；".join(bad))
+    ok = problem.feasible(metrics)
+    return Judgement(PASS if ok else REJECT, "feasible" if ok else "infeasible",
+                     None, metrics, True)
+
+
 # ------------------------------------------------------------------ 实验目录
 
 EVOLVE_DIR = "evolve"
@@ -379,7 +450,7 @@ def lab_paths(lab: str) -> dict[str, str]:
 
 def _stage_and_evaluate(p: dict[str, str], code: str, h: str, *, problem_path: str,
                         timeout: float, mem_max_mb: int | None,
-                        ) -> tuple[dict[str, Any] | None, str, str, dict[str, str]]:
+                        ) -> tuple[dict[str, Any] | None, str, str, dict[str, str], int | None]:
     """把候选与冻结定义**只读**挂进沙箱、跑评估器、读回指标。
 
     == 沙箱里挂什么，是个安全问题，不是整理问题 ==
@@ -395,8 +466,9 @@ def _stage_and_evaluate(p: dict[str, str], code: str, h: str, *, problem_path: s
     `/work`，但它伸不到别处。冻结定义只读这一点尤其要紧——**一个能改定义的候选等于
     自己出题自己判**。
 
-    返回 (metrics 或 None, 运行目录, 沙箱结局, 快照路径)。**不**在拿不到 metrics 时
-    编一个空的：「没有结论」与「结论是空的」是两回事。
+    返回 (metrics 或 None, 运行目录, 沙箱结局, 快照路径, payload 退出码)。
+    `payload_exit` 必须带出来：**「按约定说不可行」与「写完指标后崩溃」都表现为
+    非零退出码**，只有原始退出码能把两者分开。
     """
     from opl_run import RunSpec, execute, write_snapshots
 
@@ -425,7 +497,7 @@ def _stage_and_evaluate(p: dict[str, str], code: str, h: str, *, problem_path: s
                 metrics = json.load(fh)
         except ValueError:
             metrics = None
-    return metrics, run_dir, res.kind, files
+    return metrics, run_dir, res.kind, files, res.payload_exit
 
 
 def _tail(path: str, limit: int = 200) -> str:
@@ -480,26 +552,30 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
 
     code = open(p["skeleton"], encoding="utf-8").read()
     h, _ = code_hash(code)
-    metrics, run_dir, kind, _files = _stage_and_evaluate(
+    metrics, run_dir, kind, _files, payload_exit = _stage_and_evaluate(
         p, code, h, problem_path=p["problem"], timeout=timeout, mem_max_mb=mem_max_mb)
 
+    # 基线用的判决函数与 eval_candidate **完全同一个**（`judge_run`）。
+    # 上一版 init 没有运行结局检查，于是 `kind=timeout` + 一份合法指标会被当成
+    # 可用基线写进 programs，而 evaluations 里同时记着 kind=timeout——
+    # 库同时保留「运行超时」与「这是成绩」。判决只能有一处实现。
+    j = judge_run(kind=kind, payload_exit=payload_exit, metrics=metrics,
+                  problem=problem, run_dir=run_dir)
     note = None
-    if metrics is None:
-        note = (f"骨架未取得指标（沙箱结局 {kind}）；第 0 代没有 metrics，"
-                f"在补测之前 best() 对它视而不见")
+    kept: dict[str, Any] | None = None
+    if j.trust_metrics:
+        kept = j.metrics
     else:
-        bad = problem.check_metrics(metrics)
-        if bad:
-            # 指标的**形状**不对：宁可留空也不入库一个坏记录
-            note = ("骨架的 metrics 不符合实验定义，未入库：" + "；".join(bad))
-            metrics = None
+        note = (f"骨架未取得可用指标（{j.kind}）：{j.reason or ''}"
+                f"；第 0 代没有 metrics，在补测之前 best() 对它视而不见").strip("：")
+    metrics = kept
     with ProgramLibrary(p["db"]) as lib:
         res = lib.add(code=code, skeleton=None, generation=0, operation="init",
                       metrics=None)
         if res.program_id is not None:
             # 基线也是一次运行，同样进运行史——「这个数字哪来的」要能一路查到 init
             lib.add_evaluation(
-                res.program_id, kind=kind, run_dir=run_dir,
+                res.program_id, kind=j.kind, run_dir=run_dir,
                 metrics=metrics if metrics else None,
                 feasible=None if metrics is None else problem.feasible(metrics),
                 note=None if metrics else (note or "基线未取得指标"),
@@ -571,7 +647,7 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
                                   f"（已有 id={dup['id']}，第 {dup['generation']} 代）。"
                                   f"要再跑一次加 --reevaluate")
 
-    metrics, run_dir, kind, _files = _stage_and_evaluate(
+    metrics, run_dir, kind, _files, payload_exit = _stage_and_evaluate(
         p, code, h, problem_path=p["problem"], timeout=timeout, mem_max_mb=mem_max_mb)
     # 这次运行「在什么条件下、由什么评估器」跑的——运行史里必须查得到这些
     fp = {"problem_sha256": sha256_file(p["problem"]),
@@ -589,40 +665,15 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
 
     # ---- F3：运行没正常结束就是「没有判决」，产物存在也不改这一条 ----
     existing_id = dup["id"] if dup else None
-    if kind == "backend_missing":
-        record(existing_id, feasible=None, note="沙箱后端缺失")
-        return EvalOutcome(exit_code=MISSING, kind=kind, code_hash=h,
-                           reason="找不到 bwrap：不降级到裸跑", run_dir=run_dir,
-                           summary_fields=summary)
-    if kind not in (OK, PAYLOAD_FAILED):
-        extra = "（评估器写出了 metrics，但这次运行没有正常结束——不采信）" \
-            if metrics is not None else ""
-        # 这次没有结论：**不入 metrics**，只留一条运行史。旧指标也不动。
-        record(existing_id, feasible=None, note=f"无判决：{kind}")
-        return EvalOutcome(exit_code=UNKNOWN, kind=kind, code_hash=h,
-                           reason=f"沙箱结局 {kind}{extra}", run_dir=run_dir,
-                           summary_fields=summary)
-    if metrics is None:
-        # 「评估器没写出指标」本身不是结论，但它往往**有**理由——比如评估器按冻结定义
-        # 拒了候选（实测：区内把 N 改成 0，评估器报「与冻结定义不一致」）。把那段
-        # stderr 带出来；否则用户只看到「没有指标」，得自己去翻运行目录才知道为什么。
-        tail = _tail(os.path.join(run_dir, "stderr.txt"))
-        record(existing_id, feasible=None, note="评估器没写出指标")
-        return EvalOutcome(exit_code=UNKNOWN, kind="no_metrics", code_hash=h,
-                           reason=(f"评估器没写出指标（{run_dir}/work/metrics.json）"
-                                   + (f"；它的 stderr 末尾：{tail}" if tail else "")),
-                           run_dir=run_dir, summary_fields=summary)
-
-    # ---- F4：指标的合法性由**冻结定义**判定，插件不认识具体字段名 ----
-    bad = problem.check_metrics(metrics)
-    if bad:
-        record(existing_id, feasible=None, note="指标不合格：" + "；".join(bad))
-        return EvalOutcome(exit_code=USAGE, kind="metrics_invalid", code_hash=h,
-                           metrics=metrics, run_dir=run_dir,
-                           reason="评估器产出的 metrics 不符合实验定义：" + "；".join(bad),
-                           summary_fields=summary)
-
-    ok = problem.feasible(metrics)
+    j = judge_run(kind=kind, payload_exit=payload_exit, metrics=metrics,
+                  problem=problem, run_dir=run_dir)
+    if not j.trust_metrics:
+        # 没有可信判决：只留一条运行史，**不入指标**，旧指标也不动
+        record(existing_id, feasible=None, note=f"{j.kind}：{j.reason or ''}".strip("："))
+        return EvalOutcome(exit_code=j.exit_code, kind=j.kind, code_hash=h,
+                           reason=j.reason, run_dir=run_dir, summary_fields=summary)
+    metrics = j.metrics
+    ok = j.exit_code == 0
     if dup:
         # 补测：**身份不变**，只追加一次运行
         record(dup["id"], feasible=ok, metrics_for_row=metrics)

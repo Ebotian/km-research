@@ -61,7 +61,12 @@ def main() -> int:
                          "**不加它是危险的**：数字最小不等于最好——"
                          "实测会选中一条不可行的候选（本仓库夹具是排序网络，"
                          "那条是 4 比较器但不排序的网络）")
-    ap.add_argument("--minimize", action="store_true", default=True)
+    # 方向默认**跟随实验定义**：定义说最大化就最大化。原先这个开关 `default=True`
+    # 且没有反向选项，于是「最大化」的定义下永远选反（实测：score=0 与 9，选中 0）。
+    ap.add_argument("--minimize", dest="minimize", action="store_true", default=None,
+                    help="强制按最小化（默认跟随实验定义的 objective.minimize）")
+    ap.add_argument("--maximize", dest="minimize", action="store_false",
+                    help="强制按最大化")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
@@ -93,14 +98,25 @@ def main() -> int:
             except EvolveError as exc:
                 c(str(exc))
                 return USAGE
-            rec = lib.best(args.best, minimize=args.minimize, where=where)
+            # 方向：显式开关 > 实验定义 > 最小化（定义没写 objective 时）
+            try:
+                prob = load_problem(lab_paths(args.lab)["problem"])
+                defined = prob.objective_minimize
+                defined_field = prob.objective_field
+            except EvolveError:
+                defined, defined_field = True, None
+            direction = args.minimize if args.minimize is not None else defined
+            if defined_field and args.best != defined_field:
+                c(f"注意：实验定义的目标字段是 {defined_field!r}，而你按 {args.best!r} 取最好"
+                  f"——这可能是两次不同的比较")
+            rec = lib.best(args.best, minimize=direction, where=where)
             if rec is None:
                 c(f"没有任何程序带指标 {args.best!r}"
                   + (f" 且满足 {where}" if where else "")
                   + ("；注意不加 --where 时不可行的程序也会参与比较" if not where else ""))
                 return EMPTY
             print(json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True))
-            c(f"best({args.best}) → " + brief(rec, keys))
+            c(f"best({args.best}, {'最小' if direction else '最大'}) → " + brief(rec, keys))
             if not where:
                 c("提示：未加 --where，选出的可能是不可行的程序（数字最小不等于最好）")
             return PASS
