@@ -162,6 +162,7 @@ class Conjecture(TypedDict, total=False):
     known_bounds: list[dict[str, Any]]
     counterexamples: list[dict[str, Any]]
     human_confirmations: list[dict[str, Any]]
+    evidence: dict[str, Any]
     source: Source
     status: str
 
@@ -220,6 +221,13 @@ def load_evidence(path: str | None, *, required_level: str | None = None,
                 f"（`none` / `UNKNOWN` / `NOT VERIFIED` / `sorry_ax` 都属此列）")
     # 种类与方向：这份证据讲的是哪一类事实
     kind = rec.get("kind")
+    # 种类必须是**已知**的：未知或缺失的 kind 会让「按种类必填绑定」的集合变成空集，
+    # 于是一份只写了 schema+verdict 的 JSON 也能升档（实测复现过）。
+    if kind is None or kind not in KIND_REQUIRED_BINDINGS:
+        raise LedgerError(
+            f"证据记录的 kind 是 {kind!r}，不是已知的证据种类 "
+            f"{sorted(KIND_REQUIRED_BINDINGS)}{who}。缺失或未知的种类无法确定该要求"
+            f"哪些绑定字段——那正是「随便写个文件」能升档的原因。")
     if expect_kind is not None and kind != expect_kind:
         raise LedgerError(
             f"证据的种类是 {kind!r}，而这个结论需要 {expect_kind!r}{who}。"
@@ -405,6 +413,97 @@ def _parse_range(spec: str) -> tuple[int, int]:
     return lo, hi
 
 
+def validate_record(rec: Conjecture, *, evidence_path: str | None = None) -> list[str]:
+    """检查**修改后的完整记录**是否自洽。返回违规列表，空列表表示合格。
+
+    为什么校验的对象是「记录」而不是「这次传了哪些参数」：这一轮审阅的教训是
+    **检查绑定在某些参数上，而不是修改后的记录上**，于是每个没传参数的入口都成了一个
+    缺口——实测三条：
+
+    * 只改 `verified_range`（不给新证据）→ 范围扩了 10 万倍，`exact_certificate` 原样保留；
+    * 只升档 + 一份 `{{"schema", "verdict"}}` 的最小 JSON → 因为缺少 `kind`，必填绑定
+      集合是空的，于是「随便写个文件」也能升到 `lean_checked`；
+    * 追加反例时给一份**别的**见证的证据 → 那个无关文件照样被标成 `verified_by=independent`。
+
+    逐条给命令参数补条件的做法会一直漏（每加一个参数就多一个入口）。所以改成一次成型：
+    **先把改动全部应用到一个副本上，再检查整个副本**，不自洽就整笔拒绝、一个字段都不写。
+
+    记录自带它的依据：`rec["evidence"]` 记着当前这次结论所依据的那份证据（路径、哈希、
+    种类、对象、范围）。于是「换范围不换证据」「换形式化目标不换证据」这类改动一望即知。
+    """
+    why: list[str] = []
+    pending = str(rec.get("formal_status", "open"))
+    want_kind, want_verdict = CONCLUSION_EVIDENCE.get(pending, (None, None))
+    ev = rec.get("evidence")
+    humans = rec.get("human_confirmations") or []
+    human_level = any(h.get("what", "").startswith("verification_level") for h in humans)
+
+    if want_kind is None:
+        # 结论不声称任何事实 → 档位不该虚高
+        lvl = rec.get("verification_level", "empirical")
+        if lvl != "empirical" and not (lvl == HUMAN_LEVEL and human_level):
+            why.append(f"结论是 {pending!r}（不声称任何事实），档位却是 {lvl!r}"
+                       f"——没有依据的档位")
+        return why
+
+    if not isinstance(ev, dict) or not ev:
+        why.append(f"结论是 {pending!r}，但记录里**没有**它所依据的证据"
+                   f"（改范围、改形式化目标、改结论都会走到这里）")
+        return why
+    if ev.get("kind") != want_kind:
+        why.append(f"依据的证据种类是 {ev.get('kind')!r}，而结论 {pending!r} 需要 "
+                   f"{want_kind!r}")
+    if ev.get("verdict") != want_verdict:
+        why.append(f"依据的证据判决是 {ev.get('verdict')!r}，而结论 {pending!r} 需要 "
+                   f"{want_verdict!r}")
+    if ev.get("subject") != rec.get("id"):
+        why.append(f"依据的证据 subject 是 {ev.get('subject')!r}，而这条记录的 id 是 "
+                   f"{rec.get('id')!r}")
+    # 范围：结论里那句「某范围内」必须与证据里记的完全一致
+    if pending == "no_counterexample_in_range":
+        vr = rec.get("verified_range") or {}
+        if vr.get("lo") is None or vr.get("hi") is None:
+            why.append("no_counterexample_in_range 必须带 verified_range")
+        else:
+            want = f"{vr['lo']}..{vr['hi']}"
+            if str(ev.get("range") or "") != want:
+                why.append(f"范围（range）是 {want!r}，而依据的证据记的是 "
+                           f"{ev.get('range')!r}——范围与证据不一致时，"
+                           f"「该范围内没有反例」无法核对")
+    # 形式化目标：被证明的对象变了，原来的证据就不再是它的依据
+    if pending == "proved":
+        sf = rec.get("statement_formal") or {}
+        if sf.get("file") and ev.get("file") and sf["file"] != ev["file"]:
+            why.append(f"形式化目标是 {sf['file']!r}，而依据的证据审的是 {ev['file']!r}")
+    # 档位：不能高于该结论 + 该证据支持到的档位
+    supported = CONCLUSION_LEVEL.get(pending, "empirical")
+    lvl = rec.get("verification_level", "empirical")
+    ok_levels = {supported, "empirical"}
+    if human_level:
+        ok_levels.add(HUMAN_LEVEL)
+    if lvl not in ok_levels:
+        why.append(f"档位是 {lvl!r}，而这个结论 + 这份证据只支持 "
+                   f"{sorted(ok_levels)}")
+    # 反例：被标成独立复核的，必须**自己说得清依据**——引用哪份证据、验证的是哪份见证。
+    # 这里刻意**不**要求它引用的就是当前结论依据的那份证据：一个猜想可以「在 1..1000
+    # 内没有反例」同时「另有一个从别处独立复核过的反例」，两件事各有各的证据。
+    for c in rec.get("counterexamples") or []:
+        if c.get("verified_by") != "independent":
+            continue
+        if not c.get("evidence_sha256"):
+            why.append(f"反例 {str(c.get('witness'))[:40]!r} 声称独立复核，却没有记下"
+                       f"所依据证据的哈希——一次没有artifact的复核")
+            continue
+        vw = c.get("verified_witness")
+        if not vw:
+            why.append(f"反例 {str(c.get('witness'))[:40]!r} 声称独立复核，却没记下"
+                       f"被验证的是哪份见证")
+        elif str(vw) != str(c.get("witness")):
+            why.append(f"反例写的是 {c.get('witness')!r}，复核章却来自见证 {vw!r}"
+                       f"——章盖在了另一份见证上")
+    return why
+
+
 def apply_changes(rec: Conjecture, *, evidence: str | None = None,
                   run_id: str | None = None,
                   formal_status: str | None = None,
@@ -420,162 +519,168 @@ def apply_changes(rec: Conjecture, *, evidence: str | None = None,
                   confirmed_by: str | None = None,
                   confirmation_note: str | None = None,
                   ) -> tuple[Conjecture, list[str]]:
-    """把一批改动应用到记录上，返回 (记录, 警告列表)。
+    """把一批改动**事务式**地应用到记录上：构造 → 校验 → 写入。
 
-    两级硬规则，都由代码拦而不是靠提示词劝：
+    顺序是这次重构的全部要点：先在副本上把改动全部应用完，再检查**修改后的完整记录**
+    是否自洽（`validate_record`），不合格就整笔拒绝、一个字段都不写。这样每个入口
+    （改范围、改形式化目标、加反例、单独升档）都自动被同一套检查覆盖，不需要逐个
+    为参数补条件——**这一轮审阅的三条缺口正是从那里来的**。
 
-    1. **任何状态变更都必须带 evidence 指针**，否则抛 `LedgerError`。
-    2. **档位不能没有依据地升**：升到 `exact_certificate` / `lean_checked` 时，
-       指针必须指向一份判决支撑该档位的结构化证据记录（见 `load_evidence`）；
-       升到 `human_peer_reviewed`、或写 `faithfulness_checked`，必须带
-       `--confirmed-by`（见 `require_human`）。
-
-    可容忍的情形（反例缺证据、证据不足）走警告：**记下来，但记成 UNVERIFIED**，
-    不拒收——台账的价值之一是留住「试过但没成」的事实。拒收与降级是两件事。
+    仍然保留的两条硬规则：状态变更必须带 evidence 指针；人工确认项必须签字。
     """
+    import copy
+
     if (formal_status or informal_status) and not evidence:
         raise LedgerError(
             "拒绝写入：状态变更必须带 --evidence <指针>。"
             "没有证据指针的状态变更正是本项目要防的自欺。")
 
+    # == 这次改动是否**在主张一个事实** ==
+    #
+    # 主张事实时证据读不出来就必须拒；只是给反例附一份证书时，证据读不出来按
+    # UNVERIFIED 降级。**「拒收」与「降级」是两件事**：台账的价值之一是留住
+    # 「试过但没成」的事实，所以反例缺证据不该被拒之门外。
+    #
+    # 实测踩到（回归第 129 项）：把这一层写成「只要给了 evidence 就先读」之后，
+    # `--add-counterexample n=99 --evidence 随便一个字符串` 从「记 UNVERIFIED + 警告」
+    # 变成了硬拒收——正好把降级路径删掉了。
+    claims_fact = bool(formal_status or informal_status
+                       or (verification_level and verification_level != "empirical"))
     warnings: list[str] = []
-    # 先验证据，再落字段：验不过就什么都不改，避免半个变更留在记录里。
+    cand: Conjecture = copy.deepcopy(rec)
     ev: Evidence | None = None
-    if verification_level:
-        if verification_level not in LEVELS:
-            raise LedgerError(f"非法 verification_level，允许：{', '.join(LEVELS)}")
+    ev_ref: dict[str, Any] | None = None
+    if evidence:
+        try:
+            ev = load_evidence(evidence, subject=cand.get("id"))
+        except LedgerError as exc:
+            if claims_fact:
+                raise
+            warnings.append(
+                f"证据指针 {evidence!r} 读不出可用记录，而这次改动不主张事实，"
+                f"按 UNVERIFIED 记下而不是拒收：{exc}")
+        if ev is not None:
+            ev_ref = {"path": ev.path, "sha256": ev.sha256, "kind": ev.kind,
+                      "subject": ev.record.get("subject"), "verdict": ev.verdict,
+                      "range": ev.record.get("range"), "file": ev.record.get("file"),
+                      "witness": ev.record.get("witness"), "at": now_iso()}
     if formal_status:
         if formal_status not in FORMAL_STATUSES:
             raise LedgerError(f"非法 formal_status，允许：{', '.join(FORMAL_STATUSES)}")
-
-    # == 每次改结论都重新校验证据 ==
-    #
-    # 上一版只在**显式传 --verification-level** 时才验证据，于是「改结论 + 一个不存在的
-    # 证据路径」拿得到退出码 0，而旧的高档位（exact_certificate）**原样保留**——
-    # 换了个结论，徽章没换。所以这里把「改结论」本身当成一次重新校验：
-    # 证据必须支持**新结论的方向**，档位由此**重新定**，而不是继承。
-    #
-    # 触发条件是**显式改结论**（传了 `--formal-status`），不是「任何一次 set」：
-    # 加一个反例、写一次 formalization_status 都不改变已经成立的那个结论，
-    # 不该因此把记录打回原形（实测踩到：加反例与写签字都被这条误拦）。
-    pending = formal_status if formal_status else None
-    want_kind, want_verdict = CONCLUSION_EVIDENCE.get(str(pending), (None, None))
-    level_from_evidence: str | None = None
-    if formal_status and want_kind is not None:
-        want_range = None
-        if pending == "no_counterexample_in_range":
-            # 范围必须一起核：只说「某范围内没有反例」而不说范围，等于什么都没说。
-            if verified_range:
-                lo, hi = _parse_range(verified_range)
-                want_range = f"{lo}..{hi}"
-            else:
-                existing = rec.get("verified_range") or {}
-                if existing.get("lo") is not None:
-                    want_range = f"{existing['lo']}..{existing['hi']}"
-            if want_range is None:
-                raise LedgerError(
-                    "登记 no_counterexample_in_range 必须带 --verified-range："
-                    "「没找到」只在说清在哪个范围内时才有意义")
-        ev = load_evidence(evidence, required_level="exact_certificate"
-                           if want_kind != "lean_audit" else "lean_checked",
-                           subject=rec.get("id"), expect_kind=want_kind,
-                           expect_range=want_range, expect_subject=rec.get("id"))
-        if ev.verdict != want_verdict:
-            raise LedgerError(
-                f"证据的判决是 {ev.verdict!r}，不足以支撑结论 {pending!r}"
-                f"（需要 {want_verdict!r}）")
-        level_from_evidence = CONCLUSION_LEVEL.get(str(pending))
-
-    if formal_status:
-        _touch(rec, "formal_status", rec.get("formal_status"), formal_status,
+        _touch(cand, "formal_status", cand.get("formal_status"), formal_status,
                evidence=evidence, run_id=run_id,
                evidence_sha256=ev.sha256 if ev else None)
-        rec["formal_status"] = formal_status
-        # 档位**重新定**，不继承。证据支持到哪一档就是哪一档；没证据就是 empirical。
-        # 这一步是「换结论不换徽章」那个 bug 的正面修法。
-        new_level = level_from_evidence or "empirical"
-        if rec.get("verification_level") != new_level:
-            _touch(rec, "verification_level", rec.get("verification_level"), new_level,
-                   evidence=evidence, run_id=run_id,
-                   evidence_sha256=ev.sha256 if ev else None)
-            rec["verification_level"] = new_level
-            warnings.append(
-                f"结论改成 {formal_status!r} 后，档位按新证据重新定为 {new_level!r}"
-                f"（不再继承旧档位）")
+        cand["formal_status"] = formal_status
     if informal_status:
         if informal_status not in STATUSES:
             raise LedgerError(f"非法 informal_status，允许：{', '.join(STATUSES)}")
-        _touch(rec, "informal_status", rec.get("informal_status"), informal_status,
+        _touch(cand, "informal_status", cand.get("informal_status"), informal_status,
                evidence=evidence, run_id=run_id,
                evidence_sha256=ev.sha256 if ev else None)
-        rec["informal_status"] = informal_status
+        cand["informal_status"] = informal_status
 
     if formalization_status:
         if formalization_status not in FORMALIZATION:
             raise LedgerError(f"非法 formalization_status，允许：{', '.join(FORMALIZATION)}")
         if formalization_status == HUMAN_FORMALIZATION:
-            # 人工确认单独建模：不进 history 的证据列，进 human_confirmations
             conf = require_human(confirmed_by, f"formalization_status={HUMAN_FORMALIZATION}")
             if confirmation_note:
                 conf["note"] = confirmation_note
-            rec.setdefault("human_confirmations", []).append(conf)
-        _touch(rec, "formalization_status", rec.get("formalization_status"),
+            cand.setdefault("human_confirmations", []).append(conf)
+        _touch(cand, "formalization_status", cand.get("formalization_status"),
                formalization_status, evidence=evidence, run_id=run_id)
-        rec["formalization_status"] = formalization_status
+        cand["formalization_status"] = formalization_status
 
     if statement_formal:
-        rec["statement_formal"] = {"file": statement_formal, "decl": decl}
+        cand["statement_formal"] = {"file": statement_formal, "decl": decl}
 
     if verified_range:
         lo, hi = _parse_range(verified_range)
-        rec["verified_range"] = {"lo": lo, "hi": hi,
-                                 "method": method or "unknown",
-                                 "run_id": run_id,
-                                 "statement": "仅在该有限域内无反例"}
+        cand["verified_range"] = {"lo": lo, "hi": hi,
+                                  "method": method or "unknown",
+                                  "run_id": run_id,
+                                  "statement": "仅在该有限域内无反例"}
 
     for spec in add_bound or []:
         claim, _, rest = spec.partition("=")
         value, _, src = rest.partition("@")
-        rec.setdefault("known_bounds", []).append(
+        cand.setdefault("known_bounds", []).append(
             {"claim": claim, "value": value, "source": src or None})
 
     for witness in add_counterexample or []:
-        # 反例的「独立复核」必须由证据支撑。以前只要 evidence 非空就写 independent，
-        # 于是随便一个字符串就能给反例盖上一个复核章——那是直接伪造复核。
+        # 反例的「独立复核」必须由证据支撑，**而且必须就是这份证据验证过的那个见证**。
+        # 以前只要 evidence 非空就写 independent，于是随便一个字符串、甚至一个无关的
+        # 文件路径都能拿到复核标记——那是直接伪造复核。
+        #
+        # 见证身份**一律按字符串比对**，不给「不是路径所以没法比」留豁免：豁免就等于
+        # 「换一个写法的见证名就能把章挪走」。证据里没记 witness 时也无从比对，
+        # 同样记 UNVERIFIED——**没有绑定关系就不该有章**。
         entry: dict[str, Any] = {"witness": witness, "certificate": evidence,
                                  "recorded_at": now_iso()}
-        if evidence:
-            try:
-                ev2 = load_evidence(evidence, required_level="exact_certificate",
-                                    subject=rec.get("id"))
-            except LedgerError as exc:
-                entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
-                warnings.append(f"反例 {witness!r} 的证据不足以支撑独立复核，"
-                                f"记为 UNVERIFIED：{exc}")
-            else:
-                entry |= {"verified_by": "independent",
-                          "verification_level": "exact_certificate",
-                          "evidence_sha256": ev2.sha256}
-        else:
+        if ev is None:
             entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
-            warnings.append(f"反例 {witness!r} 没有证书指针，请补 --evidence")
-        rec.setdefault("counterexamples", []).append(entry)
+            warnings.append(f"反例 {witness!r} 没有可用的证书指针，请补 --evidence")
+        elif ev.kind != "witness_eval":
+            entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
+            warnings.append(
+                f"反例 {witness!r} 的证据种类是 {ev.kind!r}，不是 witness_eval，"
+                f"记为 UNVERIFIED")
+        elif not ev.record.get("witness"):
+            entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
+            warnings.append(
+                f"证据 {ev.path!r} 里没有 witness 字段，无从确认它验证的是哪份见证，"
+                f"反例 {witness!r} 记为 UNVERIFIED")
+        elif str(ev.record.get("witness")) != str(witness):
+            entry |= {"verified_by": "UNVERIFIED", "verification_level": "empirical"}
+            warnings.append(
+                f"反例写的是 {witness!r}，而这份证据验证的是 "
+                f"{ev.record.get('witness')!r}——验证的是哪份见证，就只能给那份见证"
+                f"加复核标记，记为 UNVERIFIED")
+        else:
+            entry |= {"verified_by": "independent",
+                      "verification_level": "exact_certificate",
+                      "evidence_sha256": ev.sha256,
+                      "verified_witness": ev.record.get("witness")}
+        cand.setdefault("counterexamples", []).append(entry)
 
     if verification_level:
+        if verification_level not in LEVELS:
+            raise LedgerError(f"非法 verification_level，允许：{', '.join(LEVELS)}")
         if verification_level == HUMAN_LEVEL:
             conf = require_human(confirmed_by, f"verification_level={HUMAN_LEVEL}")
             if confirmation_note:
                 conf["note"] = confirmation_note
-            rec.setdefault("human_confirmations", []).append(conf)
-        elif verification_level != "empirical":
-            # 显式升档：证据要支撑得住。这里与上面的「结论驱动」是两条路，
-            # 但用的是同一套证据校验。
-            ev2 = load_evidence(evidence, required_level=verification_level,
-                                subject=rec.get("id"))
-            ev = ev2
-        _touch(rec, "verification_level", rec.get("verification_level"),
+            cand.setdefault("human_confirmations", []).append(conf)
+        _touch(cand, "verification_level", cand.get("verification_level"),
                verification_level, evidence=evidence, run_id=run_id,
                evidence_sha256=ev.sha256 if ev else None)
-        rec["verification_level"] = verification_level
+        cand["verification_level"] = verification_level
+    elif formal_status:
+        # 结论变了而没显式给档位：按新证据重新定，**不继承**旧档位
+        new_level = CONCLUSION_LEVEL.get(formal_status) if ev is not None else None
+        new_level = new_level or "empirical"
+        if cand.get("verification_level") != new_level:
+            _touch(cand, "verification_level", cand.get("verification_level"), new_level,
+                   evidence=evidence, run_id=run_id,
+                   evidence_sha256=ev.sha256 if ev else None)
+            cand["verification_level"] = new_level
+            warnings.append(f"结论改成 {formal_status!r} 后，档位按新证据重新定为 "
+                            f"{new_level!r}（不再继承旧档位）")
 
-    return rec, warnings
+    # == 记录的依据只在**重新确立结论**时改 ==
+    #
+    # `--evidence` 这一个开关身兼两职：既可能是「我改的这个结论依据它」，也可能只是
+    # 「这个反例的证书是它」。后者不该把已有结论的依据换掉——换了之后
+    # `validate_record` 会发现「结论是 no_counterexample_in_range，而依据的是
+    # 一份 witness_eval」，于是把一次合法的加反例拒之门外（实测踩到）。
+    # 反例的证书记在它自己的条目里（`certificate` / `evidence_sha256`），不抢这个位置。
+    if ev_ref is not None and claims_fact:
+        cand["evidence"] = ev_ref          # 记录自带它的依据
+
+    problems = validate_record(cand, evidence_path=ev.path if ev else None)
+    if problems:
+        raise LedgerError("拒绝写入：修改后的记录不自洽——\n  - " + "\n  - ".join(problems))
+
+    # 返回**新记录**而不是原地改：调用方本来就是 `rec, _ = apply_changes(rec, ...)`
+    # 重新绑定，而 `TypedDict` 上没有 `clear()`。
+    return cand, warnings
