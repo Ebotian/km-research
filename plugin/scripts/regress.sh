@@ -214,7 +214,75 @@ if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
 
-# ---------------------------------------------------------------- 编码
+# ---------------------------------------------------------------- 沙箱（功能性）
+# 「存在性不等于可用」在这里第四次应验：实测 `systemd-run -p IPAddressDeny=any`
+# **退出 0、不报错、不禁网**（根因是本机 cgroup 没有 bpf 控制器）。只查
+# `command -v` 的探测会把它记成可用，然后 M4 的「禁网生效」那一格就是假章。
+#
+# 所以这一组验两件事：探测的**结论**与实测一致；探测对「隔离与否」**敏感**。
+# 后者靠变异检查——把 --unshare-net 去掉，探测必须改口说「没隔离」。
+echo "sandbox —— 功能性探测（存在性不等于可用）"
+net_ok=0
+if python3 -c "
+import socket, sys
+try:
+    socket.create_connection(('1.1.1.1', 443), timeout=4); sys.exit(0)
+except OSError:
+    sys.exit(1)" 2>/dev/null; then net_ok=1; fi
+if [ "$net_ok" != 1 ]; then
+  # 本机出不去网时，「沙箱里连不出去」什么都证明不了——那一格只能报 null。
+  # 按纪律计入 skip，不算通过。
+  skip=$((skip + 1))
+  printf '  skip  %-46s 本机出不去网，禁网结论无从判定\n' "沙箱探测"
+else
+  chk "禁网/限额结论如实且对隔离敏感" 0 python3 -c "
+import os, shutil, subprocess, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_sandbox as sb
+from opl_probe import probe_sandbox
+
+py = sys.executable
+why = []
+
+# ---- 甲：探测结论必须与实测一致，且**不许把不禁网报成禁网** ----
+p = probe_sandbox(timeout=20)
+if not (p.get('net_control') or {}).get('connected'):
+    why.append('对照都连不出去，不该走到这一支')
+bw = p.get('bwrap_net_off') or {}
+if bw.get('isolated') is not True:
+    why.append('bwrap --unshare-net 未报禁网生效：%r' % (bw,))
+sd = p.get('systemd_ipaddressdeny_isolated') or {}
+if sd.get('isolated') is not False:
+    why.append('IPAddressDeny 被报成 %r —— 实测它不禁网，报 true 就是盖假章'
+               % (sd.get('isolated'),))
+mem = p.get('mem_limit_fires') or {}
+if not (mem.get('MemoryMax + MemorySwapMax=0') or {}).get('killed'):
+    why.append('MemoryMax+SwapMax=0 没能杀掉超标进程：%r'
+               % (mem.get('MemoryMax + MemorySwapMax=0'),))
+if (mem.get('MemoryMax only') or {}).get('killed'):
+    why.append('只设 MemoryMax 竟然也杀了——与本机实测不符，先查 swap 是否被关掉了')
+
+# ---- 乙：变异检查。去掉 --unshare-net，探测必须改口 ----
+d = tempfile.mkdtemp(prefix='opl-sbxtest.')
+try:
+    rc_up = subprocess.run(sb.bwrap_argv(py, sb.NET_PROBE, workdir=d, net_off=False),
+                           capture_output=True, timeout=25).returncode
+    if rc_up != 0:
+        why.append('去掉 --unshare-net 后仍连不出去（rc=%r）：探测对隔离与否不敏感，'
+                   '等于没测' % rc_up)
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+
+# ---- 丙：内存 payload 本身得真会写成功，否则「被杀」不能归因于限额 ----
+free = subprocess.run([py, '-c', sb.mem_probe_mb(32)], capture_output=True, timeout=40)
+if free.returncode != 0 or b'WROTE' not in free.stdout:
+    why.append('无限制下内存 payload 都没写成功（rc=%r）：那「被杀」说明不了限额生效'
+               % free.returncode)
+
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+fi
 echo "encode —— 规格到模型，双后端互相证伪"
 chk "纯编码到 CNF（不需求解器）" 0 $BIN/opl-encode --spec $FIX/spec-pc43.json --to cnf --out "$work/e.cnf"
 chk "见证成立"                0 $BIN/opl-encode --spec $FIX/spec-pc23.json --eval-witness $FIX/spec-pc23-witness.json

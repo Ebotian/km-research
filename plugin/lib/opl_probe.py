@@ -40,11 +40,15 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from typing import Any
 
 from opl_common import find_tool, plugin_root, run
+import opl_sandbox as sandbox
 # 「向上找 lean-toolchain」是 Lean 的定制规则（找的是哪个文件名、找到了算什么），
 # 所以它住在 opl_lean 里。这里借用而不是复制一份——两份实现必然会分叉，
 # 而分叉的后果是「opl-capabilities 说有定点、opl-leancheck 说没有」。
@@ -323,6 +327,106 @@ def probe_lean_project(timeout: float = 30.0) -> dict[str, Any]:
     return info
 
 
+# ------------------------------------------------------------------ 沙箱
+
+
+def _run_rc(argv: list[str], timeout: float) -> tuple[int | None, str]:
+    rc, out, err = run(argv, timeout=timeout)
+    tail = (err or out).decode("utf-8", "replace").strip().splitlines()
+    return rc, (tail[-1][:140] if tail else "")
+
+
+def probe_sandbox(timeout: float = 20.0) -> dict[str, Any]:
+    """**功能性**探测沙箱：不问版本，问它到底管不管用。
+
+    为什么不能只查存在性（本模块的第三条要求在这里又应验一次）：实测
+    `systemd-run --user --scope -p IPAddressDeny=any` **退出 0、不报错、不禁网**。
+    一个只查 `command -v systemd-run` 的探测会把它记成可用，然后 M4 的验收就会在
+    「禁网生效」那一格上盖一个假章。所以这里让每种后端**当场做一次**它该做的事。
+
+    三条都必须带**对照**才算数：连本机本来就出不去网时，「沙箱里连不出去」什么都
+    证明不了——那种情形只能报 `null`（测不出），不能报 `true`。
+    """
+    py = sys.executable or "python3"
+    d = tempfile.mkdtemp(prefix="opl-sbxprobe.")
+    res: dict[str, Any] = {"schema": "opl.sandbox-probe/1", "workdir": d}
+    try:
+        # 对照：不套沙箱时能不能连出去。连不出去说明本机没网，后面两条一并作废。
+        ctl_rc, ctl_msg = _run_rc([py, "-c", sandbox.NET_PROBE], timeout)
+        net_ctl = ctl_rc == 0
+        res["net_control"] = {
+            "connected": net_ctl, "exit": ctl_rc,
+            "note": None if net_ctl else "本机本来就出不去网：下面两条测不出隔离是否生效",
+        }
+
+        def net_verdict(rc: int | None) -> bool | None:
+            if not net_ctl:
+                return None
+            if rc is None:
+                return None
+            return rc != 0
+
+        # bwrap --unshare-net（预期：真的禁网）
+        bw_rc, bw_msg = _run_rc(
+            sandbox.bwrap_argv(py, sandbox.NET_PROBE, workdir=d), timeout)
+        res["bwrap_net_off"] = {"isolated": net_verdict(bw_rc), "exit": bw_rc,
+                                "detail": bw_msg}
+
+        # systemd-run + IPAddressDeny（预期：**不禁网**——如实记下来，别当成可用）
+        sd_rc, sd_msg = _run_rc(
+            [sandbox.SYSTEMD_RUN, "--user", "--scope", "--quiet",
+             "-p", "IPAddressDeny=any", py, "-c", sandbox.NET_PROBE], timeout)
+        res["systemd_ipaddressdeny_isolated"] = {
+            "isolated": net_verdict(sd_rc), "exit": sd_rc, "detail": sd_msg,
+            "note": "实测本机不禁网且不报错：IPAddressDeny 需要 cgroup 的 bpf 控制器",
+        }
+        # 根因也给出来，省得下一个人再查一遍
+        ctl_files = ["/sys/fs/cgroup/cgroup.controllers",
+                     f"/sys/fs/cgroup/user.slice/user-{os.getuid()}.slice/cgroup.controllers"]
+        controllers: dict[str, list[str] | None] = {}
+        for f in ctl_files:
+            try:
+                controllers[f] = open(f, encoding="utf-8").read().split()
+            except OSError:
+                controllers[f] = None
+        res["cgroup_controllers"] = controllers
+
+        # 内存限额：两个属性一起下才开火；只下 MemoryMax 是装饰
+        per_run = min(64, max(8, int(_mem_available_mb() / 8)))
+        mb = per_run * 3
+        mem_payload = sandbox.mem_probe_mb(mb)
+        def mem_case(swap_zero: bool) -> dict[str, Any]:
+            unit = f"opl-probe-mem-{os.getpid()}-{'z' if swap_zero else 'n'}.scope"
+            argv = sandbox.scope_argv(
+                [py, "-c", mem_payload], unit=unit, mem_max_mb=per_run,
+                swap_max_mb=0 if swap_zero else 1024 * 1024)
+            rc, msg = _run_rc(argv, timeout)
+            subprocess.run(sandbox.stop_unit_argv(unit), capture_output=True)
+            # 被杀（负退出码 / 137）才算限额开火；退出 0 说明它写完了，限额没用
+            return {"exit": rc, "killed": rc is not None and rc != 0, "detail": msg}
+
+        res["mem_limit_fires"] = {
+            "MemoryMax + MemorySwapMax=0": mem_case(True),
+            "MemoryMax only": mem_case(False),
+            "caps_mb": per_run, "payload_mb": mb,
+            "note": "只设 MemoryMax 时 8 GB swap 会吸收匿名页，限额变成装饰",
+        }
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    return res
+
+
+def _mem_available_mb() -> float:
+    """本机可用内存（MB）。探测用的 payload 大小按它取比例，不写死数字。"""
+    try:
+        for line in open("/proc/meminfo", encoding="utf-8"):
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return 4096.0
+
+
 # ------------------------------------------------------------------ 解释器
 
 
@@ -426,6 +530,25 @@ def build_snapshot(*, layers: list[str] | None = None,
         log.append(f"{'decompress':<16} {'proof':<10} "
                    f"{info.get('functional', info.get('error'))}")
 
+    # 沙箱层：版本探测只说明「装没装」，这里**当场让它做一次该做的事**。实测
+    # `systemd-run -p IPAddressDeny=any` 退出 0、不报错、不禁网——只查存在性的探测
+    # 会给它盖一个假章，然后 M4 的「禁网生效」那一格就是假的。
+    sandbox_probe: dict[str, Any] | None = None
+    if "sandbox" in wanted:
+        sandbox_probe = probe_sandbox(timeout)
+        bw = sandbox_probe.get("bwrap_net_off") or {}
+        sd = sandbox_probe.get("systemd_ipaddressdeny_isolated") or {}
+        mem = (sandbox_probe.get("mem_limit_fires") or {})
+        log.append(f"{'bwrap-net':<16} {'sandbox':<10} "
+                   f"{'禁网生效' if bw.get('isolated') else '禁网未生效/测不出'}")
+        log.append(f"{'ipaddressdeny':<16} {'sandbox':<10} "
+                   f"{'禁网生效' if sd.get('isolated') else '不禁网（如实记录，勿当可用）'}")
+        log.append(f"{'cgroup-mem':<16} {'sandbox':<10} "
+                   f"caps={mem.get('caps_mb')}M "
+                   f"{'限额开火' if (mem.get('MemoryMax + MemorySwapMax=0') or {}).get('killed') else '限额未开火'}"
+                   f" / 只设 MemoryMax："
+                   f"{'也开火' if (mem.get('MemoryMax only') or {}).get('killed') else '不开火'}")
+
     # Lean 层的可用性由*项目上下文*决定，而不是由任意 cwd 下的 `lean --version`
     # 决定：只有定点了 toolchain 的目录里才不会联网。
     lean_project = probe_lean_project(python_timeout)
@@ -483,6 +606,7 @@ def build_snapshot(*, layers: list[str] | None = None,
         "probe_ms": int((time.monotonic() - t0) * 1000),
         "tools": tools,
         "lean_project": lean_project,
+        "sandbox_probe": sandbox_probe,
         "interpreters": interpreters,
         "py_layers": py_layers,
         "required_missing": required_missing,
