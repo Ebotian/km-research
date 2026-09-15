@@ -110,6 +110,10 @@ def main() -> int:
     ap.add_argument("--allow-net", action="store_true")
     ap.add_argument("--no-sandbox", action="store_true")
     ap.add_argument("--deep-capabilities", action="store_true")
+    ap.add_argument("--ro-bind", action="append", default=None, metavar="HOST[:SANDBOX]",
+                    help="把一个文件/目录以**只读**方式挂进沙箱（可重复）。"
+                         "用来递入可信的东西（评估器、冻结定义）而不暴露整个工作目录；"
+                         "不写 SANDBOX 时挂到同路径")
     ap.add_argument("--detach", action="store_true",
                     help="派发到后台，写 runs/<id>/status.json")
     ap.add_argument("--wait", action="store_true",
@@ -136,10 +140,18 @@ def main() -> int:
     runner_dir = os.path.join(runs_dir, run_id)
     os.makedirs(runner_dir, exist_ok=True)
 
+    ro_binds = []
+    for spec_txt in (args.ro_bind or []):
+        host, _, sandbox_path = spec_txt.partition(":")
+        host = os.path.abspath(host)
+        if not os.path.exists(host):
+            c(f"--ro-bind 的源不存在：{host}")
+            return USAGE
+        ro_binds.append((host, sandbox_path or host))
     spec = RunSpec(argv=cmd, workdir=workdir, run_id=run_id, runner_dir=runner_dir,
                    timeout=args.timeout, mem_max_mb=args.mem_mb,
                    pids_max=args.pids_max, net_off=not args.allow_net,
-                   sandboxed=not args.no_sandbox)
+                   sandboxed=not args.no_sandbox, ro_binds=ro_binds)
 
     if args.wait:
         # 只读轮询，**绝不重跑**——幂等的全部含义在这里。

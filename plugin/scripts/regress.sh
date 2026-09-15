@@ -522,13 +522,36 @@ chk "还在跑时 wait -> 3（不是失败）" 3 $BIN/opl-run --runs-dir "$R" --
 chk "W2 终态随后可取到"           0 $BIN/opl-run --runs-dir "$R" --id W2 --wait --wait-timeout 30
 # ---------------------------------------------------------------- 排序网络夹具
 # 判据 7 的地基：玩具问题本身要成立——评估器确定性、骨架与最优之间有**真实余量**。
-# 这里不验「改进能不能跑出来」（那是判据 7 本体），只验评估器的判决有依据：
-# 判「排序成立」要给出查了多少个输入，判「不排序」要给出反例。
-echo "opl-evolve 夹具与约束（排序网络 + EVOLVE-BLOCK + code_hash）"
-mkdir -p "$work/sn"
+# 评估器是**两阶段**的：`extract` 跑候选只产出数据，`verify` 读数据独立判定。
+# 所以下面每条用例都跑两次，断言取 `verify` 那一次（判决在它手里）。
+echo "opl-evolve 夹具与约束（排序网络 + 两阶段评估器 + EVOLVE-BLOCK + code_hash）"
+SNF="$FIX/sortnet"          # 后面几组也用它；定义提前到第一次使用之前
+
+# 单阶段评估器（老写法）：插件要求两阶段协议，**必须明确拒绝**，而不是把它误报成
+# 「候选被拒」——不合规的评估器收到 `extract` 时 argparse 会以 2 结束，而那正是
+# 「候选不可用」的约定码。靠退出码推测就会指错方向。
+cat > "$work/single_stage_ev.py" <<'PYEOF'
+import argparse, json, sys
+ap = argparse.ArgumentParser()
+ap.add_argument("--candidate", required=True)
+ap.add_argument("--problem", required=True)
+ap.add_argument("--metrics-out")
+a = ap.parse_args()
+ns = {}
+exec(compile(open(a.candidate).read(), a.candidate, "exec"), ns)
+m = {"schema": "opl.evolve.metrics/1", "sorts": True, "comparators": 6,
+     "zero_one_inputs_checked": 16}
+if a.metrics_out:
+    json.dump(m, open(a.metrics_out, "w"))
+sys.exit(0)
+PYEOF
+
+
+
+mkdir -p "$work/sn/work"
 cp "$FIX/sortnet/evaluator.py" "$FIX/sortnet/skeleton.py" \
    "$FIX/sortnet/candidate-opt5.py" "$FIX/sortnet/problem.json" "$work/sn/"
-# 负样本现造：少一个比较器（不排序）、比较器越界（候选本身不可用）
+# 负样本现造：少一个比较器（不排序）、比较器越界（数据不合规）
 cat > "$work/sn/broken.py" <<'EOF'
 N = 4
 def build_network():
@@ -539,114 +562,153 @@ N = 4
 def build_network():
     return [(0, 4)]
 EOF
-EV=("$BIN/opl-run" --runs-dir "$R" --timeout 30 --workdir "$work/sn" --
-    /usr/bin/python3 /work/evaluator.py --metrics-out /work/EV-M.json)
-# `--` 之后的一切都属于 payload，所以 run 的选项（--id）必须写在 `--` **之前**。
-# （第一版把 --id 写进了数组末尾，于是它被当成评估器的参数，argparse 报错退出 2，
-#   opl-run 报 1——三条用例一起红，正是回归该有的反应。）
-# 评估器现在**必须**拿到冻结定义（`--problem`）：题目参数由它给出，不由候选说了算。
-sn_eval() {  # $1=run id  $2=候选文件名
-  "$BIN/opl-run" --runs-dir "$R" --id "$1" --timeout 30 --workdir "$work/sn" -- \
-    /usr/bin/python3 /work/evaluator.py --problem /work/problem.json \
-    --candidate "/work/$2" --metrics-out /work/EV-M.json
+# F1 的载荷（审阅稿第二轮）：候选把**评估器进程内**的枚举器换掉。
+# 单进程评估器会给它退出码 0；两阶段里它只污染 extract 那一侧，verify 独立枚举。
+cat > "$work/sn/evil.py" <<'EOF'
+N = 4
+
+import itertools
+itertools.product = lambda *a, **k: [(0, 0, 0, 0)]
+
+
+def build_network():
+    return []
+EOF
+
+# 两阶段跑一遍：先 extract（候选在这里跑），再 verify。返回 verify 的退出码。
+sn_two_stage() {  # $1=run id  $2=候选文件名
+  rm -rf "$work/sn/work/artifacts"
+  mkdir -p "$work/sn/work/artifacts"
+  cp "$work/sn/$2" "$work/sn/work/cand.py" 2>/dev/null || true
+  # 评估器与冻结定义**只读**挂进去（`/opt/...`），跟插件自己的做法一致：
+  # 工作目录里只放候选，可信的东西不在候选能改的地方。
+  "$BIN/opl-run" --runs-dir "$R" --id "$1-extract" --timeout 30 \
+    --workdir "$work/sn/work" \
+    --ro-bind "$work/sn/evaluator.py:/opt/evaluator.py" \
+    --ro-bind "$work/sn/problem.json:/opt/problem.json" -- \
+    /usr/bin/python3 /opt/evaluator.py extract --problem /opt/problem.json \
+    --candidate /work/cand.py --artifacts /work/artifacts >/dev/null 2>&1
+  local a=$?
+  if [ "$a" != 0 ]; then return "$a"; fi
+  "$BIN/opl-run" --runs-dir "$R" --id "$1-verify" --timeout 30 \
+    --workdir "$work/sn/work" \
+    --ro-bind "$work/sn/evaluator.py:/opt/evaluator.py" \
+    --ro-bind "$work/sn/problem.json:/opt/problem.json" -- \
+    /usr/bin/python3 /opt/evaluator.py verify --problem /opt/problem.json \
+    --artifacts /work/artifacts --metrics-out /work/EV-M.json >/dev/null 2>&1
 }
-chk "骨架可评估 -> 0" 0 sn_eval E1 skeleton.py
-chk "已知最优可评估 -> 0" 0 sn_eval E2 candidate-opt5.py
-# 注意这一层是 `opl-run` 的判决：payload 非零 -> REJECT(1)。评估器自己的退出码
-# （1=有反例 / 2=候选不可用）保留在 metrics.payload_exit_code 里，由调用方解读——
-# 「进程层的结果」与「评估器层的判决」分开，是在 lib 层就定好的分工。
-chk "不排序的候选 -> 1" 1 sn_eval E3 broken.py
-chk "越界候选 -> 1（payload 退 2）" 1 sn_eval E4 oob.py
-chk "判决有依据：6 / 5 / 反例 / 2" 0 python3 -c "
+chk "骨架可评估 -> 0" 0 sn_two_stage S1 skeleton.py
+chk "已知最优可评估 -> 0" 0 sn_two_stage S2 candidate-opt5.py
+chk "不排序的候选 -> 1" 1 sn_two_stage S3 broken.py
+# 注意分层：`opl-run` 只回答「这个进程成功了吗」，payload 非零一律收成 1；
+# 评估器自己的约定码（2=数据不合规）留在快照的 `payload_exit_code` 里。
+chk "越界候选 -> opl-run 报 1" 1 sn_two_stage S4 oob.py
+chk "越界候选的评估器码是 2" 0 python3 -c "
 import json, os, sys
+m = json.load(open(os.path.join('$R', 'S4-verify', 'metrics.json')))
+err = open(os.path.join('$R', 'S4-verify', 'stderr.txt')).read()
 why = []
-
-def load(rid):
-    p = '$R/%s/metrics.json' % rid
-    if not os.path.isfile(p):
-        return None
-    return json.load(open(p))
-
-def gone(rid):
-    p = '$work/sn/EV-M.json'
-    return json.load(open(p)) if os.path.isfile(p) else None
-
-# 评估器每次覆盖同一个 metrics 文件，所以判据取的是**每次运行的快照 + 最后一次产物**：
-# 快照里的 payload_exit_code 是每次各自的，产物文件里的数字是最后一次的。
-e1, e2, e3, e4 = (load(x) for x in ('E1', 'E2', 'E3', 'E4'))
-for rid, m in (('E1', e1), ('E2', e2), ('E3', e3), ('E4', e4)):
-    if m is None:
-        why.append('%s 缺 metrics.json' % rid)
-        continue
-    if m.get('verdict') != 'payload_failed' and rid in ('E3', 'E4'):
-        why.append('%s 应报 payload_failed，实为 %r' % (rid, m.get('verdict')))
-
-# payload 自己的退出码必须分得开：1=有反例，2=候选不可用
-if e3 and e3.get('payload_exit_code') != 1:
-    why.append('不排序的候选 payload_exit_code=%r（应为 1）' % e3.get('payload_exit_code'))
-if e4 and e4.get('payload_exit_code') != 2:
-    why.append('越界候选 payload_exit_code=%r（应为 2，与「排序失败」分开）'
-               % e4.get('payload_exit_code'))
-
-# 判据 7 的余量是真实存在的：骨架 6、最优 5
-if not (e1 and e2):
-    why.append('缺 E1/E2 的快照')
-else:
-    if e1.get('payload_exit_code') != 0 or e2.get('payload_exit_code') != 0:
-        why.append('骨架/最优应各自退出 0')
-# 直接从快照里的 stdout 读评估结论，避开「同一个产物文件被覆盖」的干扰
-import re
-def comparators_from_stdout(rid):
-    p = '$R/%s/stdout.txt' % rid
-    m = re.search(r'\"comparators\": (\d+)', open(p).read()) if os.path.isfile(p) else None
-    return int(m.group(1)) if m else None
-c1, c2 = comparators_from_stdout('E1'), comparators_from_stdout('E2')
-if c1 != 6:
-    why.append('骨架比较器数 %r（应为 6）' % c1)
-if c2 != 5:
-    why.append('最优比较器数 %r（应为 5）—— 余量不成立则判据 7 无从谈起' % c2)
-if not (c1 and c2 and c1 > c2):
-    why.append('骨架 %r 未严格多于最优 %r：没有可改进的余量' % (c1, c2))
-
-# 判「不排序」必须给出反例，而不是只给一个布尔
-bad = json.load(open('$work/sn/EV-M.json')) if os.path.isfile('$work/sn/EV-M.json') else {}
+if m.get('payload_exit_code') != 2:
+    why.append('payload_exit_code=%r（应为 2）' % m.get('payload_exit_code'))
+if '越界' not in err:
+    why.append('stderr 没说清是越界：%r' % err.strip()[-80:])
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
-chk "反例可查且沙箱链路完整" 0 python3 -c "
-import json, os, sys
-# 用坏候选再跑一次，专门看它给出的反例
-import subprocess
+# **F1 的核心断言**：候选替换进程内的枚举器，不再能伪造成功。
+# 修前：单进程评估器报 sorts=true, comparators=0, zero_one_inputs_checked=1 并给退出码 0。
+chk "F1 替换进程内枚举器 -> 不可行" 1 sn_two_stage S5 evil.py
+chk "非两阶段评估器 -> 明确拒绝（不误报候选）" 0 python3 -c "
+import os, shutil, subprocess, sys, tempfile
 env = dict(os.environ)
-r = subprocess.run(['$BIN/opl-run', '--runs-dir', '$R', '--id', 'E5',
-                    '--timeout', '30', '--workdir', '$work/sn', '--',
-                    '/usr/bin/python3', '/work/evaluator.py',
-                    '--problem', '/work/problem.json',
-                    '--candidate', '/work/broken.py',
-                    '--metrics-out', '/work/broken-metrics.json'],
-                   capture_output=True, env=env)
+SN = '$SNF'
+d = tempfile.mkdtemp(prefix='opl-1stage.')
 why = []
-if r.returncode != 1:
-    why.append('退出码 %d（应为 1）' % r.returncode)
-d = os.path.join('$R', 'E5')
-miss = [n for n in ('cmd.json', 'env.json', 'capabilities.json', 'metrics.json',
-                    'status.json') if not os.path.isfile(os.path.join(d, n))]
-if miss:
-    why.append('E5 缺 %r' % miss)
-m = json.load(open(os.path.join('$work', 'sn', 'broken-metrics.json')))
-if m.get('sorts') is not False:
-    why.append('坏候选被判 sorts=%r' % m.get('sorts'))
-if m.get('first_counterexample') is None:
-    why.append('判「不排序」却没给反例')
-if m.get('zero_one_inputs_checked') != 16:
-    why.append('检查的输入数 %r（应为 16 = 2^4）' % m.get('zero_one_inputs_checked'))
+try:
+    shutil.copyfile('$work/single_stage_ev.py', d + '/ev.py')
+    r = subprocess.run(['$BIN/opl-evolve-init', '--lab', d + '/lab',
+                        '--skeleton', SN + '/skeleton.py',
+                        '--evaluator', d + '/ev.py',
+                        '--problem', SN + '/problem.json'],
+                       capture_output=True, text=True, env=env)
+    if r.returncode == 0:
+        why.append('单阶段评估器被接受了——协议不是硬约定')
+    msg = r.stderr + r.stdout
+    if '两阶段' not in msg:
+        why.append('拒绝理由没提两阶段协议：%r' % msg.strip()[-100:])
+    if '候选' in msg and '两阶段' not in msg:
+        why.append('把协议问题误报成了候选问题')
+finally:
+    shutil.rmtree(d, ignore_errors=True)
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
-
-# ---- 判据 8/9：可进化区是真约束，code_hash 是去重的执行点 ----
-# 这两条都由 **lib 层**保证，不靠调用方自觉。所以用例也打在 lib 上：
-# 区外改动必须被拒（且指出在哪一行），重复程序必须由唯一索引拦下并给出理由。
+chk "F1 verify 独立枚举了 16 个输入" 0 python3 -c "
+import json, sys
+m = json.load(open('$work/sn/work/EV-M.json'))
+why = []
+if m.get('zero_one_inputs_checked') != 16:
+    why.append('只查了 %r 个输入（应为 16 = 2^4）' % m.get('zero_one_inputs_checked'))
+if m.get('sorts') is not False:
+    why.append('被替换过枚举器的候选仍被判 sorts=%r' % m.get('sorts'))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "判决有依据：6 / 5 / 反例" 0 python3 -c "
+import json, os, sys
+why = []
+# 每个 run id 的 verify 阶段各自留了一份 stdout（判决与依据都在它里面）
+def verdict(rid):
+    p = os.path.join('$R', rid + '-verify', 'stdout.txt')
+    for line in open(p).read().splitlines():
+        if line.strip().startswith('{'):
+            return json.loads(line)
+    return None
+c1, c2, c3 = (verdict(x) for x in ('S1', 'S2', 'S3'))
+if not c1 or c1.get('comparators') != 6 or c1.get('sorts') is not True:
+    why.append('骨架的判决不对：%r' % c1)
+if not c2 or c2.get('comparators') != 5:
+    why.append('最优的比较器数 %r（应为 5）——余量不成立则判据 7 无从谈起' % (c2 or {}).get('comparators'))
+if not c3 or c3.get('sorts') is not False or not c3.get('first_counterexample'):
+    why.append('不排序的候选没给反例：%r' % c3)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# 沙箱把实验目录整个藏起来了：候选只看得到自己那次运行的目录（F2b）
+chk "候选不可写实验目录（探针）" 0 python3 -c "
+import os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+from opl_run import RunSpec, execute
+SN = '$SNF'
+d = tempfile.mkdtemp()
+E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+           problem_src=SN + '/problem.json')
+ev = d + '/lab/evolve'
+probe = ('import os\n'
+         'print(\"sees skeleton:\", os.path.exists(\"/work/skeleton.py\"))\n'
+         'print(\"sees db:\", os.path.exists(\"/work/programs.sqlite\"))\n'
+         'print(\"sees runs:\", os.path.exists(\"/work/runs\"))\n'
+         'print(\"problem writable:\", os.access(\"/opt/problem.json\", os.W_OK))\n')
+work = d + '/probe'
+os.makedirs(work)
+execute(RunSpec(argv=['/usr/bin/python3', '-c', probe], workdir=work,
+                runner_dir=d + '/probe-run', run_id='p',
+                ro_binds=[(ev + '/evaluator.py', '/opt/evaluator.py'),
+                          (ev + '/problem.json', '/opt/problem.json')]))
+out = open(d + '/probe-run/stdout.txt').read()
+why = []
+for bad, what in (('sees skeleton: True', '能看到 skeleton.py'),
+                  ('sees db: True', '能看到 programs.sqlite'),
+                  ('sees runs: True', '能看到 runs/')):
+    if bad in out:
+        why.append('候选' + what)
+if 'problem writable: False' not in out:
+    why.append('冻结定义在沙箱内可写')
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# code_hash：吸收写法差异，区分语义（判据 8 的执行点）
 chk "code_hash：吸收写法差异，区分语义" 0 python3 -c "
 import sys
 sys.path.insert(0, '$plugin/lib')
@@ -656,23 +718,15 @@ h0, mode = code_hash(base)
 why = []
 if mode != 'tokens':
     why.append('基准的归一化模式是 %r' % mode)
-# 该吸收的：写法差异
-for name, v in [
-    ('行尾补空格', 'x = 1   \ny = x + 1   \n'),
-    ('每行加注释', 'x = 1  # a\ny = x + 1  # b\n'),
-    ('空行改写', 'x = 1\n\n\ny = x + 1\n'),
-    ('CRLF', 'x = 1\r\ny = x + 1\r\n'),
-    ('制表缩进', 'if True:\n\tx = 1\ny = x + 1\n'),
-]:
-    if code_hash(v)[0] != h0 and not name.startswith('制表'):
-        why.append('%s 未被归一化吸收（哈希变了）' % name)
-# 该区分的：语义差异
-for name, v in [
-    ('改数字', 'x = 2\ny = x + 1\n'),
-    ('换写法', 'x = 1\ny = 1 + x\n'),
-]:
+for name, v in [('行尾补空格', 'x = 1   \ny = x + 1   \n'),
+                ('每行加注释', 'x = 1  # a\ny = x + 1  # b\n'),
+                ('空行改写', 'x = 1\n\n\ny = x + 1\n'),
+                ('CRLF', 'x = 1\r\ny = x + 1\r\n')]:
+    if code_hash(v)[0] != h0:
+        why.append('%s 未被归一化吸收' % name)
+for name, v in [('改数字', 'x = 2\ny = x + 1\n'), ('换写法', 'x = 1\ny = 1 + x\n')]:
     if code_hash(v)[0] == h0:
-        why.append('%s 被误判为同一程序（哈希没变）' % name)
+        why.append('%s 被误判为同一程序' % name)
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
@@ -685,25 +739,20 @@ b = split_block(skel)
 why = []
 if b.before + b.block + b.after != skel:
     why.append('切块不能拼回原文')
-# 只在区内改：必须通过
 opt = open('$FIX/sortnet/candidate-opt5.py').read()
 try:
     assert_only_block_changed(skel, opt)
 except EvolveError as exc:
     why.append('合法候选被误拒：%s' % exc)
-# 区外改动：必须被拒，且理由要**具体**——要么指出在哪一行，要么点明标记本身有问题。
-for name, cand in [
-    ('区外改空格', skel.replace('N = 4', 'N  = 4')),
-    ('区外加注释', skel.replace('N = 4', '# 我加的\nN = 4')),
-    ('区外改 N', skel.replace('N = 4', 'N = 5')),
-    ('删掉标记行', skel.replace('# EVOLVE-BLOCK-START\n', '')),
-]:
+for name, cand in [('区外改空格', skel.replace('N = 4', 'N  = 4')),
+                   ('区外加注释', skel.replace('N = 4', '# 我加的\nN = 4')),
+                   ('区外改 N', skel.replace('N = 4', 'N = 5')),
+                   ('删掉标记行', skel.replace('# EVOLVE-BLOCK-START\n', ''))]:
     try:
         assert_only_block_changed(skel, cand)
         why.append('%s 竟然通过了' % name)
     except EvolveError as exc:
         msg = str(exc)
-        # 「区外被改」要有行号；「标记缺失」没有行号可给，但必须点明是标记的问题。
         if '行' not in msg and '标记' not in msg:
             why.append('%s 被拒但理由不具体：%s' % (name, msg[:60]))
 if why:
@@ -732,22 +781,13 @@ try:
         why.append('被拒的理由里没提 code_hash：%r' % r3.rejected_reason)
     if lib.count() != 2:
         why.append('库容 %d（应为 2）' % lib.count())
-    # 区内加注释算同一程序（归一化吸收），不该占新位
-    commented = opt.replace('    return [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)]',
-                            '    return [(0, 1), (2, 3), (0, 2), (1, 3), (1, 2)]  # 最优')
-    r4 = lib.add(code=commented, skeleton=skel)
-    if r4.accepted or lib.count() != 2:
-        why.append('区内加注释被当成新程序（库容 %d）' % lib.count())
-    # best 必须跳过「没有该指标」的行，而不是当成 0
-    b = lib.best('comparators', minimize=True)
-    if not b or (b.get('metrics') or {}).get('comparators') != 5:
-        why.append('best(comparators,min) = %r（应为 5）' % (b and b.get('metrics')))
     lib.close()
 finally:
     shutil.rmtree(d, ignore_errors=True)
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+
 # ---- 判据 7/8/9：命令层的退出码矩阵 ----
 # `opl-evolve-*` 的结局有四种，退出码必须分开：0 新增且通过 / 1 新增但不通过 /
 # 2 候选不合格 / 5 重复没有新增。混起来调用方就没法处置。
@@ -874,6 +914,43 @@ if after != mid:
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+# 测试用的**通用两阶段**评估器：字段名与函数名都从实验定义读，因此同一份脚本能同时
+# 服务「最大化 score」与「feasible/loss」两种实验。extract 只产出数据，verify 独立判定。
+cat > "$work/generic_ev.py" <<'PYEOF'
+import argparse, json, os, sys
+ap = argparse.ArgumentParser()
+sub = ap.add_subparsers(dest="stage", required=True)
+_e = sub.add_parser("extract")
+_e.add_argument("--problem"); _e.add_argument("--candidate"); _e.add_argument("--artifacts")
+_v = sub.add_parser("verify")
+_v.add_argument("--problem"); _v.add_argument("--artifacts"); _v.add_argument("--metrics-out")
+a = ap.parse_args()
+prob = json.load(open(a.problem))
+fn = prob["params"]["func"]
+if a.stage == "extract":
+    ns = {}
+    exec(compile(open(a.candidate).read(), a.candidate, "exec"), ns)
+    os.makedirs(a.artifacts, exist_ok=True)
+    json.dump({"schema": "opl.evolve.artifact/1", "probe": float(ns[fn](2.0))},
+              open(os.path.join(a.artifacts, "g.json"), "w"))
+    sys.exit(0)
+d = json.load(open(os.path.join(a.artifacts, "g.json")))
+req = prob["metrics"]["required"]
+feas = prob["metrics"]["feasible"]["field"]
+obj = (prob["metrics"].get("objective") or {}).get("field")
+m = {"schema": "opl.evolve.metrics/1"}
+for k, t in req.items():
+    if k == feas or t == "bool":
+        m[k] = True
+    elif k == obj or t == "number":
+        m[k] = d["probe"]
+    else:
+        m[k] = "x"
+if a.metrics_out:
+    json.dump(m, open(a.metrics_out, "w"))
+print(json.dumps(m))
+sys.exit(0)
+PYEOF
 # ---- F3/F4：判决只有一处实现；方向跟随实验定义 ----
 # F3：`init_lab` 原先没有运行结局检查，一次 `timeout` 的结果会被当成可用基线
 #     （实测 `baseline_note=None`，指标写进 programs，而 evaluations 里记着 timeout）。
@@ -889,7 +966,7 @@ def stub(kind, pexit):
     def fake(p, code, h, *, problem_path, timeout, mem_max_mb):
         rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
         json.dump(MET, open(rd + '/work/metrics.json', 'w'))
-        return MET, rd, kind, {}, pexit
+        return E.RunFacts(MET, rd, kind, {}, pexit, rd)
     E._stage_and_evaluate = fake
 import sqlite3
 CASES = (('timeout', None), ('oom', None), ('payload_failed', 3), ('payload_failed', 137))
@@ -947,7 +1024,7 @@ for kind, pexit, want in CASES:
     def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _k=kind, _p=pexit):
         rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
         json.dump(MET, open(rd + '/work/metrics.json', 'w'))
-        return MET, rd, _k, {}, _p
+        return E.RunFacts(MET, rd, _k, {}, _p, rd)
     E._stage_and_evaluate = fake
     out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
     if out.exit_code != want:
@@ -963,19 +1040,9 @@ d = tempfile.mkdtemp(prefix='opl-max.')
 why = []
 try:
     open(d + '/skel.py', 'w').write('# EVOLVE-BLOCK-START\ndef score(x):\n    return 0\n# EVOLVE-BLOCK-END\n')
-    open(d + '/ev.py', 'w').write(
-        'import argparse, json, sys\n'
-        'ap = argparse.ArgumentParser()\n'
-        'ap.add_argument(\"--candidate\", required=True)\n'
-        'ap.add_argument(\"--problem\", required=True)\n'
-        'ap.add_argument(\"--metrics-out\")\n'
-        'a = ap.parse_args()\n'
-        'ns = {}\n'
-        'exec(compile(open(a.candidate).read(), a.candidate, \"exec\"), ns)\n'
-        'm = {\"schema\": \"opl.evolve.metrics/1\", \"ok\": True, \"score\": ns[\"score\"](0)}\n'
-        'if a.metrics_out: json.dump(m, open(a.metrics_out, \"w\"))\n'
-        'sys.exit(0)\n')
+    shutil.copyfile('$work/generic_ev.py', d + '/ev.py')
     json.dump({'schema': 'opl.evolve.problem/1',
+               'params': {'func': 'score'},
                'metrics': {'feasible': {'field': 'ok', 'equals': True},
                            'objective': {'field': 'score', 'minimize': False},
                            'required': {'ok': 'bool', 'score': 'number'}}},
@@ -1010,6 +1077,189 @@ sys.exit(0 if not why else 1)"
 # ---- F5：程序身份与评估运行分列（同一程序可多次评估，各留证据）----
 # 判据 8 要「重复提交被拒」，F5 要「同一程序能再评估一次」——两件事由**同一个动作**
 # 触发，所以必须能区分：默认拒绝（不花沙箱的钱），补测要显式 `--reevaluate`。
+# 测试用的**两阶段**评估器：extract 正常产出数据，verify 退出 3（模拟评估器坏了）。
+# 为什么不能再用「不认子命令」的脚本：那会先被协议探测拒掉，而 F5 要测的是
+# 「init 拿不到指标，之后能否补测」——协议探测是另一条路径。
+cat > "$work/generic_ev.py" <<'PYEOF'
+import argparse, json, os, sys
+ap = argparse.ArgumentParser()
+sub = ap.add_subparsers(dest="stage", required=True)
+_e = sub.add_parser("extract")
+_e.add_argument("--problem"); _e.add_argument("--candidate"); _e.add_argument("--artifacts")
+_v = sub.add_parser("verify")
+_v.add_argument("--problem"); _v.add_argument("--artifacts"); _v.add_argument("--metrics-out")
+a = ap.parse_args()
+prob = json.load(open(a.problem))
+fn = prob["params"]["func"]
+if a.stage == "extract":
+    ns = {}
+    exec(compile(open(a.candidate).read(), a.candidate, "exec"), ns)
+    os.makedirs(a.artifacts, exist_ok=True)
+    json.dump({"schema": "opl.evolve.artifact/1", "probe": float(ns[fn](2.0))},
+              open(os.path.join(a.artifacts, "g.json"), "w"))
+    sys.exit(0)
+d = json.load(open(os.path.join(a.artifacts, "g.json")))
+req = prob["metrics"]["required"]
+feas = prob["metrics"]["feasible"]["field"]
+obj = (prob["metrics"].get("objective") or {}).get("field")
+m = {"schema": "opl.evolve.metrics/1"}
+for k, t in req.items():
+    if k == feas or t == "bool":
+        m[k] = True
+    elif k == obj or t == "number":
+        m[k] = d["probe"]
+    else:
+        m[k] = "x"
+if a.metrics_out:
+    json.dump(m, open(a.metrics_out, "w"))
+print(json.dumps(m))
+sys.exit(0)
+PYEOF
+# ---- F3/F4：判决只有一处实现；方向跟随实验定义 ----
+# F3：`init_lab` 原先没有运行结局检查，一次 `timeout` 的结果会被当成可用基线
+#     （实测 `baseline_note=None`，指标写进 programs，而 evaluations 里记着 timeout）。
+# F4：`--minimize` 那个开关 `default=True` 且没有反向选项，定义说最大化时永远选反。
+chk "F3 初始化不得接纳超时/OOM 结果" 0 python3 -c "
+import json, os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+SN = '$SNF'
+MET = {'sorts': True, 'comparators': 6, 'zero_one_inputs_checked': 16}
+why = []
+def stub(kind, pexit):
+    def fake(p, code, h, *, problem_path, timeout, mem_max_mb):
+        rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
+        json.dump(MET, open(rd + '/work/metrics.json', 'w'))
+        return E.RunFacts(MET, rd, kind, {}, pexit, rd)
+    E._stage_and_evaluate = fake
+import sqlite3
+CASES = (('timeout', None), ('oom', None), ('payload_failed', 3), ('payload_failed', 137))
+for kind, pexit in CASES:
+    d = tempfile.mkdtemp()
+    stub(kind, pexit)
+    res = E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+                     problem_src=SN + '/problem.json')
+    if res.metrics is not None:
+        why.append('%s/%s 的指标被当成可用基线' % (kind, pexit))
+    if not res.baseline_note:
+        why.append('%s/%s 没有任何说明' % (kind, pexit))
+    con = sqlite3.connect(d + '/lab/evolve/programs.sqlite'); con.row_factory = sqlite3.Row
+    row = dict(list(con.execute('SELECT metrics_json FROM programs'))[0])
+    evk = [dict(r)['kind'] for r in con.execute('SELECT kind FROM evaluations')]
+    con.close()
+    if row['metrics_json'] is not None:
+        why.append('%s/%s：programs.metrics_json 有值，但这次运行没有判决' % (kind, pexit))
+    # 运行史记「发生了什么」（kind 是原始沙箱结局，那是事实），但**不能有判决**：
+    # feasible 与 metrics 都必须是空的
+    con = sqlite3.connect(d + '/lab/evolve/programs.sqlite'); con.row_factory = sqlite3.Row
+    rows = [dict(r) for r in con.execute('SELECT feasible, metrics_json, note FROM evaluations')]
+    con.close()
+    if any(r['feasible'] is not None for r in rows):
+        why.append('%s/%s：运行史给了可行/不可行判决' % (kind, pexit))
+    if any(r['metrics_json'] is not None for r in rows):
+        why.append('%s/%s：运行史存了不可信的指标' % (kind, pexit))
+    if not any(r['note'] for r in rows):
+        why.append('%s/%s：运行史没有说明为什么没有判决' % (kind, pexit))
+# 对照：正常结局必须入库
+d = tempfile.mkdtemp(); stub('ok', 0)
+res = E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+                 problem_src=SN + '/problem.json')
+if res.metrics is None:
+    why.append('正常结局的基线竟然没入库')
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F3 评估器退出码契约（1/2/3/137）" 0 python3 -c "
+import json, os, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+SN = '$SNF'
+MET = {'sorts': True, 'comparators': 5, 'zero_one_inputs_checked': 16}
+ORIG = E._stage_and_evaluate
+why = []
+# 契约：1=按约定不可行（结论）；2=拒收候选；>=3=评估器自身故障（不采信指标）
+CASES = (('payload_failed', 1, 0), ('payload_failed', 2, 2),
+         ('payload_failed', 3, 3), ('payload_failed', 137, 3), ('timeout', None, 3))
+for kind, pexit, want in CASES:
+    d = tempfile.mkdtemp()
+    E._stage_and_evaluate = ORIG
+    E.init_lab(d + '/lab', SN + '/skeleton.py', SN + '/evaluator.py',
+               problem_src=SN + '/problem.json')
+    def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _k=kind, _p=pexit):
+        rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
+        json.dump(MET, open(rd + '/work/metrics.json', 'w'))
+        return E.RunFacts(MET, rd, _k, {}, _p, rd)
+    E._stage_and_evaluate = fake
+    out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
+    if out.exit_code != want:
+        why.append('kind=%s exit=%s -> 退出码 %d（应为 %d）' % (kind, pexit, out.exit_code, want))
+E._stage_and_evaluate = ORIG
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "F4 --best 跟随实验定义的方向" 0 python3 -c "
+import json, os, shutil, subprocess, sys, tempfile
+env = dict(os.environ)
+d = tempfile.mkdtemp(prefix='opl-max.')
+why = []
+try:
+    open(d + '/skel.py', 'w').write('# EVOLVE-BLOCK-START\ndef score(x):\n    return 0\n# EVOLVE-BLOCK-END\n')
+    shutil.copyfile('$work/generic_ev.py', d + '/ev.py')
+    json.dump({'schema': 'opl.evolve.problem/1',
+               'params': {'func': 'score'},
+               'metrics': {'feasible': {'field': 'ok', 'equals': True},
+                           'objective': {'field': 'score', 'minimize': False},
+                           'required': {'ok': 'bool', 'score': 'number'}}},
+              open(d + '/problem.json', 'w'))
+    lab = d + '/lab'
+    subprocess.run(['$BIN/opl-evolve-init', '--lab', lab, '--skeleton', d + '/skel.py',
+                    '--evaluator', d + '/ev.py', '--problem', d + '/problem.json'],
+                   capture_output=True, env=env)
+    for v in (0, 9):
+        open(d + ('/c%d.py' % v), 'w').write(
+            '# EVOLVE-BLOCK-START\ndef score(x):\n    return %d\n# EVOLVE-BLOCK-END\n' % v)
+        subprocess.run(['$BIN/opl-evolve-eval', '--lab', lab, '--candidate', d + ('/c%d.py' % v)],
+                       capture_output=True, env=env)
+    def best(*extra):
+        r = subprocess.run(['$BIN/opl-evolve-show', '--lab', lab, '--best', 'score',
+                            '--json'] + list(extra), capture_output=True, text=True, env=env)
+        if r.returncode != 0:
+            return None
+        return (json.loads(r.stdout).get('metrics') or {}).get('score')
+    if best() != 9:
+        why.append('定义说最大化，--best 却选中 %r（应 9）' % best())
+    if best('--minimize') != 0:
+        why.append('--minimize 选中 %r（应 0）' % best('--minimize'))
+    if best('--maximize') != 9:
+        why.append('--maximize 选中 %r（应 9）' % best('--maximize'))
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+
+# ---- F5：程序身份与评估运行分列（同一程序可多次评估，各留证据）----
+# 判据 8 要「重复提交被拒」，F5 要「同一程序能再评估一次」——两件事由**同一个动作**
+# 触发，所以必须能区分：默认拒绝（不花沙箱的钱），补测要显式 `--reevaluate`。
+# 测试用的**两阶段**评估器：extract 正常产出数据，verify 退出 3（模拟评估器坏了）。
+# 为什么不能再用「不认子命令」的脚本：那会先被协议探测拒掉，而 F5 要测的是
+# 「init 拿不到指标，之后能否补测」——协议探测是另一条路径。
+cat > "$work/broken_verify.py" <<'PYEOF'
+import argparse, json, os, sys
+ap = argparse.ArgumentParser()
+sub = ap.add_subparsers(dest="stage", required=True)
+_e = sub.add_parser("extract")
+_e.add_argument("--problem"); _e.add_argument("--candidate"); _e.add_argument("--artifacts")
+_v = sub.add_parser("verify")
+_v.add_argument("--problem"); _v.add_argument("--artifacts"); _v.add_argument("--metrics-out")
+a = ap.parse_args()
+if a.stage == "extract":
+    os.makedirs(a.artifacts, exist_ok=True)
+    open(os.path.join(a.artifacts, "a.json"), "w").write("{}")
+    sys.exit(0)
+print("verifier crashed", file=sys.stderr)
+sys.exit(3)
+PYEOF
 chk "F5 补测：身份不变、运行史 +1" 0 python3 -c "
 import json, os, shutil, sqlite3, subprocess, sys, tempfile
 env = dict(os.environ)
@@ -1019,8 +1269,8 @@ why = []
 try:
     lab = d + '/lab'
     # 先让评估器坏掉：基线拿不到指标
-    open(d + '/bad_ev.py', 'w').write(
-        'import sys\nprint(\"crashed\", file=sys.stderr)\nsys.exit(3)\n')
+    # 坏掉的**两阶段**评估器：extract 正常，verify 退出 3（见上面生成的脚本）
+    shutil.copyfile('$work/broken_verify.py', d + '/bad_ev.py')
     r0 = subprocess.run(['$BIN/opl-evolve-init', '--lab', lab,
                          '--skeleton', SN + '/skeleton.py',
                          '--evaluator', d + '/bad_ev.py',
@@ -1084,15 +1334,22 @@ for r in runs:
     if not rd or not os.path.isdir(rd):
         why.append('运行 #%s 的目录不存在：%r' % (r['id'], rd))
         continue
-    for name in ('cmd.json', 'env.json', 'capabilities.json', 'metrics.json'):
-        if not os.path.isfile(os.path.join(rd, name)):
-            why.append('运行 #%s 缺 %s' % (r['id'], name))
-    mp = os.path.join(rd, 'metrics.json')
-    if os.path.isfile(mp):
-        m = json.load(open(mp))
-        for k, v in (m.get('sources') or {}).items():
-            if isinstance(v, str) and v.startswith('/') and not os.path.exists(v):
-                why.append('运行 #%s 的 metrics.sources[%s] 指向不存在的路径' % (r['id'], k))
+    # 一次评估 = 两个阶段（extract / verify），**每阶段各自**落四份快照
+    stages = [d for d in ('extract', 'verify') if os.path.isdir(os.path.join(rd, d))]
+    if len(stages) != 2:
+        why.append('运行 #%s 缺阶段目录（找到 %r）' % (r['id'], stages))
+    for st in stages:
+        sd = os.path.join(rd, st)
+        for name in ('cmd.json', 'env.json', 'capabilities.json', 'metrics.json'):
+            if not os.path.isfile(os.path.join(sd, name)):
+                why.append('运行 #%s/%s 缺 %s' % (r['id'], st, name))
+        mp = os.path.join(sd, 'metrics.json')
+        if os.path.isfile(mp):
+            m = json.load(open(mp))
+            for k, v in (m.get('sources') or {}).items():
+                if isinstance(v, str) and v.startswith('/') and not os.path.exists(v):
+                    why.append('运行 #%s/%s 的 metrics.sources[%s] 指向不存在的路径'
+                               % (r['id'], st, k))
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
@@ -1151,9 +1408,6 @@ sys.path.insert(0, '$plugin/lib')
 import opl_evolve as E
 SN = '$SNF'
 why = []
-class R:  # 替身：注入「运行没正常结束」的结局，但产物照写
-    def __init__(self, kind): self.kind = kind; self.payload_exit = None
-    notes = []; cgroup = {}
 MET = {'sorts': True, 'comparators': 5, 'zero_one_inputs_checked': 16}
 for kind in ('timeout', 'oom', 'signal'):
     d = tempfile.mkdtemp()
@@ -1162,9 +1416,8 @@ for kind in ('timeout', 'oom', 'signal'):
     def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _k=kind):
         rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
         json.dump(MET, open(rd + '/work/metrics.json', 'w'))
-        return MET, rd, _k, {}, None
+        return E.RunFacts(MET, rd, _k, {}, None, rd)
     E._stage_and_evaluate = fake
-    import opl_run; opl_run.execute = lambda spec, _k=kind: R(_k)
     out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
     if out.exit_code != 3:
         why.append('%s + 有 metrics 得到退出码 %d（应为 3 没有判决）' % (kind, out.exit_code))
@@ -1189,7 +1442,7 @@ for label, metrics in CASES:
     def fake(p, code, h, *, problem_path, timeout, mem_max_mb, _m=metrics):
         rd = os.path.join(p['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
         json.dump(_m, open(rd + '/work/metrics.json', 'w'))
-        return _m, rd, 'ok', {}, 0
+        return E.RunFacts(_m, rd, 'ok', {}, 0, rd)
     E._stage_and_evaluate = fake
     out = E.eval_candidate(d + '/lab', SN + '/candidate-opt5.py')
     if out.exit_code != 2:
@@ -1205,22 +1458,10 @@ why = []
 try:
     open(d + '/skeleton.py', 'w').write(
         '# EVOLVE-BLOCK-START\ndef predict(x):\n    return x * 0.5\n# EVOLVE-BLOCK-END\n')
-    EV = ('import argparse, json, sys\n'
-          'ap = argparse.ArgumentParser()\n'
-          'ap.add_argument(\"--candidate\", required=True)\n'
-          'ap.add_argument(\"--problem\", required=True)\n'
-          'ap.add_argument(\"--metrics-out\")\n'
-          'a = ap.parse_args()\n'
-          'ns = {}\n'
-          'exec(compile(open(a.candidate).read(), a.candidate, \"exec\"), ns)\n'
-          'loss = sum(abs(ns[\"predict\"](x) - x) for x in (1.0, 2.0, 3.0))\n'
-          'm = {\"schema\": \"opl.evolve.metrics/1\", \"feasible\": True, \"loss\": loss}\n'
-          'if a.metrics_out: json.dump(m, open(a.metrics_out, \"w\"))\n'
-          'print(json.dumps(m))\n'
-          'sys.exit(0)\n')
-    open(d + '/evaluator.py', 'w').write(EV)
+    shutil.copyfile('$work/generic_ev.py', d + '/evaluator.py')
     # **没有 sorts 字段**：可行性叫 feasible，目标叫 loss
     json.dump({'schema': 'opl.evolve.problem/1',
+               'params': {'func': 'predict'},
                'metrics': {'feasible': {'field': 'feasible', 'equals': True},
                            'objective': {'field': 'loss', 'minimize': True},
                            'required': {'feasible': 'bool', 'loss': 'number'}}},

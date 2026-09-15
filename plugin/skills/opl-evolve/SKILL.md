@@ -22,6 +22,30 @@ OPL="${KIMI_PLUGIN_ROOT:-<插件根>}/bin"
 
 ## 四步，一步一条命令
 
+## 评估器必须是**两阶段**的（硬约定）
+
+```bash
+python3 evaluator.py extract --problem P --candidate C --artifacts DIR   # 跑候选，只产出数据
+python3 evaluator.py verify  --problem P --artifacts DIR --metrics-out M # 没有候选，独立判定
+```
+
+插件把这两步跑在**两个独立的沙箱进程**里：`extract` 那一侧有候选，`verify` 那一侧
+**没有候选**，只读 `DIR` 里的数据并自己独立判定。
+
+**为什么是硬约定而不是建议**——实测（审阅稿第二轮）：候选在可进化区里放
+
+```python
+import itertools
+itertools.product = lambda *a, **k: [(0, 0, 0, 0)]
+```
+
+就把**评估器进程内**的枚举器换掉了。区外文本一字未改、冻结的题目参数也没变，于是
+评估器只查一个全零输入就报 `sorts=true, comparators=0`，插件给它退出码 0。
+
+**只读挂载挡不住这个**：它保护的是文件，而候选改的是**进程内存**。边界只能画在进程上。
+不合规的评估器（只有一个 `--candidate` 入口的老写法）会被 `init` **直接拒绝**，
+不会降级——降级选项一旦存在，早晚会被用来绕过。
+
 ### 1 建库：把骨架、评估器与实验定义钉住
 
 ```bash

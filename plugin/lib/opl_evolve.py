@@ -44,6 +44,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import time
@@ -314,6 +315,20 @@ EVAL_MIN_FAILURE = 3
 
 
 @dataclass
+class RunFacts:
+    """一次评估（两个阶段）的事实。**用 dataclass 而不是元组**：字段到第 6 个之后，
+    元组下标已经没法让人读懂，而其中 `verdict_dir` 是「该去哪儿找拒绝理由」——
+    弄错它只会让错误信息变糊，不会报错，属于最难发现的那类。"""
+
+    metrics: dict[str, Any] | None = None
+    run_dir: str = ""
+    kind: str = ""
+    files: dict[str, str] = field(default_factory=dict)
+    payload_exit: int | None = None
+    verdict_dir: str = ""      # 起决定作用的那一阶段目录（stderr 在这里）
+
+
+@dataclass
 class Judgement:
     exit_code: int          # 调用方该用的退出码
     kind: str               # 判决标签
@@ -335,6 +350,10 @@ def judge_run(*, kind: str, payload_exit: int | None, metrics: Any,
 
     if kind == "backend_missing":
         return Judgement(MISSING, "backend_missing", "找不到 bwrap：不降级到裸跑")
+    if kind == "protocol_violation":
+        return Judgement(UNKNOWN, "protocol_violation",
+                         "评估器说 extract 成功却没产出任何数据——"
+                         "多半不符合两阶段协议（extract 只产出数据，verify 独立判定）")
     if kind not in ("ok", "payload_failed"):
         extra = "（评估器写出了指标，但这次运行没有正常结束——不采信）" if metrics else ""
         return Judgement(UNKNOWN, kind, f"沙箱结局 {kind}{extra}")
@@ -448,56 +467,146 @@ def lab_paths(lab: str) -> dict[str, str]:
             "db": os.path.join(d, "programs.sqlite")}
 
 
+def check_evaluator_protocol(p: dict[str, str], *, timeout: float = 60.0) -> str | None:
+    """评估器是否符合**两阶段协议**。返回 None 表示符合，否则返回原因。
+
+    这是**功能性**探测，不是查 `--help`：真拿骨架跑一次 `extract`，要求它**产出数据**。
+
+    为什么要这么严——实测两种弱写法都放过了坏评估器：
+
+    * 查 `extract --help` 的退出码：任何一个忽略 argv 的脚本（比如随手把骨架文件
+      当评估器传进来）都会以 0 退出，于是「探测通过」而评估器根本不存在。
+    * 从退出码推测：不合规的评估器收到 `extract` 时 argparse 以 2 结束，而那正是
+      「候选不可用」的约定码——于是协议问题被误报成「候选被拒」，指错方向。
+
+    「存在性不等于可用」这条在本项目已经应验过五次，这是第六次。
+    """
+    ev = os.path.join(p["dir"], "evaluator.py")
+    if not os.path.isfile(ev):
+        return f"实验目录里没有评估器：{ev}"
+    if not os.path.isfile(p["skeleton"]):
+        return f"实验目录里没有骨架：{p['skeleton']}"
+    import tempfile
+
+    from opl_run import RunSpec, execute
+
+    with tempfile.TemporaryDirectory(prefix="opl-proto.") as tmp:
+        work = os.path.join(tmp, "work")
+        os.makedirs(work, exist_ok=True)
+        shutil.copyfile(p["skeleton"], os.path.join(work, "candidate.py"))
+        spec = RunSpec(
+            argv=[SANDBOX_PYTHON, "/opt/evaluator.py", "extract",
+                  "--problem", "/opt/problem.json", "--candidate", "/work/candidate.py",
+                  "--artifacts", "/work/artifacts"],
+            workdir=work, run_id="protocol-probe", runner_dir=os.path.join(tmp, "run"),
+            timeout=timeout,
+            ro_binds=[(ev, "/opt/evaluator.py"), (p["problem"], "/opt/problem.json")])
+        res = execute(spec)
+        arts = os.path.join(work, "artifacts")
+        produced = os.path.isdir(arts) and bool(os.listdir(arts))
+        if res.kind not in ("ok", "payload_failed"):
+            return (f"两阶段协议探测失败：extract 的结局是 {res.kind}"
+                    f"（评估器必须实现 `extract`：跑候选、把产物写成数据）")
+        if not produced:
+            return (f"评估器不符合两阶段协议：拿骨架跑 `extract` 没有产出任何数据"
+                    f"（退出码 {res.payload_exit}）。本插件要求评估器实现 "
+                    f"`extract`（跑候选、只产出数据）与 `verify`（读数据、独立判定）"
+                    f"两个子命令——这是**硬约定**，不合规的评估器会被拒绝而不是降级")
+    return None
+
+
 def _stage_and_evaluate(p: dict[str, str], code: str, h: str, *, problem_path: str,
                         timeout: float, mem_max_mb: int | None,
-                        ) -> tuple[dict[str, Any] | None, str, str, dict[str, str], int | None]:
-    """把候选与冻结定义**只读**挂进沙箱、跑评估器、读回指标。
+                        ) -> RunFacts:
+    """两阶段评估：**候选进程只产出数据，判定在另一个进程里独立做**。
 
-    == 沙箱里挂什么，是个安全问题，不是整理问题 ==
+        <run>/extract/   候选在这里跑，只写 artifacts/（普通数据）
+        <run>/verify/    **没有候选**；读只读的 artifacts/，独立判定，写指标
 
-    原先把整个实验目录以读写方式挂到 `/work`（`skeleton.py`、`programs.sqlite`、
-    `runs/` 全在里面），实测候选可以改写它们——包括改写基线骨架与历史证据。现在：
+    == 为什么必须拆进程 ==
 
-        /work               ← 本次运行自己的目录，**唯一可写**的地方
-        /opt/evaluator.py   ← 从实验目录只读挂入
-        /opt/problem.json   ← 冻结定义，只读挂入
+    实测（审阅稿第二轮）：候选在可进化区里放 `itertools.product = lambda *a, **k:
+    [(0,0,0,0)]`，就把**评估器进程内**的枚举器换掉了——区外文本没变、冻结的题目参数
+    也没变，评估器只查一个输入就报 `sorts=true, comparators=0`，插件给它退出码 0。
 
-    实验目录本身、数据库、历史运行目录**都不在沙箱的视野里**。候选要能跑就得能写
-    `/work`，但它伸不到别处。冻结定义只读这一点尤其要紧——**一个能改定义的候选等于
-    自己出题自己判**。
+    **只读挂载挡不住这个**：它保护的是文件，而候选改的是进程内存。边界只能画在进程上。
+    `verify` 是另一个进程，读的是 JSON 数据，而且**自己独立枚举**。
 
-    返回 (metrics 或 None, 运行目录, 沙箱结局, 快照路径, payload 退出码)。
-    `payload_exit` 必须带出来：**「按约定说不可行」与「写完指标后崩溃」都表现为
-    非零退出码**，只有原始退出码能把两者分开。
+    == 两阶段的返回码（插件据此判定）==
+
+        extract: 0 数据已产出 / 2 候选不可用 / 3+ 自身故障
+        verify:  0 可行 / 1 不可行 / 2 数据不合规 / 3+ 自身故障
+
+    合并规则：**extract 失败就没有后续**（它没产出数据，verify 无从判起）；
+
+    返回 `RunFacts`。结局取**起决定作用的那个阶段**，并记住它的目录
+    （`verdict_dir`）——拒绝理由在那里的 `stderr.txt`，弄错它只会让错误信息变糊。
     """
     from opl_run import RunSpec, execute, write_snapshots
 
     run_dir = _next_run_dir(p, h)
-    work = os.path.join(run_dir, "work")
-    os.makedirs(work, exist_ok=True)
-    with open(os.path.join(work, "candidate.py"), "w", encoding="utf-8") as fh:
+    evaluator = os.path.join(p["dir"], "evaluator.py")
+    a_dir = os.path.join(run_dir, "extract")
+    a_work = os.path.join(a_dir, "work")
+    artifacts = os.path.join(a_work, "artifacts")
+    os.makedirs(a_work, exist_ok=True)
+    with open(os.path.join(a_work, "candidate.py"), "w", encoding="utf-8") as fh:
         fh.write(code)
-    metrics_host = os.path.join(work, "metrics.json")
 
-    spec = RunSpec(
-        argv=[SANDBOX_PYTHON, "/opt/evaluator.py", "--problem", "/opt/problem.json",
-              "--candidate", "/work/candidate.py", "--metrics-out", "/work/metrics.json"],
-        workdir=work, run_id=os.path.basename(run_dir), runner_dir=run_dir,
+    spec_a = RunSpec(
+        argv=[SANDBOX_PYTHON, "/opt/evaluator.py", "extract", "--problem", "/opt/problem.json",
+              "--candidate", "/work/candidate.py", "--artifacts", "/work/artifacts"],
+        workdir=a_work, run_id=os.path.basename(run_dir) + "-extract", runner_dir=a_dir,
         timeout=timeout, mem_max_mb=mem_max_mb,
-        ro_binds=[(os.path.join(p["dir"], "evaluator.py"), "/opt/evaluator.py"),
-                  (problem_path, "/opt/problem.json")])
-    res = execute(spec)
-    # 每次运行都落四份快照：**指标与它的来源必须一起留存**，否则事后无法回答
-    # 「这个数字是怎么来的」。原先进化路径只调 execute()，运行目录里只有两个流文件。
-    files = write_snapshots(spec, res)
+        ro_binds=[(evaluator, "/opt/evaluator.py"), (problem_path, "/opt/problem.json")])
+    res_a = execute(spec_a)
+    files = write_snapshots(spec_a, res_a)
+
+    def merged(kind: str, pexit: int | None) -> tuple[str, int | None]:
+        """把两个阶段的结局合成一套语义：**先看 extract 有没有产出数据。**"""
+        if res_a.kind not in ("ok", "payload_failed"):
+            return res_a.kind, res_a.payload_exit
+        if res_a.payload_exit is not None and res_a.payload_exit >= EVAL_MIN_FAILURE:
+            return "payload_failed", res_a.payload_exit
+        if res_a.payload_exit == EVAL_REJECT_CANDIDATE:
+            return "payload_failed", EVAL_REJECT_CANDIDATE
+        return kind, pexit
+
+    artifacts_produced = (os.path.isdir(artifacts) and os.listdir(artifacts))
+    if res_a.kind not in ("ok", "payload_failed") or (
+            res_a.payload_exit is not None
+            and res_a.payload_exit >= EVAL_REJECT_CANDIDATE):
+        kind, pexit = merged(res_a.kind, res_a.payload_exit)
+        return RunFacts(None, run_dir, kind, files, pexit, a_dir)
+    if res_a.payload_exit == 0 and not artifacts_produced:
+        # extract 说成功却没产出数据：**这多半是评估器不符合两阶段协议**，
+        # 而不是候选有问题。分不清就会去修一个本来没问题的候选。
+        return RunFacts(None, run_dir, "protocol_violation", files, None, a_dir)
+
+    # 阶段 B：命令行里**没有候选**，artifacts 以只读方式挂进来
+    b_dir = os.path.join(run_dir, "verify")
+    b_work = os.path.join(b_dir, "work")
+    os.makedirs(b_work, exist_ok=True)
+    spec_b = RunSpec(
+        argv=[SANDBOX_PYTHON, "/opt/evaluator.py", "verify", "--problem", "/opt/problem.json",
+              "--artifacts", "/artifacts", "--metrics-out", "/work/metrics.json"],
+        workdir=b_work, run_id=os.path.basename(run_dir) + "-verify", runner_dir=b_dir,
+        timeout=timeout, mem_max_mb=mem_max_mb,
+        ro_binds=[(evaluator, "/opt/evaluator.py"), (problem_path, "/opt/problem.json"),
+                  (artifacts, "/artifacts")])
+    res_b = execute(spec_b)
+    files |= write_snapshots(spec_b, res_b)
+
+    metrics_path = os.path.join(b_work, "metrics.json")
     metrics: dict[str, Any] | None = None
-    if os.path.isfile(metrics_host):
+    if os.path.isfile(metrics_path):
         try:
-            with open(metrics_host, encoding="utf-8") as fh:
+            with open(metrics_path, encoding="utf-8") as fh:
                 metrics = json.load(fh)
         except ValueError:
             metrics = None
-    return metrics, run_dir, res.kind, files, res.payload_exit
+    kind, pexit = merged(res_b.kind, res_b.payload_exit)
+    return RunFacts(metrics, run_dir, kind, files, pexit, b_dir)
 
 
 def _tail(path: str, limit: int = 200) -> str:
@@ -550,17 +659,24 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
     shutil.copyfile(evaluator_src, p["evaluator"])
     shutil.copyfile(problem_src, p["problem"])
 
+    # 协议合规**正面探一次**，不合规就直接拒——别等到评估时把它误报成「候选被拒」：
+    # 不合规的评估器收到 `extract` 时 argparse 会以 2 结束，而那正是「候选不可用」的码。
+    bad_proto = check_evaluator_protocol(p)
+    if bad_proto:
+        raise EvolveError(bad_proto)
     code = open(p["skeleton"], encoding="utf-8").read()
     h, _ = code_hash(code)
-    metrics, run_dir, kind, _files, payload_exit = _stage_and_evaluate(
-        p, code, h, problem_path=p["problem"], timeout=timeout, mem_max_mb=mem_max_mb)
+    facts = _stage_and_evaluate(p, code, h, problem_path=p["problem"],
+                                timeout=timeout, mem_max_mb=mem_max_mb)
+    metrics, run_dir, kind, payload_exit = (facts.metrics, facts.run_dir,
+                                            facts.kind, facts.payload_exit)
 
     # 基线用的判决函数与 eval_candidate **完全同一个**（`judge_run`）。
     # 上一版 init 没有运行结局检查，于是 `kind=timeout` + 一份合法指标会被当成
     # 可用基线写进 programs，而 evaluations 里同时记着 kind=timeout——
     # 库同时保留「运行超时」与「这是成绩」。判决只能有一处实现。
     j = judge_run(kind=kind, payload_exit=payload_exit, metrics=metrics,
-                  problem=problem, run_dir=run_dir)
+                  problem=problem, run_dir=facts.verdict_dir)
     note = None
     kept: dict[str, Any] | None = None
     if j.trust_metrics:
@@ -621,6 +737,9 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
     if not os.path.isfile(p["evaluator"]):
         raise EvolveError(f"实验目录里缺评估器：{p['evaluator']}")
     problem = load_problem(p["problem"])
+    bad_proto = check_evaluator_protocol(p)
+    if bad_proto:
+        raise EvolveError(bad_proto)
     summary = [problem.feasible_field] + (
         [problem.objective_field] if problem.objective_field else []) + \
         [f for f in problem.required if f not in (problem.feasible_field,
@@ -647,8 +766,10 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
                                   f"（已有 id={dup['id']}，第 {dup['generation']} 代）。"
                                   f"要再跑一次加 --reevaluate")
 
-    metrics, run_dir, kind, _files, payload_exit = _stage_and_evaluate(
-        p, code, h, problem_path=p["problem"], timeout=timeout, mem_max_mb=mem_max_mb)
+    facts = _stage_and_evaluate(p, code, h, problem_path=p["problem"],
+                                timeout=timeout, mem_max_mb=mem_max_mb)
+    metrics, run_dir, kind, payload_exit = (facts.metrics, facts.run_dir,
+                                            facts.kind, facts.payload_exit)
     # 这次运行「在什么条件下、由什么评估器」跑的——运行史里必须查得到这些
     fp = {"problem_sha256": sha256_file(p["problem"]),
           "evaluator_sha256": sha256_file(p["evaluator"])}
@@ -666,7 +787,7 @@ def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
     # ---- F3：运行没正常结束就是「没有判决」，产物存在也不改这一条 ----
     existing_id = dup["id"] if dup else None
     j = judge_run(kind=kind, payload_exit=payload_exit, metrics=metrics,
-                  problem=problem, run_dir=run_dir)
+                  problem=problem, run_dir=facts.verdict_dir)
     if not j.trust_metrics:
         # 没有可信判决：只留一条运行史，**不入指标**，旧指标也不动
         record(existing_id, feasible=None, note=f"{j.kind}：{j.reason or ''}".strip("："))
