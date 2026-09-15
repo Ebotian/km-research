@@ -109,7 +109,17 @@ def main() -> int:
             if defined_field and args.best != defined_field:
                 c(f"注意：实验定义的目标字段是 {defined_field!r}，而你按 {args.best!r} 取最好"
                   f"——这可能是两次不同的比较")
-            rec = lib.best(args.best, minimize=direction, where=where)
+            # 当前实验的指纹：换了定义或评估器之后，旧成绩不可比，必须排除
+            from opl_ledger import sha256_file as _sha
+            try:
+                fp = (_sha(lab_paths(args.lab)["problem"]),
+                      _sha(lab_paths(args.lab)["evaluator"]))
+            except OSError:
+                fp = None
+            rec = lib.best(args.best, minimize=direction, where=where, fingerprints=fp)
+            if getattr(lib, "skipped_incomparable", 0):
+                c(f"注意：跳过了 {lib.skipped_incomparable} 条**不同实验定义/评估器**的成绩"
+                  f"——同名指标不代表可直接比较")
             if rec is None:
                 c(f"没有任何程序带指标 {args.best!r}"
                   + (f" 且满足 {where}" if where else "")

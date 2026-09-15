@@ -379,7 +379,26 @@ def judge_run(*, kind: str, payload_exit: int | None, metrics: Any,
     if bad:
         return Judgement(USAGE, "metrics_invalid",
                          "评估器产出的 metrics 不符合实验定义：" + "；".join(bad))
+    # == 退出码与结构化判决矛盾时，不许任选一个当成功依据 ==
+    #
+    # 协议说：`0` 是「跑完，指标有效」（可行性交给定义），`1` 是「结论是不可行」。
+    # 两者矛盾——退出码 1 而指标说可行，或退出码 0 而指标说不可行——说明评估器自己
+    # 不自洽。实测（审阅稿第三轮）注入 `payload_exit=1` + `sorts=true` 时，旧代码直接
+    # 采信指标给出 `0 / feasible`，矛盾被吞掉了。
     ok = problem.feasible(metrics)
+    if payload_exit == EVAL_INFEASIBLE and ok:
+        return Judgement(UNKNOWN, "verdict_conflict",
+                         f"评估器退出码 {EVAL_INFEASIBLE}（按协议=不可行），"
+                         f"而它写的指标说可行——两份原始信息都留着："
+                         f"exit={EVAL_INFEASIBLE}, "
+                         f"{problem.feasible_field}={metrics.get(problem.feasible_field)!r}，"
+                         f"两者矛盾，不下判决")
+    if payload_exit == EVAL_OK and not ok:
+        return Judgement(UNKNOWN, "verdict_conflict",
+                         f"评估器退出码 0（按协议=跑完且指标有效），"
+                         f"而它写的指标说不可行——两份信息矛盾，不下判决"
+                         f"（exit=0, {problem.feasible_field}="
+                         f"{metrics.get(problem.feasible_field)!r}）")
     return Judgement(PASS if ok else REJECT, "feasible" if ok else "infeasible",
                      None, metrics, True)
 
@@ -407,6 +426,9 @@ class InitResult:
     metrics: dict[str, Any] | None = None
     baseline_note: str | None = None
     run_dir: str = ""
+    # `--force` 时旧库被挪到哪去了。重建**不原地复用**旧库：换了实验定义之后，
+    # 旧成绩与新的不可比，混在一张表里会让 best() 排出一个不存在的「最好」。
+    archived_db: str | None = None
     # 打哪几个字段给用户看：来自实验定义，不由壳硬编码（与 EvalOutcome 同理）
     summary_fields: list[str] = field(default_factory=list)
 
@@ -647,8 +669,14 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
     from opl_ledger import sha256_file
 
     p = lab_paths(lab)
-    if os.path.exists(p["db"]) and not force:
-        raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
+    archived = None
+    if os.path.exists(p["db"]):
+        if not force:
+            raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
+        # **归档旧库**，不原地复用：换了实验定义之后，旧成绩与新的不可比，
+        # 而「同名指标不代表可直接比较」。原地保留会让 best() 把两个实验混在一起排。
+        archived = f"{p['db']}.bak-{time.strftime('%Y%m%dT%H%M%S')}"
+        os.replace(p["db"], archived)
     for src, what in ((skeleton_src, "骨架"), (evaluator_src, "评估器"),
                       (problem_src, "实验定义")):
         if not os.path.isfile(src):
@@ -706,7 +734,7 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
                       evaluator=p["evaluator"], problem=p["problem"],
                       seeded_id=res.program_id, already_existed=force,
                       metrics=metrics, baseline_note=note, run_dir=run_dir,
-                      summary_fields=summary)
+                      archived_db=archived, summary_fields=summary)
 
 
 def eval_candidate(lab: str, candidate: str, *, generation: int = 1,
@@ -1047,8 +1075,19 @@ class ProgramLibrary:
             args.append(limit)
         return [self._decode(dict(r)) for r in self.conn.execute(q, args)]
 
+    def latest_fingerprints(self, program_id: int) -> tuple[str | None, str | None]:
+        """某程序**最近一次**评估用的 (实验定义指纹, 评估器指纹)。"""
+        rows = self.conn.execute(
+            "SELECT problem_sha256, evaluator_sha256 FROM evaluations"
+            " WHERE program_id = ? ORDER BY id DESC LIMIT 1", (program_id,)).fetchone()
+        if rows is None:
+            return (None, None)
+        return (rows["problem_sha256"], rows["evaluator_sha256"])
+
     def best(self, metric: str, *, minimize: bool = True, island: str | None = None,
-             where: dict[str, Any] | None = None) -> dict[str, Any] | None:
+             where: dict[str, Any] | None = None,
+             fingerprints: tuple[str | None, str | None] | None = None,
+             ) -> dict[str, Any] | None:
         """按 `metrics_json` 里的某个字段取最好的一条。
 
         **两条如实记录的坑，都是实测踩出来的：**
@@ -1062,11 +1101,17 @@ class ProgramLibrary:
           刻意不替调用方猜哪个字段意味着「可行」。
         """
         cands: list[tuple[float, dict[str, Any]]] = []
+        self.skipped_incomparable = 0
         for rec in self.all_programs(island=island):
             m = rec.get("metrics") or {}
             if metric not in m or not isinstance(m[metric], (int, float)):
                 continue
             if where and any(m.get(k) != v for k, v in where.items()):
+                continue
+            if fingerprints is not None and self.latest_fingerprints(rec["id"]) != fingerprints:
+                # 换了实验定义或评估器之后，旧成绩**不可比**——同名指标不代表同一件事。
+                # 跳过而不是当成 0，也不是静默混在一起排名。
+                self.skipped_incomparable += 1
                 continue
             cands.append((float(m[metric]), rec))
         if not cands:
