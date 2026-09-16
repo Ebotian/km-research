@@ -426,9 +426,10 @@ class InitResult:
     metrics: dict[str, Any] | None = None
     baseline_note: str | None = None
     run_dir: str = ""
-    # `--force` 时旧库被挪到哪去了。重建**不原地复用**旧库：换了实验定义之后，
-    # 旧成绩与新的不可比，混在一张表里会让 best() 排出一个不存在的「最好」。
-    archived_db: str | None = None
+    # `--force` 时旧实验被整体挪到哪去了。重建**不原地复用**：换了实验定义之后旧成绩
+    # 与新的不可比；而且只恢复库、不恢复骨架/评估器/实验定义，会留下一个**新旧混合的
+    # 实验**（库里的成绩是配旧骨架的，骨架却已经换了）。所以归档的是整个目录。
+    archived_dir: str | None = None
     # 打哪几个字段给用户看：来自实验定义，不由壳硬编码（与 EvalOutcome 同理）
     summary_fields: list[str] = field(default_factory=list)
 
@@ -493,14 +494,41 @@ def _unique_path(base: str) -> str:
     return cand
 
 
-def lab_paths(lab: str) -> dict[str, str]:
-    d = os.path.join(os.path.abspath(lab), EVOLVE_DIR)
+def evolve_dir_paths(d: str) -> dict[str, str]:
+    """实验目录里的六个路径。拆出来是因为**暂存目录要用同一套**：`init_lab` 先把整个
+    新实验建在一个 sibling 暂存目录里（同一个文件系统，`os.replace` 才能一次换过去），
+    建完再整体切换。"""
     return {"dir": d,
             "skeleton": os.path.join(d, "skeleton.py"),
             "evaluator": os.path.join(d, "evaluator.py"),
             "problem": os.path.join(d, "problem.json"),
             "candidates": os.path.join(d, "candidates"),
             "db": os.path.join(d, "programs.sqlite")}
+
+
+def lab_paths(lab: str) -> dict[str, str]:
+    return evolve_dir_paths(os.path.join(os.path.abspath(lab), EVOLVE_DIR))
+
+
+def _rewrite_run_dirs(live_dir: str, staging_dir: str) -> None:
+    """把运行史里记的**暂存期路径**改成切换后的正式路径。
+
+    基线评估是在暂存目录里跑的，`evaluations.run_dir` 存的就是那条路径；目录一改名，
+    它指向的地方就不存在了，「这个数字哪来的」当场断掉。搬完要顺手把门牌换掉。
+    """
+    import sqlite3
+
+    db = os.path.join(live_dir, "programs.sqlite")
+    if not os.path.isfile(db):
+        return
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE evaluations SET run_dir = replace(run_dir, ?, ?)"
+                     " WHERE run_dir LIKE ?",
+                     (staging_dir, live_dir, staging_dir + "%"))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def check_evaluator_protocol(evaluator: str, skeleton: str, problem: str, *,
@@ -691,82 +719,114 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
     from opl_ledger import sha256_file
 
     p = lab_paths(lab)
-    archived = None
-    # == 顺序：**先把新输入验完，再动活库** ==
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    # == 顺序：**验输入 → 在暂存目录建完 → 整体切换** ==
     #
-    # 第四轮审阅 F3：旧版先归档、后检查输入，于是一个**无效请求**（比如骨架路径写错）
-    # 已经把正常实验的 `programs.sqlite` 挪走了——报错退出，但活库不见了。一次失败的
-    # 重建不该改变现有实验的状态，这是「失败要失败得干净」的最低要求。
-    for src, what in ((skeleton_src, "骨架"), (evaluator_src, "评估器"),
-                      (problem_src, "实验定义")):
-        if not os.path.isfile(src):
-            raise EvolveError(f"{what}文件不存在：{src}")
+    # 这条顺序是本轮（第六轮审阅 F2）修出来的，两个教训叠在一起：
+    #
+    #   1. 第四轮之前是「先归档活库、后检查输入」——一次无效请求（骨架路径写错）就把正常
+    #      实验的库挪走了。现在是**先验输入**（三个源文件在不在、实验定义合不合法、两阶段
+    #      协议探测），全部通过才碰活实验。
+    #   2. 只把校验提前还不够：**复制阶段**失败时（比如新骨架拷成功、新评估器拷失败），
+    #      活实验里已经是新旧混合——库被放回去了，骨架却换成了新的，而库里的成绩是配旧
+    #      骨架的。错误信息还说「已把旧库放回原处」，读起来像没事。所以现在整个新实验
+    #      （三份文件 + 运行史 + 库）都建在一个 sibling 暂存目录里，建完用一次
+    #      `os.replace` 整体换过去；任何一步失败，活实验**一个字节都没动**。
+    for src_path, what in ((skeleton_src, "骨架"), (evaluator_src, "评估器"),
+                           (problem_src, "实验定义")):
+        if not os.path.isfile(src_path):
+            raise EvolveError(f"{what}文件不存在：{src_path}")
     problem = load_problem(problem_src)  # 先校验，别把一个坏定义拷进去
 
     # 协议合规**正面探一次**，不合规就直接拒——别等到评估时把它误报成「候选被拒」：
-    # 不合规的评估器收到 `extract` 时 argparse 会以 2 结束，而那正是「候选不可用」的码。
-    # 探测拿的是**源文件**（还没拷进实验目录），所以探测失败时实验目录一个字节都没动。
+    # 不合规的 evaluator 收到 `extract` 时 argparse 会以 2 结束，而那正是「候选不可用」
+    # 的码。探测拿的是**源文件**（还没拷进任何实验目录），所以探测失败时一个字节都没动。
     bad_proto = check_evaluator_protocol(evaluator_src, skeleton_src, problem_src,
                                          timeout=timeout)
     if bad_proto:
         raise EvolveError(bad_proto)
 
-    if os.path.exists(p["db"]):
-        if not force:
-            raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
-        # **归档旧库**，不原地复用：换了实验定义之后，旧成绩与新的不可比，
-        # 而「同名指标不代表可直接比较」。原地保留会让 best() 把两个实验混在一起排。
-        #
-        # 名字要**唯一**：第四轮审阅实测，精确到秒的时间戳在一次循环里重建两次就会撞，
-        # 而 `os.replace` 是覆盖式的——第二次重建会静默吃掉第一次的备份。
-        archived = _unique_path(f"{p['db']}.bak-{time.strftime('%Y%m%dT%H%M%S')}")
-        os.replace(p["db"], archived)
+    live = p["dir"]
+    initialized = os.path.isdir(live) and bool(os.listdir(live))
+    if initialized and not force:
+        raise EvolveError(f"实验目录已存在：{p['db']}（要重建加 --force）")
+
+    parent = os.path.dirname(live)
+    os.makedirs(parent, exist_ok=True)
+    staging = _unique_path(os.path.join(parent, f".evolve-new-{ts}"))
+    sp = evolve_dir_paths(staging)
+
+    # ---- 阶段一：把整个新实验建在暂存目录里（活实验不参与）----
     try:
-        os.makedirs(p["candidates"], exist_ok=True)
-        shutil.copyfile(skeleton_src, p["skeleton"])
-        shutil.copyfile(evaluator_src, p["evaluator"])
-        shutil.copyfile(problem_src, p["problem"])
+        os.makedirs(sp["candidates"], exist_ok=True)
+        shutil.copyfile(skeleton_src, sp["skeleton"])
+        shutil.copyfile(evaluator_src, sp["evaluator"])
+        shutil.copyfile(problem_src, sp["problem"])
+        code = open(sp["skeleton"], encoding="utf-8").read()
+        h, _ = code_hash(code)
+        facts = _stage_and_evaluate(sp, code, h, problem_path=sp["problem"],
+                                    timeout=timeout, mem_max_mb=mem_max_mb)
+        metrics, run_dir, kind, payload_exit = (facts.metrics, facts.run_dir,
+                                                facts.kind, facts.payload_exit)
+
+        # 基线用的判决函数与 eval_candidate **完全同一个**（`judge_run`）。
+        # 上一版 init 没有运行结局检查，于是 `kind=timeout` + 一份合法指标会被当成
+        # 可用基线写进 programs，而 evaluations 里同时记着 kind=timeout——
+        # 库同时保留「运行超时」与「这是成绩」。判决只能有一处实现。
+        j = judge_run(kind=kind, payload_exit=payload_exit, metrics=metrics,
+                      problem=problem, run_dir=facts.verdict_dir)
+        note = None
+        kept: dict[str, Any] | None = None
+        if j.trust_metrics:
+            kept = j.metrics
+        else:
+            note = (f"骨架未取得可用指标（{j.kind}）：{j.reason or ''}"
+                    f"；第 0 代没有 metrics，在补测之前 best() 对它视而不见").strip("：")
+        metrics = kept
+        with ProgramLibrary(sp["db"]) as lib:
+            res = lib.add(code=code, skeleton=None, generation=0, operation="init",
+                          metrics=None)
+            if res.program_id is not None:
+                # 基线也是一次运行，同样进运行史——「这个数字哪来的」要能一路查到 init
+                lib.add_evaluation(
+                    res.program_id, kind=j.kind, run_dir=run_dir,
+                    metrics=metrics if metrics else None,
+                    feasible=None if metrics is None else problem.feasible(metrics),
+                    note=None if metrics else (note or "基线未取得指标"),
+                    problem_sha256=sha256_file(sp["problem"]),
+                    evaluator_sha256=sha256_file(sp["evaluator"]),
+                    budget={"timeout_s": timeout, "mem_max_mb": mem_max_mb})
     except OSError as exc:
-        # 归档之后、三份文件就位之前还可能失败（盘满、权限）。把库放回原处，
-        # 宁可退回「重建没发生」，也不要留一个没有库的实验目录。
+        # 建到一半失败（拷不动、盘满、权限）：清掉暂存目录。**活实验从头到尾没被碰过**，
+        # 所以没有东西要回滚——这正是「先建暂存、再整体切换」买到的东西。
+        shutil.rmtree(staging, ignore_errors=True)
+        raise EvolveError(f"建新实验失败，活实验一个字节都没动：{exc}") from exc
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)   # 连 Ctrl-C 也要把暂存清干净
+        raise
+
+    # ---- 阶段二：整体切换（两次 rename，都在同一个文件系统内）----
+    #
+    # 归档的是**整个旧实验目录**（骨架、评估器、实验定义、运行史、库），不是只归档库：
+    # 只恢复库会让成绩与骨架对不上。名字要唯一——精确到秒的时间戳在循环里重建两次就会
+    # 撞，而 `os.replace` 是覆盖式的，第二次会静默吃掉第一次的备份。
+    archived = None
+    if initialized:
+        archived = _unique_path(os.path.join(parent, f".evolve-bak-{ts}"))
+        os.replace(live, archived)
+    try:
+        os.replace(staging, live)
+    except OSError as exc:
         if archived:
-            os.replace(archived, p["db"])
-        raise EvolveError(f"重建失败，已把旧库放回原处：{exc}") from exc
+            os.replace(archived, live)      # 切不过去就把旧的放回来
+        shutil.rmtree(staging, ignore_errors=True)
+        raise EvolveError(f"实验切换失败，旧实验已放回原处：{exc}") from exc
 
-    code = open(p["skeleton"], encoding="utf-8").read()
-    h, _ = code_hash(code)
-    facts = _stage_and_evaluate(p, code, h, problem_path=p["problem"],
-                                timeout=timeout, mem_max_mb=mem_max_mb)
-    metrics, run_dir, kind, payload_exit = (facts.metrics, facts.run_dir,
-                                            facts.kind, facts.payload_exit)
+    # 运行史里记的是**暂存期**的路径；目录换了名字，那些路径要跟着改，否则
+    # 「这个数字哪来的」会指向一个已经不存在的目录。这是搬家的一部分，不是修补。
+    _rewrite_run_dirs(live, staging)
+    run_dir = run_dir.replace(staging, live)
 
-    # 基线用的判决函数与 eval_candidate **完全同一个**（`judge_run`）。
-    # 上一版 init 没有运行结局检查，于是 `kind=timeout` + 一份合法指标会被当成
-    # 可用基线写进 programs，而 evaluations 里同时记着 kind=timeout——
-    # 库同时保留「运行超时」与「这是成绩」。判决只能有一处实现。
-    j = judge_run(kind=kind, payload_exit=payload_exit, metrics=metrics,
-                  problem=problem, run_dir=facts.verdict_dir)
-    note = None
-    kept: dict[str, Any] | None = None
-    if j.trust_metrics:
-        kept = j.metrics
-    else:
-        note = (f"骨架未取得可用指标（{j.kind}）：{j.reason or ''}"
-                f"；第 0 代没有 metrics，在补测之前 best() 对它视而不见").strip("：")
-    metrics = kept
-    with ProgramLibrary(p["db"]) as lib:
-        res = lib.add(code=code, skeleton=None, generation=0, operation="init",
-                      metrics=None)
-        if res.program_id is not None:
-            # 基线也是一次运行，同样进运行史——「这个数字哪来的」要能一路查到 init
-            lib.add_evaluation(
-                res.program_id, kind=j.kind, run_dir=run_dir,
-                metrics=metrics if metrics else None,
-                feasible=None if metrics is None else problem.feasible(metrics),
-                note=None if metrics else (note or "基线未取得指标"),
-                problem_sha256=sha256_file(p["problem"]),
-                evaluator_sha256=sha256_file(p["evaluator"]),
-                budget={"timeout_s": timeout, "mem_max_mb": mem_max_mb})
     summary = [problem.feasible_field] + (
         [problem.objective_field] if problem.objective_field else []) + \
         [f for f in problem.required if f not in (problem.feasible_field,
@@ -774,8 +834,9 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
     return InitResult(lab_dir=p["dir"], db_path=p["db"], skeleton=p["skeleton"],
                       evaluator=p["evaluator"], problem=p["problem"],
                       seeded_id=res.program_id, already_existed=force,
-                      metrics=metrics, baseline_note=note, run_dir=run_dir,
-                      archived_db=archived, summary_fields=summary)
+                      metrics=metrics, baseline_note=note,
+                      run_dir=run_dir,
+                      archived_dir=archived, summary_fields=summary)
 
 
 def eval_candidate(lab: str, candidate: str, *, generation: int = 1,

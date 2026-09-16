@@ -53,8 +53,9 @@ def main() -> int:
     c(f"骨架 {res.skeleton}")
     c(f"评估器 {res.evaluator}")
     c(f"实验定义 {res.problem}")
-    if res.archived_db:
-        c(f"旧库已归档：{res.archived_db}（换了实验定义之后，旧成绩与新定义不可比）")
+    if res.archived_dir:
+        c(f"旧实验已整体归档：{res.archived_dir}"
+          f"（含骨架、评估器、实验定义、运行史与库——只留库会让成绩与骨架对不上）")
     if res.metrics:
         # 打哪几个字段由**实验定义**决定，不在这里写死字段名（判据 F4）
         keys = res.summary_fields or sorted(res.metrics)
