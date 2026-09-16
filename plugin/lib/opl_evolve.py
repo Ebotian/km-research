@@ -68,7 +68,12 @@ CREATE TABLE IF NOT EXISTS programs (
     code         TEXT    NOT NULL,
     metrics_json TEXT,
     operation    TEXT,
-    created_at   TEXT    NOT NULL
+    created_at   TEXT    NOT NULL,
+    -- 「当前头条指标是哪一次运行跑出来的」。第八轮审阅 F1：原先 `best()` 用
+    -- **最近一次运行**的指纹去判断成绩属于哪个实验，而失败运行（超时等）不写指标、
+    -- 却会追加一行——于是「旧定义的成绩 + 新定义的指纹」被判为可比，一次超时补测就
+    -- 把旧成绩洗成了新实验的成绩。成绩必须跟着**产生它的那次评估**走。
+    metrics_evaluation_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS programs_cell ON programs (island, cell_key);
 
@@ -791,6 +796,16 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
     # 撞，而 `os.replace` 是覆盖式的，第二次会静默吃掉第一次的备份。
     archived = None
     if initialized:
+        # **搬迁之前**把旧库里属于这个实验的绝对索引改成相对形式——搬完就再也说不清
+        # 某条绝对路径原属哪个实验了。无法归属的只计数、不动它（见 migrate_run_dirs）。
+        with ProgramLibrary(p["db"]) as lib:
+            migrated, foreign = lib.migrate_run_dirs(live)
+        if migrated:
+            print(f"  迁移：{migrated} 条运行索引从绝对路径改成相对实验目录", file=sys.stderr)
+        if foreign:
+            print(f"  注意：{foreign} 条运行索引的绝对路径不属于这个实验目录，"
+                  f"已原样保留并标记（`opl-evolve-show --id` 会显示它们解不到）",
+                  file=sys.stderr)
         archived = _unique_path(os.path.join(parent, f".evolve-bak-{ts}"))
         os.replace(live, archived)
     try:
@@ -1034,6 +1049,25 @@ class ProgramLibrary:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._migrate()          # 旧库补列 + 回填「成绩的来源」
+
+    def _migrate(self) -> None:
+        """把旧库升到当前结构，并**回填**成绩的来源。
+
+        回填规则：`metrics_evaluation_id` = 该程序**最后一条带指标的评估**。这不是猜的
+        ——`add_evaluation()` 只在传入 metrics 时才更新 `programs.metrics_json`，所以
+        「头条指标」与「最后一条带指标的评估」在旧库里本来就是同一件事，这里只是把它
+        显式记下来。空着会导致该程序被视为「成绩来源不明」而退出比较。
+        """
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(programs)")}
+        if "metrics_evaluation_id" not in cols:
+            self.conn.execute("ALTER TABLE programs ADD COLUMN metrics_evaluation_id INTEGER")
+        self.conn.execute(
+            "UPDATE programs SET metrics_evaluation_id = ("
+            "  SELECT e.id FROM evaluations e WHERE e.program_id = programs.id"
+            "    AND e.metrics_json IS NOT NULL ORDER BY e.id DESC LIMIT 1)"
+            " WHERE metrics_json IS NOT NULL AND metrics_evaluation_id IS NULL")
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -1135,9 +1169,13 @@ class ProgramLibrary:
              json.dumps(budget, ensure_ascii=False, sort_keys=True) if budget else None,
              note, time.strftime("%Y-%m-%dT%H:%M:%S%z")))
         if metrics is not None:
-            self.conn.execute("UPDATE programs SET metrics_json = ? WHERE id = ?",
-                              (json.dumps(metrics, ensure_ascii=False, sort_keys=True),
-                               program_id))
+            # 指标与其来源**一起更新**：只改一个就会出现「成绩来自 A、身份写着 B」。
+            # 失败运行（metrics 为 None）只追加历史，不动头条指标、也不动来源。
+            self.conn.execute(
+                "UPDATE programs SET metrics_json = ?, metrics_evaluation_id = ?"
+                " WHERE id = ?",
+                (json.dumps(metrics, ensure_ascii=False, sort_keys=True),
+                 int(cur.lastrowid or 0), program_id))
         self.conn.commit()
         return int(cur.lastrowid or 0)
 
@@ -1153,6 +1191,9 @@ class ProgramLibrary:
             # 库里存的是相对实验目录的形式；对外的读接口给**绝对路径**，
             # 调用方（`opl-evolve-show`、运行史）拿到就能直接用。
             d["run_dir"] = self._abs_run_dir(d.get("run_dir"))
+            # 索引解不到就**明说**：死链与「指到别处」在调用方看来必须是两件事，
+            # 不能都给一个看起来正常的路径。
+            d["run_dir_exists"] = bool(d["run_dir"]) and os.path.isdir(str(d["run_dir"]))
             out.append(d)
         return out
 
@@ -1183,14 +1224,66 @@ class ProgramLibrary:
             args.append(limit)
         return [self._decode(dict(r)) for r in self.conn.execute(q, args)]
 
-    def latest_fingerprints(self, program_id: int) -> tuple[str | None, str | None]:
-        """某程序**最近一次**评估用的 (实验定义指纹, 评估器指纹)。"""
+    def migrate_run_dirs(self, evolve_dir: str) -> tuple[int, int]:
+        """把**属于这个实验目录**的绝对运行索引改成相对形式；返回 (已迁移, 无法归属)。
+
+        第八轮审阅 F2：0.4.0 及以前写的是绝对路径，归档之后那些索引仍指着**活实验**——
+        不只是死链，查旧成绩时可能打开新实验的产物。迁移必须在**搬迁之前**、拿旧路径做，
+        搬完就再也说不清某条绝对路径原属哪个实验了。
+
+        无法归属的（绝对路径不在这个实验目录下）**不猜、不改**，只如实计数交回调用方；
+        静默把它们当成正确索引，比留个死链更坏——那是在给一个来历不明的路径背书。
+        """
+        base = os.path.abspath(evolve_dir)
+        migrated = foreign = 0
         rows = self.conn.execute(
-            "SELECT problem_sha256, evaluator_sha256 FROM evaluations"
-            " WHERE program_id = ? ORDER BY id DESC LIMIT 1", (program_id,)).fetchone()
-        if rows is None:
+            "SELECT id, run_dir FROM evaluations"
+            " WHERE run_dir IS NOT NULL AND run_dir LIKE '/%'").fetchall()
+        for r in rows:
+            raw = str(r["run_dir"])
+            if os.path.abspath(raw).startswith(base + os.sep):
+                try:
+                    rel = os.path.relpath(raw, base)
+                except ValueError:
+                    foreign += 1
+                    continue
+                self.conn.execute("UPDATE evaluations SET run_dir = ? WHERE id = ?",
+                                  (rel, r["id"]))
+                migrated += 1
+            else:
+                foreign += 1
+        if migrated or foreign:
+            self.conn.commit()
+        return migrated, foreign
+
+    def metrics_provenance(self, program_id: int) -> dict[str, Any] | None:
+        """**当前头条指标**是哪一次运行跑出来的：返回那一行的关键字段。
+
+        为什么不是「最近一次运行」（第八轮审阅 F1）：失败运行（超时 / 评估器崩了）不写
+        指标，却会追加一行评估记录。拿「最近一次运行」当身份，等于让**没有产生任何成绩的
+        那次运行**去代表成绩的归属——一次超时补测就能把旧定义的成绩洗成新定义的。
+        成绩与它的来源必须不可分离，所以这里顺着 `metrics_evaluation_id` 查。
+        """
+        row = self.conn.execute(
+            "SELECT e.id, e.run_dir, e.problem_sha256, e.evaluator_sha256,"
+            "       e.metrics_json, e.kind, e.created_at"
+            "  FROM programs p JOIN evaluations e ON e.id = p.metrics_evaluation_id"
+            " WHERE p.id = ?", (program_id,)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["run_dir"] = self._abs_run_dir(d.get("run_dir"))
+        return d
+
+    def metrics_fingerprints(self, program_id: int) -> tuple[str | None, str | None]:
+        """当前头条指标所属那一次运行的 (实验定义指纹, 评估器指纹)。
+
+        没有来源（旧库没回填上、或记录被手工改过）就返回 `(None, None)`——调用方据此把
+        它排除在比较之外，而不是拿别的运行的指纹来顶。"""
+        prov = self.metrics_provenance(program_id)
+        if prov is None:
             return (None, None)
-        return (rows["problem_sha256"], rows["evaluator_sha256"])
+        return (prov.get("problem_sha256"), prov.get("evaluator_sha256"))
 
     def best(self, metric: str, *, minimize: bool = True, island: str | None = None,
              where: dict[str, Any] | None = None,
@@ -1210,17 +1303,25 @@ class ProgramLibrary:
         """
         cands: list[tuple[float, dict[str, Any]]] = []
         self.skipped_incomparable = 0
+        self.skipped_unattributed = 0
         for rec in self.all_programs(island=island):
             m = rec.get("metrics") or {}
             if metric not in m or not isinstance(m[metric], (int, float)):
                 continue
             if where and any(m.get(k) != v for k, v in where.items()):
                 continue
-            if fingerprints is not None and self.latest_fingerprints(rec["id"]) != fingerprints:
-                # 换了实验定义或评估器之后，旧成绩**不可比**——同名指标不代表同一件事。
-                # 跳过而不是当成 0，也不是静默混在一起排名。
-                self.skipped_incomparable += 1
-                continue
+            if fingerprints is not None:
+                mine = self.metrics_fingerprints(rec["id"])
+                if mine == (None, None):
+                    # 成绩在，但**说不清是哪一次跑出来的**（旧库没回填上、或被手工改过）。
+                    # 当成不可比并单独计数——不能拿别的运行的指纹替它作证。
+                    self.skipped_unattributed += 1
+                    continue
+                if mine != fingerprints:
+                    # 换了实验定义或评估器之后，旧成绩**不可比**——同名指标不代表同一件事。
+                    # 跳过而不是当成 0，也不是静默混在一起排名。
+                    self.skipped_incomparable += 1
+                    continue
             cands.append((float(m[metric]), rec))
         if not cands:
             return None

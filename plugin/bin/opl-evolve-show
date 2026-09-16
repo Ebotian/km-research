@@ -88,9 +88,18 @@ def main() -> int:
             rec["evaluations"] = lib.evaluations(args.id)
             print(json.dumps(rec, ensure_ascii=False, indent=2, sort_keys=True))
             c(brief(rec, keys))
+            # 哪一次运行产出了**当前头条指标**：成绩与它的来源必须分得开、也看得见
+            with ProgramLibrary(p["db"]) as lib2:
+                prov = lib2.metrics_provenance(args.id)
+            src_id = prov["id"] if prov else None
             for e in rec["evaluations"]:
+                mark = "  ← 当前成绩来自这次运行" if e["id"] == src_id else ""
+                gone = "" if e.get("run_dir_exists", True) else "  **索引解不到**"
                 c(f"  运行 #{e['id']}  {e['kind']:<22} feasible={e['feasible']}  "
-                  f"{e['created_at']}  {e.get('run_dir') or '-'}")
+                  f"{e['created_at']}  {e.get('run_dir') or '-'}{gone}{mark}")
+            if src_id is None and rec.get("metrics"):
+                c("  注意：这条程序的成绩说不清是哪一次运行跑出来的"
+                  "（旧库没回填、或被手工改过），best() 会把它排除在比较之外")
             return PASS
         if args.best:
             try:
@@ -120,6 +129,12 @@ def main() -> int:
             if getattr(lib, "skipped_incomparable", 0):
                 c(f"注意：跳过了 {lib.skipped_incomparable} 条**不同实验定义/评估器**的成绩"
                   f"——同名指标不代表可直接比较")
+            if getattr(lib, "skipped_unattributed", 0):
+                # 成绩在、但说不清是哪一次跑出来的：也必须报出来。**静默排除与「本来就没有」
+                # 看起来一模一样**，而两者的下一步完全不同（一个是修库/重跑，一个是继续找）。
+                c(f"注意：另有 {lib.skipped_unattributed} 条成绩**说不清是哪一次运行跑出来的**"
+                  f"（旧库没回填来源、或记录被改过），已排除在比较之外"
+                  f"——`opl-evolve-show --id <程序>` 会指出来源")
             if rec is None:
                 c(f"没有任何程序带指标 {args.best!r}"
                   + (f" 且满足 {where}" if where else "")
