@@ -510,27 +510,6 @@ def lab_paths(lab: str) -> dict[str, str]:
     return evolve_dir_paths(os.path.join(os.path.abspath(lab), EVOLVE_DIR))
 
 
-def _rewrite_run_dirs(live_dir: str, staging_dir: str) -> None:
-    """把运行史里记的**暂存期路径**改成切换后的正式路径。
-
-    基线评估是在暂存目录里跑的，`evaluations.run_dir` 存的就是那条路径；目录一改名，
-    它指向的地方就不存在了，「这个数字哪来的」当场断掉。搬完要顺手把门牌换掉。
-    """
-    import sqlite3
-
-    db = os.path.join(live_dir, "programs.sqlite")
-    if not os.path.isfile(db):
-        return
-    conn = sqlite3.connect(db)
-    try:
-        conn.execute("UPDATE evaluations SET run_dir = replace(run_dir, ?, ?)"
-                     " WHERE run_dir LIKE ?",
-                     (staging_dir, live_dir, staging_dir + "%"))
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def check_evaluator_protocol(evaluator: str, skeleton: str, problem: str, *,
                              timeout: float = 60.0) -> str | None:
     """评估器是否符合**两阶段协议**。返回 None 表示符合，否则返回原因。
@@ -822,10 +801,10 @@ def init_lab(lab: str, skeleton_src: str, evaluator_src: str, *, problem_src: st
         shutil.rmtree(staging, ignore_errors=True)
         raise EvolveError(f"实验切换失败，旧实验已放回原处：{exc}") from exc
 
-    # 运行史里记的是**暂存期**的路径；目录换了名字，那些路径要跟着改，否则
-    # 「这个数字哪来的」会指向一个已经不存在的目录。这是搬家的一部分，不是修补。
-    _rewrite_run_dirs(live, staging)
-    run_dir = run_dir.replace(staging, live)
+    # 运行史里记的是**相对实验目录**的路径（`ProgramLibrary._rel_run_dir`），暂存期与
+    # 正式期因此是同一个字符串——**提交之后不需要再写一次库**。第七轮审阅 F3 就是这一
+    # 步的残留：那时它在切换之后改库，一次失败会让命令报错，而活实验已经换成了新版。
+    run_dir = run_dir.replace(staging, live)   # 返回给调用方的仍是可导航的绝对路径
 
     summary = [problem.feasible_field] + (
         [problem.objective_field] if problem.objective_field else []) + \
@@ -1109,6 +1088,30 @@ class ProgramLibrary:
                              rejected_reason="internal: INSERT 成功但拿不到 lastrowid")
         return AddResult(True, program_id=int(new_id), code_hash=h)
 
+    def _rel_run_dir(self, run_dir: str | None) -> str | None:
+        """写库前把运行目录换成**相对实验目录**的形式。
+
+        为什么不是绝对路径（第七轮审阅 F2/F3）：实验目录会被整体归档/搬家，绝对路径一搬
+        就成死链，而且**归档库里的索引会指向活实验**——查看旧成绩时可能打开新实验的产物。
+        相对路径对「整个实验目录搬到哪」都成立，也就顺手消掉了「切换之后再改一次库」这个
+        提交后的写操作（F3：那样一次失败会让命令报错、而活实验已经换新）。
+        """
+        if not run_dir:
+            return run_dir
+        if not os.path.isabs(run_dir):
+            return run_dir
+        base = os.path.dirname(os.path.abspath(self.path))
+        try:
+            return os.path.relpath(run_dir, base)
+        except ValueError:               # 不同盘符之类：保持原样，不假装能相对
+            return run_dir
+
+    def _abs_run_dir(self, run_dir: str | None) -> str | None:
+        """读出来解析成绝对路径。0.4.0 及以前写的是绝对路径，照旧返回，不打回旧库。"""
+        if not run_dir or os.path.isabs(run_dir):
+            return run_dir
+        return os.path.join(os.path.dirname(os.path.abspath(self.path)), run_dir)
+
     def add_evaluation(self, program_id: int, *, kind: str, run_dir: str | None = None,
                        metrics: dict[str, Any] | None = None, feasible: bool | None = None,
                        problem_sha256: str | None = None,
@@ -1125,7 +1128,7 @@ class ProgramLibrary:
             "INSERT INTO evaluations (program_id, run_dir, kind, feasible, metrics_json,"
             " problem_sha256, evaluator_sha256, budget_json, note, created_at)"
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (program_id, run_dir, kind,
+            (program_id, self._rel_run_dir(run_dir), kind,
              None if feasible is None else int(feasible),
              json.dumps(metrics, ensure_ascii=False, sort_keys=True) if metrics else None,
              problem_sha256, evaluator_sha256,
@@ -1147,6 +1150,9 @@ class ProgramLibrary:
             d = dict(r)
             raw = d.pop("metrics_json", None)
             d["metrics"] = json.loads(raw) if raw else None
+            # 库里存的是相对实验目录的形式；对外的读接口给**绝对路径**，
+            # 调用方（`opl-evolve-show`、运行史）拿到就能直接用。
+            d["run_dir"] = self._abs_run_dir(d.get("run_dir"))
             out.append(d)
         return out
 

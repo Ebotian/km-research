@@ -587,8 +587,10 @@ def metrics_snapshot(spec: RunSpec, res: RunResult) -> dict[str, Any]:
     当场断掉。第六轮审阅正好撞上这一点：重建之后运行的快照**看起来**还在，来源却全是死链。
 
     路径是给人顺着找文件的，写相对的就是自足的：把整个实验目录搬到任何地方，这份
-    `metrics.json` 依旧指得准。数据库里的 `evaluations.run_dir` 仍存**绝对**路径——那是
-    索引，得能从库里直接导航；搬家时由 `init_lab` 负责把它改到新位置。
+    `metrics.json` 依旧指得准。数据库里的 `evaluations.run_dir` 现在也**相对实验目录**
+    存（`ProgramLibrary` 写时转相对、读出时解析成绝对）——同样是「一搬就活」的道理：
+    绝对索引在归档之后会指回**活实验**，查旧成绩时可能打开新实验的产物。两处一起，
+    实验目录搬到哪，证据与索引都跟着走。
     """
     base = spec.runner_dir or spec.workdir
     out_p = os.path.join(base, "stdout.txt")
