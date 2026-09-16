@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""opl-sign —— 本机签名密钥与验签。薄壳：逻辑在 lib/opl_sign.py。
+
+一个职责：让「这份证据/这条记录是谁写的」有一份可复查的凭据。密码学不自己实现，
+用系统自带 OpenSSH 的 `-Y sign` / `-Y verify`（SSHSIG，带命名空间）。
+
+用法：
+    opl-sign init [--force]            生成无口令的本机工具密钥 + 验签清单
+    opl-sign status [--json]           签名器状态（密钥、公钥、清单在哪）
+    opl-sign verify FILE...            验签；退出码 0 全部可信 / 1 有核不过的
+    opl-sign trust PUBKEY [--identity NAME]
+                                       把另一把公钥加进验签清单（本机自用不需要）
+
+退出码：
+    0 PASS     状态就绪 / 验签全部可信
+    1 REJECT   至少一个文件核不过（含「没有签名」）
+    2 USAGE    参数错误
+    4 MISSING  找不到 ssh-keygen（不自己实现密码学，也不静默降级到「不签」）
+
+密钥默认在 `~/.config/open-problem-lab/ledger_ed25519`，`OPL_SIGNING_KEY` 可覆盖。
+它是**本机工具密钥**：沙箱里的候选/评估器看不到它（沙箱只挂显式列出的文件），但同一
+用户下有 shell 的进程仍能读它——这一层降的是自欺的概率，不是不可伪造。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+
+from opl_common import MISSING, PASS, REJECT, USAGE, c, out_json, s  # noqa: E402
+from opl_sign import (SignError, allowed_signers_path, init_key, key_path,  # noqa: E402
+                      signer_state, ssh_keygen, verify_file)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(add_help=True)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    i = sub.add_parser("init")
+    i.add_argument("--force", action="store_true")
+    i.add_argument("--json", action="store_true")
+
+    st = sub.add_parser("status")
+    st.add_argument("--json", action="store_true")
+
+    v = sub.add_parser("verify")
+    v.add_argument("files", nargs="+")
+    v.add_argument("--json", action="store_true")
+
+    t = sub.add_parser("trust")
+    t.add_argument("pubkey")
+    t.add_argument("--identity", default="opl-local")
+
+    args = ap.parse_args()
+
+    if args.cmd == "init":
+        try:
+            kp, note = init_key(force=args.force)
+        except SignError as exc:
+            c(str(exc))
+            return MISSING if ssh_keygen() is None else USAGE
+        if args.json:
+            out_json({"ok": True, "key": kp, "allowed_signers": allowed_signers_path()})
+        else:
+            s("SIGNER_READY", kp)
+            c(note)
+            c("公钥可以给别人：它只能验，不能签；私钥不出本机。")
+        return PASS
+
+    if args.cmd == "status":
+        state, why = signer_state()
+        if args.json:
+            out_json({"state": state, "detail": why, "key": key_path(),
+                      "allowed_signers": allowed_signers_path(),
+                      "ssh_keygen": ssh_keygen()})
+        else:
+            s("SIGNER_READY" if state == "ready" else "SIGNER_MISSING", state)
+            c(why)
+        # 状态命令自己不是判决：就绪 0，其余 4/1 让调用方能分辨
+        if state == "ready":
+            return PASS
+        return MISSING if state == "no_tool" else REJECT
+
+    if args.cmd == "verify":
+        bad = 0
+        rows = []
+        for f in args.files:
+            ok, why = verify_file(f)
+            rows.append({"file": f, "ok": ok, "detail": why})
+            bad += 0 if ok else 1
+            c(why)
+        if args.json:
+            out_json({"ok": bad == 0, "files": rows})
+        s("SIGNATURE_OK" if bad == 0 else "SIGNATURE_BAD", f"{len(args.files) - bad}/{len(args.files)}")
+        if bad == 0:
+            return PASS
+        # 「验不了」与「验不过」必须分开：没有 ssh-keygen 时无从判定，报 REJECT 等于把
+        # 「我读不懂」说成「它是错的」——那是这个项目最不能犯的错（4 = 缺工具，1 = 有了
+        # 判决，判决是不可信）。
+        return MISSING if ssh_keygen() is None else REJECT
+
+    if args.cmd == "trust":
+        if not os.path.isfile(args.pubkey):
+            c(f"公钥文件不存在：{args.pubkey}")
+            return USAGE
+        line = open(args.pubkey, encoding="utf-8").read().strip()
+        with open(allowed_signers_path(), "a", encoding="utf-8") as fh:
+            fh.write(f'{args.identity} namespaces="open-problem-lab" {line}\n')
+        c(f"已加入验签清单：{args.identity}（{args.pubkey}）")
+        return PASS
+    return USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main())
