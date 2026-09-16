@@ -1,8 +1,18 @@
 = 工具链与组合契约
 
+#text(size: 10pt, fill: luma(90))[
+  同步状态（截至插件 `0.6.0`）：`M0`–`M4` 已交付并有回归覆盖（`M4` = `opl-evolve-*` 四个命令加 `opl-evolve` 技能），
+  `M5`（`opl-stat` 与 `opl-benchmark` 技能）和 `M6`（`opl-report`）未开始；命令 12 个、技能 5 个，
+  与原定的 13 个命令并不重合（差异见「命令清单」）。实现中还长出五处原计划没有的机制：
+  签名层（`opl-sign`：记录内嵌签名、证据旁挂 `<path>.sig`）、台账的事务式整笔校验（不自洽就一个字段都不写）、
+  评估器退出码与指标矛盾时不下判决（`UNKNOWN`，标签 `verdict_conflict`）、`opl-evolve-init` 先在暂存目录把新实验建完再整体切换、
+  成绩只跟随产生它的那次评估（`programs.metrics_evaluation_id`，来源不明者被排除并单独计数）。
+]
+
 == 为什么不是单体 `MCP` 服务器
 
 早期方案把 13 个能力塞进一个 Node stdio `MCP` 服务器。调研与实测都指向同一条反驳，因此改为单一职责的可执行文件。
+*与原计划的差异*：13 个是计划口径，插件 `0.6.0` 实际交付 12 个命令，且集合有出入——多出原计划未设想的签名层 `opl-sign`，缺少 `opl-stat` 与 `opl-report`。
 
 *一、保留 `MCP` 的主要理由不成立。* 原方案的论证是「`MCP` 工具只能按工具名做权限匹配，所以工具要拆窄，让 deny 能落在具体工具上」。但权限规则系统的一手事实是：`pattern` 字段接受 `ToolName` 或 `ToolName(arg-pattern)`，按顺序匹配、第一条命中即生效。既然 Bash 命令行也能被静态 allow/deny 精确约束，把能力藏在 `MCP` 方法后面就不再带来权限优势。
 
@@ -21,13 +31,19 @@
 #table(
   columns: (auto, auto, 1fr),
   table.header([*码*], [*判决*], [*含义*]),
-  [`0`], [`PASS`], [断言成立，且已被独立复核],
+  [`0`], [`PASS`], [这一步跑完并给出正面结果。*不等于「已被独立复核」*——判决强度看结构化字段与档位],
   [`1`], [`REJECT`], [断言被推翻：找到见证，或证书被判定无效],
   [`2`], [`USAGE`], [参数或输入错误],
   [`3`], [`UNKNOWN`], [无法判定，必须附原因。*绝不与 `1` 合并*],
-  [`4`], [`MISSING`], [所需后端不存在。此时不许回退到估算],
-  [`5`], [`EMPTY`], [正常运行但无结果：0 个候选、0 次执行。对齐 `pytest` 退出码 5 的设计],
+  [`4`], [`MISSING`], [所需后端不存在，*也包含没有签名器*。此时不许回退到估算，也不许产出无签名的证据],
+  [`5`], [`EMPTY`], [正常运行但无结果：0 个候选、0 次执行、重复提交、查询无匹配。对齐 `pytest` 退出码 5 的设计],
 )
+
+退出码只表达「这条命令完成了它那一步」；研究判决看结构化字段与档位，`0` 不等于已被独立复核。与最初的设计相比，`4` 与 `5` 的含义已经变宽，实况如下：
+
+- `4 MISSING` 现在还涵盖*没有签名器*：`opl-certcheck`、`opl-encode --eval-witness`、`opl-leancheck` 三个证据产出命令在找不到 `ssh-keygen` 或本机密钥时，不但不产出证据，还会删掉刚写下的那份；`opl-conj` 写台账同样是 `4`——不产出无签名的记录。
+- `5 EMPTY` 还用于「正常跑完但没有新增」：`opl-evolve-eval` 命中 `code_hash` 的重复提交、`opl-conj list` 查询无匹配。
+- `--evidence-out` 指向已存在的路径（或它的 `.sig`）时以 `2` 拒绝：证据不许被覆盖。
 
 由此得到三条硬性质：
 
@@ -49,24 +65,29 @@
 
 == 命令清单
 
-按管道阶段组织，每个命令一个职责。标注 `[已实现]` 的是本轮已通过实测的垂直切片。
+按管道阶段组织，每个命令一个职责。`[已实现]` 表示插件 `0.6.0` 里已交付并有回归覆盖，`[未实现]` 表示仍停在计划里。
+
+原计划 13 个命令，实际交付 12 个，且集合并不重合：多出原计划未设想的签名层 `opl-sign`，缺少 `opl-stat` 与 `opl-report`（连带 `opl-benchmark` 技能）。这处出入先记在这里，两个缺口保持在计划中待裁。
 
 #table(
   columns: (auto, auto, 1fr),
   table.header([*阶段*], [*命令*], [*一个职责*]),
-  [探测], [`opl-capabilities`] + [后端可用性与版本 → JSON。含功能探测，不只看存在性。`[已实现]`],
-  [登记], [`opl-conj`] + [猜想台账读写。一题一文件，状态变更强制带证据指针。`[已实现]`],
-  [复核], [`opl-certcheck`] + [证书独立复核：调度 `drat-trim` / `lrat-check`，翻译成退出码。`[已实现]`],
-  [编码], [`opl-encode`], [猜想加定义域 → CNF 或 SMT-LIB。编码错误的主要来源，需双后端交叉验证],
-  [搜索], [`opl-search`] + [跑后端，产出见证或证明。三态输出由退出码承载],
-  [证明], [`opl-leancheck`], [Lean 编译加公理审计：白名单、`sorry`、`native_decide`],
-  [实验], [`opl-run`], [运行快照：`cmd` / `env` / `capabilities` / `metrics`],
-  [统计], [`opl-stat`], [删失统计与 performance profile],
-  [进化], [`opl-evolve-init` / `-suggest` / `-eval` / `-show`], [程序搜索的四个 plumbing，共用一份 `SQLite`],
-  [报告], [`opl-report`], [台账加运行目录 → Typst 源码与 PDF],
+  [探测], [`opl-capabilities`], [后端可用性与版本 → JSON。含功能探测，不只看存在性。`[已实现]`],
+  [登记], [`opl-conj`], [猜想台账读写。一题一文件，状态变更强制带证据指针。`[已实现]`],
+  [复核], [`opl-certcheck`], [证书独立复核：调度 `drat-trim` / `lrat-check`，翻译成退出码。`[已实现]`],
+  [编码], [`opl-encode`], [猜想加定义域 → CNF 或 SMT-LIB。编码错误的主要来源，需双后端交叉验证。`[已实现]`],
+  [搜索], [`opl-search`], [跑后端，产出见证或证明。三态输出由退出码承载。`[已实现]`],
+  [证明], [`opl-leancheck`], [Lean 编译加公理审计：白名单、`sorry`、`native_decide`。`[已实现]`],
+  [实验], [`opl-run`], [运行快照：`cmd` / `env` / `capabilities` / `metrics`。`[已实现]`],
+  [统计], [`opl-stat`], [删失统计与 performance profile。`[未实现]`],
+  [进化], [`opl-evolve-init` / `-suggest` / `-eval` / `-show`], [程序搜索的四个 plumbing，共用一份 `SQLite`。`[已实现]`],
+  [报告], [`opl-report`], [台账加运行目录 → Typst 源码与 PDF。`[未实现]`],
+  [签名], [`opl-sign`], [本机签名密钥与验签（SSHSIG，命名空间 `open-problem-lab`）：记录的签名内嵌在 JSON 顶层 `signature`，证据的签名旁挂为 `<path>.sig`。原计划未列，实现中新增。`[已实现]`],
 )
 
-== 三个已实现命令的契约
+== 三个命令的契约
+
+`opl-capabilities`、`opl-certcheck`、`opl-conj` 三份契约是本文的基准；其余已实现的九个命令（`opl-encode`、`opl-search`、`opl-leancheck`、`opl-run`、`opl-evolve-*` 四个、`opl-sign`）用法以其 `--help` 为准。
 
 === `opl-capabilities`
 

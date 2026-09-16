@@ -2,13 +2,15 @@
 
 里程碑按「能否独立验收」切分，每个里程碑的验收标准必须是可执行的命令或可观察的输出，而不是形容词。
 
-每个里程碑的产出都遵守同一条约束：先做窄，做通了再加宽。命令集在 M0 到 M6 之间从 3 个增长到 13 个，每一步都保持可安装、可运行。
+每个里程碑的产出都遵守同一条约束：先做窄，做通了再加宽。原计划里命令集在 M0 到 M6 之间从 3 个增长到 13 个，每一步都保持可安装、可运行。
 
-== M0 契约与骨架
+同步状态（截至插件 `0.6.0`）：M0–M4 已实现并有回归覆盖（`plugin/scripts/regress.sh` 166 项通过 / 0 失败 / 0 跳过；无 Lean 时 150 通过 / 16 跳过），M5、M6 未开始；`bin/` 下 12 个命令、`skills/` 下 5 个技能。与计划对不上的地方写明在这里——计划的 13 个命令里落地 11 个（含计划中「实验」阶段的 `opl-run`），另加计划外的 `opl-sign`，合计 12 个；缺的两个正是 M5 的 `opl-stat` 与 M6 的 `opl-report`。技能同理：计划 7 个，落地 5 个，缺 `opl-benchmark`（M5）与 `opl-report`（M6）。
+
+== M0 契约与骨架 [已实现]
 
 *垂直切片已完成并通过实测*，用来先验证组合契约本身成立——退出码语义、流约定、能力探测的降级路径。
 
-交付：`kimi.plugin.json`、`skills/opl-entry/SKILL.md`、`bin/opl-capabilities`、`bin/opl-conj`、`bin/opl-certcheck`、`lib/opl_common.py`。
+交付（[已实现]）：`kimi.plugin.json`、`skills/opl-entry/SKILL.md`、`bin/opl-capabilities`、`bin/opl-conj`、`bin/opl-certcheck`、`lib/opl_common.py`。
 
 验收（全部已实测通过）：
 
@@ -18,11 +20,13 @@
 - `opl-conj` 在缺少 `--evidence` 时以退出码 `2` 拒绝状态变更。
 - `opl-certcheck` 对真证书返回 `0`、对内容篡改的证书返回 `1`、对空证书返回 `3`、对缺失后端返回 `4`；对 `R_4_4_18`（153 变量 / 6120 子句 / 8.4 MB `.bz2`）返回 `0`，460 毫秒。
 
-收口项：把技能正文写实，补 `opl-entry` 与 `opl-refute` 两个技能；`kimi.plugin.json` 里显式列出全部技能目录。
+收口项：把技能正文写实，补 `opl-entry` 与 `opl-refute` 两个技能——两个技能目录均已落地；`kimi.plugin.json` 里显式列出全部技能目录（现列 5 个，`sessionStart.skill` 指向 `opl-entry`）。
 
-== M1 编码与搜索
+同步状态（插件 `0.6.0`）：退出码在 `lib/opl_common.py` 定义，`0` PASS / `1` REJECT / `2` USAGE / `3` UNKNOWN / `4` MISSING / `5` EMPTY。两条比上面的验收条目更宽的用法记在这里——其一，`4` 同时表示「没有签名器」：三个产出证据的命令（`opl-certcheck`、`opl-encode --eval-witness`、`opl-leancheck`）在找不到 `ssh-keygen` 或本机密钥时不但不产出证据，还会删掉刚写下的那一份，写台账（`opl-conj`）同样是 `4`；其二，`5` 用于「正常运行但没有结果」，例如 `opl-evolve-eval` 的重复提交、`opl-conj list` 无匹配。另外，退出码只表达「这个命令完成了它那一步」，研究判决看结构化字段与档位——`0` 不等于「已被独立复核」。
 
-交付：`opl-encode`、`opl-search`、`skills/opl-refute/SKILL.md`。
+== M1 编码与搜索 [已实现]
+
+交付（[已实现]）：`opl-encode`、`opl-search`、`skills/opl-refute/SKILL.md`。
 
 验收：
 
@@ -30,9 +34,9 @@
 - `opl-search` 对可满足实例返回 `0` 且附带见证文件；对不可满足实例返回 `0` 且附证书文件；对超时返回 `3` 且附 `reason`。
 - 缺后端时返回 `4`，不返回 `1`。
 
-== M2 反例搜索闭环
+== M2 反例搜索闭环 [已实现]
 
-交付：`opl-search` 与 `opl-certcheck` 的串联、`lab/evidence/` 落盘、技能里的完整流程。
+交付（[已实现]）：`opl-search` 与 `opl-certcheck` 的串联、`lab/evidence/` 落盘、技能里的完整流程。
 
 验收（四项，缺一不可）：
 
@@ -41,9 +45,9 @@
 - *负向对照必须破坏证书内容*，例如翻转一个文字：退出码 `1`。注意「截断证明」是无效的负向对照——实测把 `uuf-100-1` 的末行空子句删掉后 `drat-trim` 仍报 `VERIFIED`，因为正向传播自己就导出了冲突；在 `example-4-vars` 上做任何篡改也不足以翻案，因为那个 CNF 本身不可满足。若用截断做验收，会得到一个永远通过的假验收。
 - 伪造格式误判时走 `3` 而不是 `1`：把一份压缩证书喂给按 DRAT 解析的路径，必须报「无法确认解析完整性」，不得报「证书无效」。
 
-== M3 形式化与证明验证
+== M3 形式化与证明验证 [已实现]
 
-交付：`opl-leancheck`、`skills/opl-formalize/SKILL.md`、`skills/opl-prove/SKILL.md`。
+交付（[已实现]）：`opl-leancheck`、`skills/opl-formalize/SKILL.md`、`skills/opl-prove/SKILL.md`。
 
 验收：
 
@@ -52,20 +56,24 @@
 - 一个已知定理（Mathlib 中已有）通过验证，且 `#print axioms` 输出落在白名单内。
 - 调用前若当前目录与祖先均无 `lean-toolchain`，工具报错而不是触发工具链下载。
 
-== M4 进化式程序搜索
+== M4 进化式程序搜索 [已实现]
 
-交付：`opl-evolve-init` / `-suggest` / `-eval` / `-show`、`skills/opl-evolve/SKILL.md`。
+交付（[已实现]）：`opl-evolve-init` / `-suggest` / `-eval` / `-show`、`skills/opl-evolve/SKILL.md`。
+
+同步状态（插件 `0.6.0`）：计划中「实验」阶段的 `opl-run` 也已实现，运行快照由它产出、`opl-evolve-eval` 依赖它，但计划只把它列在工具链章的命令清单里，路线图没有把它单列进任何里程碑，这里照实记一笔。
 
 验收：
 
 - 在一个玩具问题（小规模在线装箱或排序网络）上跑出优于初始骨架的候选。
 - 候选代码在 `bwrap` 或 `systemd-run` 沙箱内执行，禁网生效；一个故意死循环的候选被硬超时终止，且不影响调用方。
 - 提交一个把 `stdout` 写脏的候选：由于候选代码本就在独立进程里跑，退出码仍是 `0`（污染只落在该进程的流上）。
-- 同一份候选重复提交两次，第二次因 `code_hash` 命中而被拒绝并给出 `rejected_reason`。
+- 同一份候选重复提交两次，第二次因 `code_hash` 命中而被拒绝并给出 `rejected_reason`（退出码 `5` `EMPTY`，不是 `1`）。
 
-== M5 实证基准与统计
+== M5 实证基准与统计 [未实现]
 
-交付：`opl-stat`、`skills/opl-benchmark/SKILL.md`。
+交付（[未实现]）：`opl-stat` `[未实现]`、`skills/opl-benchmark/SKILL.md` `[未实现]`。
+
+同步状态（插件 `0.6.0`）：本节未开始——`bin/` 下没有 `opl-stat`，`skills/` 下也没有 `opl-benchmark` 目录，下面的验收项暂时没有可执行的对象；验收标准按计划保留不动。
 
 验收：
 
@@ -74,9 +82,11 @@
 - 对元数据不一致（核数或 governor 不同）的两组运行，工具拒绝合并并说明原因。
 - 跑基准前用 `cpupower` 固定 governor 并记录，否则结果标注为不可跨机器比较。
 
-== M6 报告与收口
+== M6 报告与收口 [未实现]
 
-交付：`opl-report`、`lab/report/` 模板、`references/` 深材料、README。
+交付（整条里程碑 `[未实现]`）：`opl-report` `[未实现]`、`lab/report/` 模板 `[未实现]`、`references/` 深材料 `[未实现]`、README（仓库根目录的 `README.md` 已在按实况维护，但它不在本节的三条验收标准里）。
+
+同步状态（插件 `0.6.0`）：本节未开始——没有 `opl-report`、没有报告技能，`lab/report/` 模板与 `references/` 深材料也都还不存在，三条验收项都无法执行。
 
 验收：
 
@@ -89,3 +99,14 @@
 M0 到 M6 的顺序不是按技术难度排的，而是按「自欺的暴露面」排的：先把契约、能力和台账做出来，研究者才能观察到自己的失败模式；再把验证器接上；最后才做搜索与改进。把搜索放前面会得到大量无法验证的中间结果，而这正是调研中 AI Scientist 多篇生成论文含幻觉数值的成因。
 
 M0 之所以先做，还有一个工程理由：退出码语义是整个工具链的地基，它错了后面每一步都会继承这个错误。实测中它已经暴露了五次——包括一次「坏解压器导致好证书被判成假」的伪证路径（见风险章）。
+
+== 同步状态：实现中新增、计划未设想的机制
+
+以下机制在实现中出现，原计划没有设想，上面各节的验收标准也还没有覆盖它们。记在这里只为让「设计」与「现状」的差异可见，不改设计意图，也不改各节的验收标准。
+
+- *签名层*（`opl-sign` + `lib/opl_sign.py`）：用系统自带的 OpenSSH `ssh-keygen -Y sign` / `-Y verify`（SSHSIG，命名空间 `open-problem-lab`）。记录是内嵌签名（记录 JSON 顶层 `signature` 字段，签的是去掉它之后的规范序列化，于是「写入 + 签名」是一次原子提交）；证据是旁挂签名（`<path>.sig`，由产出它的命令一次写出）。它挡的是「手写一份自洽的假证据」——哈希是自证的，`verdict` 只是文件里的一行字。信任边界要写清：密钥在本机（`~/.config/open-problem-lab/ledger_ed25519`，`OPL_SIGNING_KEY` 可覆盖），沙箱只挂显式列出的文件所以看不到它，但同一用户下有 shell 的进程仍然能读密钥、照样签——它降的是自欺的概率，不是不可伪造。
+- *台账事务式校验*（`lib/opl_ledger.py` 的 `apply_changes` / `validate_record`）：先把改动全部应用到副本，再校验改完的整条记录——结论与证据种类或判决、对象、范围、档位、被盖章的反例逐项对上；不自洽就整笔拒绝，一个字段都不写。
+- *评估器退出码契约与矛盾不下判决*：`0` 跑完（可行性看实验定义里的 `feasible` 字段）、`1` 按约定不可行（结论）、`2` 拒收候选、`3` 及以上是自身故障（不采信它写下的指标）；退出码与指标互相矛盾时返回 `UNKNOWN`（标签 `verdict_conflict`）。判决只有一处实现，`init` 与 `eval` 共用。
+- *`opl-evolve-init` 的事务*：先在 sibling 暂存目录 `.evolve-new-<ts>` 里把整个新实验建完（含基线评估与库），再整体切换；归档的是整个旧实验目录 `<lab>/.evolve-bak-<ts>`；提交之后不再有任何写操作。
+- *运行索引与成绩来源*：`evaluations.run_dir` 相对实验目录存储（读出时解析），归档后索引跟着归档走；`programs` 多一列 `metrics_evaluation_id`——当前头条指标是哪一次运行跑出来的，成绩跟着产生它的那次评估走，失败运行只追加历史、不动归属；来源不明的成绩被排除并单独计数。
+- *证据不许覆盖*：`--evidence-out` 指向已存在的路径（或它的 `.sig`）时以 `2` 拒绝。

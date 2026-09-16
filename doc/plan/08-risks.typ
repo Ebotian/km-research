@@ -11,11 +11,11 @@
   table.header([*层*], [*实测可用*]),
   [必需], [`python3` 3.14.7、`typst` 0.15.1],
   [证明], [`drat-trim`、`lrat-check`（`decompress` 存在但功能异常）；经软链挂进 `plugin/bin/third-party/`，不依赖 `PATH`],
-  [Lean], [Lean 4.33.1、Lake 5.0.0；`plugin/lean` 链到定点 toolchain `v4.33.0-rc1` 的项目，Mathlib 已构建],
+  [Lean], [Lean 4.33.0-rc1、Lake 5.0.0；`plugin/lean` 链到定点 toolchain `v4.33.0-rc1` 的项目，Mathlib 已构建],
   [SMT], [`z3` 4.16.0、`minisat`、`cryptominisat5`],
   [CAS], [`PARI/GP` 2.17.4、`fplll` 5.5.0],
   [基准], [`hyperfine` 1.20.0、`perf` 7.2.5、`cpupower` 7.2.5、`numactl` 2.0.19],
-  [沙箱], [`bwrap` 0.12.0、Docker 29.8.0、systemd 261],
+  [沙箱], [`bwrap` 0.12.0、Docker 29.8.0、systemd 261。能力经功能探测而非存在性探测：禁网只有 `bwrap --unshare-net` 有效（`systemd-run -p IPAddressDeny=any` 实测退出 `0` 却不隔离，因为根 cgroup 里没有 `bpf` 控制器），内存限额必须 `MemoryMax` 与 `MemorySwapMax=0` 一起下],
   [Python], [项目 venv（3.14.7）13 个模块全满足；系统 `python3` 只看得到 8 个],
   [仍缺], [`cadical`、`kissat`（官方源无，可由 PySAT 内建的 `CaDiCaL195` / `Glucose42` 顶上）；`cvc5` 作库可用但无命令行],
 )
@@ -30,19 +30,19 @@
   [能力探测同时覆盖*可执行文件与 Python 模块*，并按解释器分别探。库型后端（如 `cvc5`）只进模块层，不放进可执行文件层——否则会报 `not_found` 让消费者误判为不可用],
   [Python 依赖分裂],
   [曾出现系统 3.14 有 `z3`/`sympy`、另一 venv（基于 uv 下载的 3.12）有 `cvc5`/`ortools`，*没有任何单一解释器同时看得见两者*。这是最隐蔽的一类故障：每一侧单独看都正常],
-  [venv 必须基于系统解释器（`home = /usr/bin`）才能让 `--system-site-packages` 指向 pacman 的 site-packages；`opl-capabilities` 新增 `split_brain` 字段，当某一层没有任何解释器能同时满足时报警并列出各缺什么],
+  [venv 必须基于系统解释器（`home = /usr/bin`）才能让 `--system-site-packages` 指向 pacman 的 site-packages；`opl-capabilities` 新增 `split_brain` 字段，当某一层没有任何解释器能同时满足时报警并逐项列出各缺什么（`missing_by_interpreter`）。`[已实现]`],
   [CAS 重依赖],
   [`pacman -Sp sagemath` 需拉 112 个包共 460.2 MiB（其中 `gap` 单项 229 MiB）],
   [整类 CAS 能力标为可选重依赖，仅在探测到已安装时启用，不作为自动安装目标],
   [Lean 工具链未定点（已缓解，但引入外部依赖）],
   [elan 的 `default_toolchain = "stable"` 使每次 `lean` / `lake` 调用都要联网解析版本。实测在无 `lean-toolchain` 的目录里耗时 5.0 / 3.0 / 5.0 秒（两次撞上 5 秒预算）；同目录放入 `lean-toolchain` 后是 0.022 / 0.021 / 0.021 秒，用 `~/.elan/toolchains/<tc>/bin/` 绝对路径同样是 0.02 秒。*差 250 倍*，且哪一次超时纯看网络抖动],
-  [已把 `plugin/lean` 链到一个定点 toolchain 的项目（`leanprover/lean4:v4.33.0-rc1`，Mathlib 已构建 8,279 个 `.olean`）。经软链 `lake --version` 为 0.021 秒，`import Mathlib` 编译项目外文件 2.18 秒。`opl-capabilities` 新增 `lean_project` 探测，报告 `pinned` / `pinned_fast`（超过 1 秒即说明仍在联网）与 Mathlib 是否已构建。*代价*：该项目已归档，它被删除或移动会让 Lean 层失效；超时只标「暂不可用」，绝不缓存为「不存在」],
+  [已把 `plugin/lean` 链到一个定点 toolchain 的项目（`leanprover/lean4:v4.33.0-rc1`，Mathlib 已构建 8,279 个 `.olean`）。经软链 `lake --version` 为 0.021 秒，`import Mathlib` 编译项目外文件 2.18 秒。`opl-capabilities` 新增 `lean_project` 探测，报告 `pinned` / `pinned_fast`（超过 1 秒即说明仍在联网）与 Mathlib 是否已构建。`[已实现]`。*代价*：该项目已归档，它被删除或移动会让 Lean 层失效；超时只标「暂不可用」，绝不缓存为「不存在」],
   [内存与 CPU 无限制],
   [`ulimit -a` 的 cpu time 与 virtual memory 全为 `unlimited`；`/tmp` 是 16 GiB tmpfs],
-  [默认走 `systemd-run --user --scope`；沙箱内挂独立 tmpfs，避免写 `/tmp` 吃内存],
+  [原计划默认走 `systemd-run --user --scope`，*实测后改为自建 per-run cgroup 套住 `bwrap`*：transient scope 的 cgroup 在进程死后就被回收，`memory.events` 这条「内核直说因内存杀了它」的硬证据会一起失去。内存限额必须 `MemoryMax` 与 `MemorySwapMax=0` 一起下；沙箱内挂独立 tmpfs，避免写 `/tmp` 吃内存；CPU 配额*没有设*，快照里如实记 `cpu_quota: {"enforced": false, "reason": …}` 而不是假装设了],
   [磁盘配额不可用],
-  [`Docker --storage-opt size=` 需 xfs 加 pquota，本机 overlay2 落在 ext4；`tune2fs` 普通用户无权限],
-  [配额在应用层按目录累计字节数实现，并用 `RLIMIT_FSIZE` 兜底],
+  [`Docker --storage-opt size=` 需 xfs 加 pquota，本机存储驱动是 `overlayfs`（Docker 29.8.0 自报），落在 ext4；`tune2fs` 普通用户无权限],
+  [配额在应用层按目录累计字节数实现，并用 `RLIMIT_FSIZE` 兜底。`[未实现]`：实测 `lib/` 里既没有目录字节累计，也没有 `RLIMIT_FSIZE`，运行快照的 `budget` 只含 `timeout_s` 与 `mem_max_mb`——写盘目前没有应用层上限],
   [文献接口限流与计费],
   [OpenAlex 自 2026-02 起按次计费；Semantic Scholar 未认证共享池连续调用即 429],
   [工具层做以美元计的熔断；引导配置免费 API key 后按 1 RPS 串行],
@@ -87,6 +87,27 @@
 
 *自欺*是第四个，也是最难自动检测的。它不表现为错误结论，而表现为结论缺少必要的怀疑。对策写在第 6 章：验证器否决权、三态逻辑、空结果的独立退出码、以及禁止「工具不可用就估算」的 fallback。
 
+== 实现过程中新暴露的风险
+
+下面每一条都是原设计没有覆盖、由实现本身带出来的。它们不靠再写一层工程消除，只能靠写清楚——写清楚的目的，是让读者不再把它们当成不存在。
+
+#table(
+  columns: (auto, 1fr),
+  table.header([*风险*], [*为什么它算风险*]),
+  [签名的信任边界],
+  [签名层（`opl-sign` 与 `lib/opl_sign.py`，`[已实现]`）用系统自带 OpenSSH 的 `ssh-keygen -Y sign/verify`（SSHSIG，命名空间 `open-problem-lab`）：记录是*内嵌签名*（记录 JSON 顶层 `signature` 字段），证据是*旁挂签名*（`<path>.sig`）。它挡的是「手写一份自洽的假证据」——哈希是自证的，`verdict` 只是文件里的一行字。但*它降的是自欺的概率，不是不可伪造*：密钥在本机（`~/.config/open-problem-lab/ledger_ed25519`，`OPL_SIGNING_KEY` 可覆盖），沙箱只挂显式列出的文件所以看不到它，可*同一用户下有 shell 的进程（包括宿主 agent）仍然读得到密钥、照样签*。把「有签名」读成「来源可信」，就是把这道闸门误当零信任边界——它做的是把「写个 JSON」升级成「动一次密钥」，换来可计数、可审计、可事后复查，不是安全性证明],
+  [实验目录切换是两次 `rename`],
+  [`opl-evolve-init`（`[已实现]`）先在 sibling 暂存目录 `.evolve-new-<ts>` 里把整个新实验建完（含基线评估与库），再整体切换：`os.replace(live, .evolve-bak-<ts>)` 与 `os.replace(staging, live)` 是*两次* `rename`，第二次失败会把归档放回。两次之间没有原子性：*SIGKILL 或断电落在中间，会留下「活目录暂缺、旧实验完整躺在 `.evolve-bak-<ts>`」*。东西一个没丢，但没有哪条命令会自动把它放回去——恢复是人工的，而 `opl-evolve-show` 此时找不到活实验。这是「先建暂存、再整体切换」买到的那份原子性的边界，不是可以忽略的窗口],
+  [内嵌签名覆盖的是规范序列化，不是文件的原始字节],
+  [记录里被签名覆盖的那部分是去掉 `signature` 之后的*规范序列化*（键排序加固定缩进），不是盘上那份字节。换成规范序列化是为了让「写入加签名」合成一次 `os.replace`，代价是*逐字节完整性没有签名保护*：只改空白或键序的文件在签名上仍然有效，任何能写盘的人都可以重排一条记录而不破坏签名。语义改动会被看见，字符级改动不会——「盘上这份文件还是不是当初写下的那串字节」要靠哈希回答，签名不回答这个问题],
+  [程序库是派生索引，手工改库没有守卫],
+  [SQLite 程序库按设计就是*派生索引*：删掉它不丢信息，真源在实验目录的产物里（`[已实现]`）。由此而来的是——既然它随时可以被重建，就没有谁保证它与产物一致，*手工改库（改 `metrics_json`、改 `metrics_evaluation_id`、删一行评估）没有任何检测*。台账那一侧有事务式校验（先把改动全应用到副本、再校验改完的整条记录、不自洽就整笔拒绝、一个字段都不写），程序库这一侧没有对应的守卫；已有守卫只覆盖「来源不明」这一种：`evaluations.run_dir` 相对实验目录存储、读出时解析，解不到的、或者成绩说不清是哪一次评估跑出来的会被排除并单独计数（`opl-evolve-show --id` 会显示它们解不到）。把库当成可以手改的配置文件，得到的就是一张自己骗自己的成绩表],
+  [`0` 只说明「这一步跑完了」],
+  [退出码只表达「这个命令完成了它那一步」，*不等于「结论已被独立复核」*：研究判决看结构化字段与档位。同一批码位在实现里还长出过新含义——`4 MISSING` 现在*也*包含「没有签名器」：三个证据产出命令（`opl-certcheck`、`opl-encode --eval-witness`、`opl-leancheck`）在找不到 `ssh-keygen` 或没有本机密钥时不但不产出证据，还会*删掉刚写下的那份*；写台账（`opl-conj`）同样是 `4`。`5 EMPTY` 用于「正常运行但没有结果」（`opl-evolve-eval` 的重复提交、`opl-conj list` 无匹配）。`2 USAGE` 也多了一层用途：证据不许覆盖——`--evidence-out` 指向已存在的路径（或它的 `.sig`）即以 `2` 拒绝，因为产出流程是「先写正式文件、再签名」，而签名失败会删掉那份文件，于是同一路径写第二次、而签名器恰好不可用，会把先前那份*有效*证据连同签名一起删掉。把 `0` 读成「已复核」，正是本章说的自欺],
+  [评估器是外部约定，不是可信代码],
+  [评估器的退出码契约（`[已实现]`）是：`0` 跑完，可行性看实验定义的 `feasible` 字段；`1` 按约定不可行，这是*结论*；`2` 拒收候选；`≥3` 自身故障，*不采信*它写的指标。它约束的是「怎么读评估器的输出」，不约束评估器诚实——`0` 只是「它说它跑完了」，而可行性同样来自它写的字段，两处出自同一个不可信来源。退出码与指标互相矛盾时返回 `UNKNOWN`（标签 `verdict_conflict`），把矛盾显式化而不是任选一侧。真正独立的是「判决只有一处实现」：`init` 与 `eval` 共用同一段判据，所以不会对同一份运行给出两种结论——代价是改判据就同时改了两条路径],
+)
+
 == 待决问题
 
 以下问题在设计阶段无法自行决定，需要在实施前确认。它们不影响 M0 到 M1 的开工。
@@ -103,3 +124,7 @@
   [`opl-capabilities` 的必需层边界],
   [当前必需层只含 `python3` 与 `typst`，证明层与求解器层均为可选。是否要把 `drat-trim` 提升为必需——取决于是否接受「UNSAT 结论在它缺失时只能停在 `empirical`」],
 )
+
+== 同步状态
+
+截至插件 0.6.0：M0–M4 已交付并有回归覆盖，M5（`opl-stat` 与 `opl-benchmark` 技能）与 M6（`opl-report`）未实现；`bin/` 12 个命令、`skills/` 5 个技能。与原设计的一处差异在此写明而不自行裁定：原写「13 个能力/命令」，实际是 12 个且集合不同——多的是 `opl-sign`（原计划没有它），少的是 `opl-stat` 与 `opl-report`。本章「待决问题」里的几项在 M0–M4 期间都没有阻塞交付，也仍未裁定。
