@@ -88,6 +88,14 @@ $OPL/opl-conj set C-0001 --formal-status proved \
   --evidence lab/evidence/C0001.json --verification-level lean_checked
 ```
 
+`--evidence-out` 落盘时**自动签出 `<path>.sig`**（走系统自带的 `ssh-keygen -Y sign`，
+不自己实现密码学、不加第三方依赖）。这不是装饰：证据是「结论撑不撑得住」的唯一依据，
+所以「这句话是谁说的」也得有凭据。**没有签名器时这条命令以 `MISSING`(4) 结束，并删掉
+刚写下的文件——不留无签名的证据**，与「找不到 bwrap 就不降级到裸跑」是同一条纪律。
+本机还没有密钥就先跑 `$OPL/opl-sign init`（生成无口令的本机工具密钥，已有密钥不覆盖，
+除非 `--force`）；证据来自别的机器，就把那边的公钥用 `opl-sign trust` 加进验签清单。
+三个产出证据的命令都这样：`opl-certcheck`、`opl-encode --eval-witness`、`opl-leancheck`。
+
 - `--decl` 必须是证据里 `decls` 记着的名字之一。不点名，或点同一个文件里的**另一个**
   声明，都被拒（退出码 `2`）。理由是**路径一致不代表被证明的对象没变**——同一个
   `.lean` 文件里换一个定理就是换了一个命题，只比文件路径分不出这两件事。
@@ -103,10 +111,42 @@ $OPL/opl-conj set C-0001 --formal-status proved \
 以及种类 / 判决 / 对象是否仍与结论相称。所以「把 Lean 文件的内容换掉、路径不动」不再
 能让记录继续挂着 `proved`——核不过就整笔拒绝（退出码 `2`），一个字段都不写。
 
+上面这些检查加起来只说明这份证据**自洽**，而哈希是**自证**的：写文件的人同时写了被
+引用的文件。于是手写一份自洽的假证据可以全部通过——实测手写
+`{"kind":"witness_eval","verdict":"VERIFIED",…}` 连同它引用的见证，台账照收，把猜想
+定成 `refuted`、档位 `exact_certificate`、反例盖上 `independent`。`verdict` 只是文件里的
+一行字，没有任何东西验过它。所以 `load_evidence` 在**结构检查之后**加一道签名校验：
+**没有签名或核不过就拒**（退出码 `2`，理由点出签名），并指路 `opl-sign init` 或
+`opl-sign trust`。签名补的就是「这句话是谁说的」。
+
+## 记录本身也签，核不过的记录只有三条出路
+
+`save()` 写盘后同样签名；签名器不可用就**不写**（`MISSING`(4)），写了一半的会被清掉，
+连同可能遗留的旧签名——盘上留一份没签名的记录，读的时候分不出它和手写的 JSON。
+
+记录签名核不过，只可能是手写的、被工具之外的东西改过、或从别处拷来的：
+
+- **读**如实标注：`opl-conj get` 的 JSON 里多一个 `"provenance": {"signed": false,
+  "detail": …}`，并在 stderr 打印「未经证实」；`opl-conj list` 在行尾标
+  `（未签名/签名核不过）`，并给一条汇总。
+- **写**被拒（退出码 `2`），并告诉你两条出路。
+- **可以人工收编**：`opl-conj set <id> … --adopt --confirmed-by <谁>`。
+
+收编不是照单全收，而是**级联降级**：先记一条 `human_confirmations`（`what` 是
+`adopt-unsigned-record`，note 里记着收编时**那份文件的哈希**）；随后按「档位压回
+`empirical`」→「结论退回 `open`」→「核不过的复核章降成 `UNVERIFIED`」逐级降，每一步都进
+`history` 并在 stderr 打印「降级：…」；三步走完仍不自洽就如实抛错——那是别的问题，
+收编不替它兜底。签名正常时给 `--adopt` 会被拒（退出码 `2`）：静默忽略一个用户明确给的
+开关，会让他以为自己刚做过什么。
+
 ## 已经踩过的坑
 
 - **`#print axioms` 在无公理时打印 `'t' does not depend on any axioms`**，不是
   `depends on axioms: []`。只匹配后者会把最干净的证明判成「无法判定」。
+- **`ssh-keygen -Y sign` 在 `<path>.sig` 已存在时会问 `Overwrite (y/n)?`**，非交互读到
+  EOF 就什么都不做，而**退出码仍是 `0`**——于是「签名成功」其实是一份旧签名，内容一改
+  立刻变成「签名核不过」。所以签名前先删旧签名、签完当场自验，不过就丢弃。与上面
+  「编译通过」是同一条陷阱：**退出码 0 不是「事情做成了」**。
 - **`lean --json` 下退出码仍然有效**，但 stdout 每行是一个 JSON 对象——不要拿
   行文本去 grep 判决。
 - **无 import 的 Lean 文件连 `ℕ` 都不在作用域**，`(1:ℕ)+1=2` 会报
