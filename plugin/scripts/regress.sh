@@ -1725,7 +1725,8 @@ sys.exit(0)
     old_fp = None
     with E.ProgramLibrary(db) as lib:
         for rec in lib.all_programs():
-            old_fp = lib.latest_fingerprints(rec['id'])
+            # 成绩的来源（第八轮改成跟着「产生它的那次评估」走，不再取最近一次运行）
+            old_fp = lib.metrics_fingerprints(rec['id'])
     problem(999)                       # 换了题目参数（同一份代码，另一个问题）
     res = E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py',
                      problem_src=d + '/problem.json', force=True)
@@ -2350,6 +2351,150 @@ os.unlink(ev); os.unlink(ev + '.sig')
 r3 = subprocess.run(sub, capture_output=True, text=True, env=env)
 if r3.returncode != 0:
     why.append('删掉旧证据之后应能重做，得到 %d' % r3.returncode)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# ---- N9/R7：第八轮审阅的两条 ----
+#   N9 成绩必须跟着**产生它的那次评估**走：一次没有指标的运行（超时）不能给旧成绩
+#      贴上新一代的指纹
+#   R7 0.4.0 及以前的绝对运行索引，要在**搬迁之前**迁成相对形式；无法归属的不许静默采用
+chk "N9 没有指标的运行不得改变已有成绩的归属" 0 python3 -c "
+import json, os, shutil, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+from opl_ledger import sha256_file
+d = tempfile.mkdtemp(prefix='opl-r8.')
+why = []
+try:
+    sk = d + '/skel.py'
+    open(sk, 'w').write('# EVOLVE-BLOCK-START\ndef f(x):\n    return 1\n# EVOLVE-BLOCK-END\n')
+    shutil.copyfile('$work/r6-ev.py', d + '/ev.py')
+    shutil.copyfile('$work/r6-problem.json', d + '/problem.json')
+    lab = d + '/lab'
+    E.init_lab(lab, sk, d + '/ev.py', problem_src=d + '/problem.json')
+    db = lab + '/evolve/programs.sqlite'
+    with E.ProgramLibrary(db) as lib:
+        base = lib.metrics_provenance(1)
+        base_score = lib.best('score', minimize=True)['metrics']['score']
+    if base is None:
+        why.append('基线没有记下成绩的来源')
+    # 换实验定义：改的是**实验目录里那一份**（查询命令就是拿它算指纹的）
+    p = json.load(open(lab + '/evolve/problem.json'))
+    p['params']['k'] = 99
+    json.dump(p, open(lab + '/evolve/problem.json', 'w'))
+    fp = (sha256_file(lab + '/evolve/problem.json'),
+          sha256_file(lab + '/evolve/evaluator.py'))
+    with E.ProgramLibrary(db) as lib:
+        if lib.best('score', minimize=True, fingerprints=fp) is not None:
+            why.append('换了定义之后旧成绩仍在参与比较')
+    # 对**同一条程序**补测，注入超时（没有指标）
+    real = E._stage_and_evaluate
+    def tmo(pp, code, h, *, problem_path, timeout, mem_max_mb, _d=d):
+        rd = os.path.join(pp['dir'], 'runs', h[:16]); os.makedirs(rd + '/work', exist_ok=True)
+        return E.RunFacts(None, rd, 'timeout', {}, None, rd)
+    E._stage_and_evaluate = tmo
+    try:
+        out = E.eval_candidate(lab, sk, reevaluate=True)
+    finally:
+        E._stage_and_evaluate = real
+    if out.exit_code != 3:
+        why.append('注入的超时没被判成 UNKNOWN：rc=%d' % out.exit_code)
+    with E.ProgramLibrary(db) as lib:
+        after = lib.best('score', minimize=True, fingerprints=fp)
+        prov = lib.metrics_provenance(1)
+    if after is not None:
+        why.append('一次超时补测之后，旧成绩（%r）被当成了新定义的——'
+                   '成绩与产生它的那次评估被分开了' % after.get('metrics'))
+    if prov is None or base is None or prov['id'] != base['id']:
+        why.append('成绩的来源被那次超时运行顶掉了：%r → %r'
+                   % (base and base['id'], prov and prov['id']))
+    if prov and prov.get('kind') != base.get('kind'):
+        why.append('来源那一次的类型也变了：%r' % prov.get('kind'))
+    # 正向对照：**真正产生成绩**的那次运行才该改变归属
+    E._stage_and_evaluate = real
+    out2 = E.eval_candidate(lab, sk, reevaluate=True)
+    if out2.exit_code != 0:
+        why.append('补测（真跑）得到 rc=%d' % out2.exit_code)
+    with E.ProgramLibrary(db) as lib:
+        prov2 = lib.metrics_provenance(1)
+        got = lib.best('score', minimize=True, fingerprints=fp)
+    if prov2 is None or prov2['id'] == (base or {}).get('id'):
+        why.append('真正跑出成绩的那次没有被记为来源')
+    if got is None:
+        why.append('对照失败：新定义下真的跑出了成绩，却查不到')
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "R7 归档前迁移绝对索引；无法归属的不静默采用" 0 python3 -c "
+import json, os, shutil, sqlite3, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+d = tempfile.mkdtemp(prefix='opl-r8b.')
+why = []
+try:
+    sk = d + '/skel.py'
+    open(sk, 'w').write('# EVOLVE-BLOCK-START\ndef f(x):\n    return 1\n# EVOLVE-BLOCK-END\n')
+    shutil.copyfile('$work/r6-ev.py', d + '/ev.py')
+    shutil.copyfile('$work/r6-problem.json', d + '/problem.json')
+    lab = d + '/lab'
+    E.init_lab(lab, sk, d + '/ev.py', problem_src=d + '/problem.json')
+    db = lab + '/evolve/programs.sqlite'
+    live = lab + '/evolve'
+    # 模拟 0.4.0 及以前的格式：绝对路径
+    con = sqlite3.connect(db)
+    for eid, rd in con.execute('SELECT id, run_dir FROM evaluations').fetchall():
+        con.execute('UPDATE evaluations SET run_dir = ? WHERE id = ?',
+                    (os.path.join(live, rd or 'runs/x'), eid))
+    con.execute(\"INSERT INTO evaluations (program_id, run_dir, kind, created_at)\"
+                \" VALUES (1, '/别处/别人的运行目录', 'ok', '2026-01-01T00:00:00+0000')\")
+    con.commit(); con.close()
+    with E.ProgramLibrary(db) as lib:
+        migrated, foreign = lib.migrate_run_dirs(live)
+    if migrated < 1:
+        why.append('属于本实验的绝对索引没被迁移（migrated=%d）' % migrated)
+    if foreign != 1:
+        why.append('无法归属的那条被算成了 %d（应为 1：只计数、不改它）' % foreign)
+    con = sqlite3.connect(db)
+    left = con.execute(\"SELECT run_dir FROM evaluations WHERE run_dir LIKE '/%'\").fetchall()
+    con.close()
+    if [r[0] for r in left] != ['/别处/别人的运行目录']:
+        why.append('无法归属的那条被改动了：%r' % [r[0] for r in left])
+    # == 集成：归档时**应当自己**迁移（不靠调用方先手工迁一遍）==
+    # 单独建一个 lab 走这条路：直接调迁移器只能测到迁移器本身，测不到挂没挂上钩
+    # （实测踩过——第一版用例手工先迁了一遍，于是「不挂钩」的注入没被抓住）。
+    lab2 = d + '/lab2'
+    E.init_lab(lab2, sk, d + '/ev.py', problem_src=d + '/problem.json')
+    live2 = lab2 + '/evolve'
+    db2 = live2 + '/programs.sqlite'
+    con = sqlite3.connect(db2)
+    for eid, rd in con.execute('SELECT id, run_dir FROM evaluations').fetchall():
+        con.execute('UPDATE evaluations SET run_dir = ? WHERE id = ?',
+                    (os.path.join(live2, rd or 'runs/x'), eid))
+    con.commit(); con.close()
+    res = E.init_lab(lab2, sk, d + '/ev.py', problem_src=d + '/problem.json', force=True)
+    arch = res.archived_dir
+    acon = sqlite3.connect(os.path.join(arch, 'programs.sqlite'))
+    rows = [r[0] for r in acon.execute(
+        'SELECT run_dir FROM evaluations WHERE run_dir IS NOT NULL')]
+    acon.close()
+    if any(os.path.isabs(r) for r in rows if not r.startswith('/别处')):
+        why.append('归档库里仍有指向别处的绝对索引：%r' % rows)
+    if not any(os.path.isdir(os.path.join(arch, r)) for r in rows if not r.startswith('/别处')):
+        why.append('归档库里的相对索引解析不到归档目录里：%r' % rows)
+    # 成绩来源不明的要**显式排除**，不能拿别的运行顶替
+    with E.ProgramLibrary(db) as lib:
+        lib.conn.execute('UPDATE programs SET metrics_evaluation_id = NULL WHERE metrics_json IS NOT NULL')
+        lib.conn.commit()
+        got = lib.best('score', minimize=True, fingerprints=(None, None))
+        n = lib.skipped_unattributed
+    if got is not None:
+        why.append('成绩来源不明却仍被拿来比较')
+    if n < 1:
+        why.append('来源不明没有被计数（skipped_unattributed=%d）' % n)
+finally:
+    shutil.rmtree(d, ignore_errors=True)
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
