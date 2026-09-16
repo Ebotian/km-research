@@ -1352,8 +1352,15 @@ runs = [dict(r) for r in con.execute('SELECT id, run_dir, program_id FROM evalua
 con.close()
 if not runs:
     why.append('运行史是空的')
+BASE = '$EL/evolve'
 for r in runs:
     rd = r['run_dir']
+    if rd and os.path.isabs(rd):
+        # 第七轮审阅 F2：绝对路径一搬就成死链，而且**归档库的索引会指向活实验**。
+        # 库里存的是相对实验目录的形式，这里按相对解析并断言这一点。
+        why.append('运行 #%s 的 run_dir 存成了绝对路径（%r）' % (r['id'], rd))
+        continue
+    rd = os.path.join(BASE, rd) if rd else rd
     if not rd or not os.path.isdir(rd):
         why.append('运行 #%s 的目录不存在：%r' % (r['id'], rd))
         continue
@@ -1396,7 +1403,7 @@ if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
 chk "F5 运行史可查（show --id）" 0 python3 -c "
-import json, subprocess, sys
+import json, os, subprocess, sys
 r = subprocess.run(['$BIN/opl-evolve-show', '--lab', '$EL', '--id', '1',
                     '--json'], capture_output=True, text=True)
 why = []
@@ -1407,11 +1414,19 @@ else:
     evs = rec.get('evaluations') or []
     if not evs:
         why.append('show --id 没带出运行史')
+    # 运行史是**给人导航**的：`run_dir` 必须解析成绝对路径且真的在。
+    # 库里存的是相对实验目录的形式，所以这一条测的是读接口有没有把它接回绝对路径
+    # （注入「读出时不解析」时，这条必须变红——直接读 SQL 的用例测不到那一层）。
     for e in evs:
         if not e.get('kind'):
             why.append('运行史条目缺 kind：%r' % e)
         if 'created_at' not in e:
             why.append('运行史条目缺 created_at')
+        rd = e.get('run_dir')
+        if not rd or not os.path.isabs(rd):
+            why.append('运行史的 run_dir 不是绝对路径：%r（读接口没解析）' % rd)
+        elif not os.path.isdir(rd):
+            why.append('运行史的 run_dir 指不到：%r' % rd)
     # 运行史必须带「当时什么条件」——否则事后无法回答「这个数字哪来的」
     if evs and not any(e.get('evaluator_sha256') for e in evs):
         why.append('运行史没记评估器指纹，事后无法确认是哪份评估器跑的')
@@ -2254,8 +2269,12 @@ try:
         why.append('运行史是空的')
     for r in rows:
         rd = r['run_dir']
+        if rd and os.path.isabs(rd):
+            why.append('运行 %s 的 run_dir 存成了绝对路径（%r）' % (r['id'], rd))
+            continue
+        rd = os.path.join(d + '/lab/evolve', rd) if rd else rd
         if not rd or not os.path.isdir(rd):
-            why.append('运行 %s 的 run_dir 指不到（%r）——搬家没把门牌换掉' % (r['id'], rd))
+            why.append('运行 %s 的 run_dir 指不到（%r）' % (r['id'], rd))
             continue
         if '.evolve-new-' in rd:
             why.append('run_dir 还写着暂存目录：%r' % rd)
@@ -2268,8 +2287,69 @@ try:
                 if isinstance(v, str) and v and not v.startswith('（') \
                         and not os.path.exists(os.path.join(sd, v)):
                     why.append('快照来源指不到：%s/%s = %r' % (st, k, v))
+    # == 归档之后，旧库的索引必须落在**归档目录**里 ==
+    # 第七轮审阅 F2 的后果不只是死链：索引指着活实验，查看旧成绩时可能打开**新实验**的产物。
+    res = E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py',
+                     problem_src=d + '/problem.json', force=True)
+    arch = res.archived_dir
+    acon = sqlite3.connect(os.path.join(arch, 'programs.sqlite'))
+    arows = [dict(zip([c[0] for c in acon.execute('SELECT * FROM evaluations').description], r))
+             for r in acon.execute('SELECT * FROM evaluations')]
+    acon.close()
+    if not arows:
+        why.append('归档库里没有运行史')
+    for r in arows:
+        rd = r['run_dir']
+        if rd and os.path.isabs(rd):
+            why.append('归档库的 run_dir 是绝对路径：%r' % rd)
+            continue
+        resolved = os.path.join(arch, rd) if rd else ''
+        if not resolved or not os.path.isdir(resolved):
+            why.append('归档库的 run_dir 解不到归档目录里：%r' % rd)
+        elif os.path.abspath(resolved).startswith(os.path.abspath(d + '/lab/evolve')):
+            why.append('归档库的索引指回了活实验：%r' % resolved)
 finally:
     shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# ---- N8/R6-3：第七轮审阅的三条 ----
+#   N8  证据不许覆盖：同一路径写第二次、签名又失败，会把**先前那份有效证据**删掉；
+#       更根本的是台账按哈希引用证据，悄悄换掉同一路径上的内容会让记录失效
+#   R6-3 归档之后旧库的索引必须落在**归档目录**里（R6-2 里已断言；这条补「第二次写证据
+#       不行，但删掉之后可以重做」这个出路）
+chk "N8 证据不许覆盖：旧证据与旧签名都完好" 0 python3 -c "
+import json, os, subprocess, sys
+env = dict(os.environ)
+ev = '$work/n8-evidence.json'
+if os.path.exists(ev):
+    os.unlink(ev)
+if os.path.exists(ev + '.sig'):
+    os.unlink(ev + '.sig')
+sub = ['$BIN/opl-encode', '--spec', '$FIX/spec-pc23.json', '--eval-witness',
+       '$FIX/spec-pc23-witness.json', '--evidence-out', ev, '--subject', 'C-1']
+r1 = subprocess.run(sub, capture_output=True, text=True, env=env)
+why = []
+if r1.returncode != 0:
+    why.append('第一次就没写成：rc=%d %s' % (r1.returncode, r1.stderr[-100:]))
+    print('  ' + '；'.join(why), file=sys.stderr); sys.exit(1)
+before, sig_before = open(ev, 'rb').read(), open(ev + '.sig', 'rb').read()
+# 第二次：同一路径 + **签名器不可用**（旧行为会先覆盖正式文件、再 discard 掉它）
+r2 = subprocess.run(sub, capture_output=True, text=True,
+                    env=dict(env, OPL_SIGNING_KEY='$work/n8/没有这把密钥'))
+if r2.returncode != 2:
+    why.append('第二次应被拒（2 输出路径已存在），得到 %d' % r2.returncode)
+if not os.path.exists(ev) or open(ev, 'rb').read() != before:
+    why.append('原证据被覆盖或删掉了')
+if not os.path.exists(ev + '.sig') or open(ev + '.sig', 'rb').read() != sig_before:
+    why.append('原签名被覆盖或删掉了')
+if subprocess.run(['$BIN/opl-sign', 'verify', ev], capture_output=True).returncode != 0:
+    why.append('原证据不再验得过')
+# 出路：显式删掉之后可以重做
+os.unlink(ev); os.unlink(ev + '.sig')
+r3 = subprocess.run(sub, capture_output=True, text=True, env=env)
+if r3.returncode != 0:
+    why.append('删掉旧证据之后应能重做，得到 %d' % r3.returncode)
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
