@@ -220,8 +220,54 @@ def sign_file(path: str) -> str:
     return sig
 
 
+def sign_bytes(data: bytes) -> str:
+    """给一段字节签出一个 SSHSIG（armored 文本），返回签名本身而不是文件路径。
+
+    `ssh-keygen -Y sign` 只签文件，所以借一个临时文件：写进去、签、把签名读回来、
+    临时目录随 `TemporaryDirectory` 一起消失。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="opl-sign.") as tmp:
+        f = os.path.join(tmp, "payload")
+        with open(f, "wb") as fh:
+            fh.write(data)
+        sign_file(f)
+        with open(sig_path(f), encoding="utf-8") as fh:
+            return fh.read()
+
+
+def verify_bytes(blob: str, data: bytes) -> tuple[bool, str]:
+    """核对一段字节与一份 SSHSIG（armored 文本）。返回 (是否可信, 理由)。"""
+    import tempfile
+
+    exe = ssh_keygen()
+    if exe is None:
+        return False, ("找不到 ssh-keygen，无法验签：本插件的签名用 OpenSSH 的 "
+                       "`-Y sign`/`-Y verify`，不自己实现密码学。"
+                       "「验不了」与「验不过」是两件事——这里如实报前者。")
+    if not os.path.isfile(allowed_signers_path()):
+        return False, (f"缺少验签清单 {allowed_signers_path()}——`opl-sign init` 会按本机"
+                       f"公钥写好它；要验别处产出的签名，用 `opl-sign trust <公钥>` 加进去")
+    with tempfile.TemporaryDirectory(prefix="opl-verify.") as tmp:
+        sig = os.path.join(tmp, "sig")
+        with open(sig, "w", encoding="utf-8") as fh:
+            fh.write(blob)
+        res = _run([exe, "-Y", "verify", "-f", allowed_signers_path(), "-I", IDENTITY,
+                    "-n", NAMESPACE, "-s", sig], stdin=data)
+    if res.returncode != 0:
+        detail = res.stderr.decode("utf-8", "replace").strip().splitlines()
+        return False, (f"签名核不过（ssh-keygen 退出码 {res.returncode}）："
+                       f"{detail[-1] if detail else '（没有诊断输出）'}")
+    return True, "签名可信"
+
+
 def verify_file(path: str) -> tuple[bool, str]:
-    """核对 `<path>.sig`。返回 (是否可信, 理由)。
+    """核对一个文件的签名。返回 (是否可信, 理由)。
+
+    **两种形态都认**：内嵌（JSON 顶层有 `signature.value`）与旁挂（`<path>.sig`）。
+    内嵌是记录用的形态——记录与签名必须在同一个文件里才能整体切换；旁挂是证据用的
+    形态——证据由验证器一次写出，不存在「更新」这种事务（见 `opl_sign` 顶部说明）。
 
     **没有签名也是「不可信」**，而且理由要说得能办事：这是「谁写的」没有凭据，不是
     「文件坏了」。
@@ -236,6 +282,9 @@ def verify_file(path: str) -> tuple[bool, str]:
     sig = sig_path(path)
     if not os.path.isfile(path):
         return False, f"文件不存在：{path}"
+    embedded = read_embedded(path)
+    if embedded is not None:
+        return verify_bytes(embedded, payload_of(path))
     if not os.path.isfile(sig):
         return False, (f"没有签名：{sig} 不存在——这份文件无法证明是本插件产出的"
                        f"（手写的 JSON 与工具写出的 JSON 在这一层上必须分得开）")
@@ -255,3 +304,35 @@ def verify_file(path: str) -> tuple[bool, str]:
         return False, (f"签名核不过（ssh-keygen 退出码 {res.returncode}）："
                        f"{detail[-1] if detail else '（没有诊断输出）'}")
     return True, f"签名可信：{sig}"
+
+
+def read_embedded(path: str) -> str | None:
+    """文件里有没有内嵌签名（JSON 顶层 `signature.value`）。没有就返回 None。"""
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if isinstance(rec, dict):
+        sig = rec.get("signature")
+        if isinstance(sig, dict) and sig.get("value"):
+            return str(sig["value"])
+    return None
+
+
+def payload_of(path: str) -> bytes:
+    """内嵌签名覆盖的那部分字节：去掉 `signature` 之后的规范序列化。
+
+    与 `opl_ledger.canonical_bytes()` 必须**逐字节一致**。这里不 import 台账（台账要
+    import 本模块，会成环），改成同一条配方：`ensure_ascii=False, sort_keys=True,
+    indent=2` 加一个尾换行。两处若漂移，症状是「刚签好的文件立刻验不过」——N7 用例
+    盯着这一点。
+    """
+    import json
+
+    with open(path, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    payload = {k: v for k, v in rec.items() if k != "signature"}
+    return (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()

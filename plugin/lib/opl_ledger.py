@@ -52,6 +52,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Required, TypedDict
 
+from opl_sign import SignError, verify_file  # noqa: E402
+#   签名异常只此一处：壳里 `except` 抓的与库里 `raise` 的是同一个类。
+#   （曾经有两个同名不同类的 SignError，于是 save() 的清理路径**从未被执行**。）
+
 STATUSES = ["open", "proved_by_hand", "disproved"]
 FORMAL_STATUSES = ["open", "refuted", "proved", "no_counterexample_in_range", "inconclusive"]
 FORMALIZATION = ["none", "draft", "compiles", "faithfulness_checked"]
@@ -113,13 +117,13 @@ class LedgerError(Exception):
     """记录或参数不合法。调用方翻成 USAGE（退出码 2）。"""
 
 
-class SignError(RuntimeError):
-    """签名器不可用，或签名/验签失败。调用方翻成 MISSING（退出码 4）。
-
-    单独一个异常类型而不是复用 `LedgerError`：这两件事的出路不同——「记录不自洽」要
-    去修记录，「没有签名器」要去配密钥（或换台机器）。把它们并成一个码，用户会在一件
-    与参数无关的事情上来回改参数。
-    """
+# == 签名异常就是 opl_sign 的那一个，**别再定义一个同名类** ==
+#
+# 项目里原先有两个 `SignError`：`opl_sign.SignError`（签名器真正抛的）与
+# `opl_ledger.SignError`（壳里 `except` 抓的）。名字一样、类不同，于是 `save()` 的
+# 清理逻辑**从来没被执行过**——签名失败时它照常走到最后，正式路径上已经是新内容。
+# 实测就是这么撞上的。现在只留一个：本模块把它**别名**进来，壳里抓到的、库里抛的、
+# 都是同一个类。
 
 
 @dataclass
@@ -392,13 +396,24 @@ def load(cid: str, lab: str | None = None) -> Conjecture | None:
 
 
 def save(rec: Conjecture, lab: str | None = None) -> str:
-    """原子写入 + **签名**：先写 `.tmp` 再 replace，然后给记录签一份 `<path>.sig`。
+    """写一条记录：**暂存 → 签名 → 自验 → 一次原子提交**。
 
-    为什么写在库层而不是命令层：签名是「这份记录是工具写的」这个判据的唯一来源，
-    绕过它的入口一个都不该有。签名器不可用就**不写**（抛 `SignError`）——半个承诺比
-    没有承诺更坏：盘上留着一份没签名的记录，读的时候分不出它和手写的 JSON。
+    == 为什么是这个顺序（这是本轮修的事务缺口）==
+
+    旧写法是「写正式文件 → 再签名」，于是签名失败时正式路径上**已经是新内容**：旧记录
+    没了，而盘上那条新记录没有可用的签名（变成「签名核不过」）。更深的一层是两个异常
+    类——`opl_sign.SignError` 与 `opl_ledger.SignError` 是两个不同的类，`save()` 的
+    清理接不住前者。但**光修异常类型不够**：清理逻辑本身就是删正式文件，删完一样回不去。
+
+    所以改成：签名先算出来（内嵌进记录），整条写到一个 `.tmp`，**在暂存处验一遍**，
+    最后 `os.replace` 一次。任何一步失败都在 `os.replace` 之前，正式路径**一个字节都
+    没动**；也不存在「新记录配旧签名」这种中间态——记录与它的签名在同一个文件里。
+
+    提交之后顺手删掉可能遗留的旁挂 `.sig`：0.3.0 写出的记录是旁挂签名的，重写之后
+    那份 `.sig` 已经多余，留着只会让「这文件有几个签名」变成一道谜题。
     """
-    from opl_sign import sign_file, signer_state
+    from opl_sign import SignError as _SignError
+    from opl_sign import signer_state
 
     state, why = signer_state()
     if state != "ready":
@@ -406,21 +421,81 @@ def save(rec: Conjecture, lab: str | None = None) -> str:
     d = conj_dir(lab)
     os.makedirs(d, exist_ok=True)
     p = record_path(rec["id"], lab)
+    staged = embed_signature({k: v for k, v in rec.items() if k != SIGNATURE_FIELD})
     tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(rec, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-    os.replace(tmp, p)
     try:
-        sign_file(p)
-    except SignError:
-        # 写成了但没签上：把这份半成品清掉，连同可能遗留的旧签名（否则盘上会留下一份
-        # 「有签名、但签名不是这份内容」的记录，读的人会以为它可信）。
-        for stale in (p, p + ".sig"):
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(staged, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        # **在暂存处自验**：只有确认「暂存文件加它的签名当下就验得过」，才允许它变成
+        # 正式文件。「我说我签好了」不算，验得过才算。
+        ok, ver_why = verify_file(tmp)
+        if not ok:
+            raise SignError(f"暂存文件自验没通过，不提交（正式记录未改动）：{ver_why}")
+        os.replace(tmp, p)
+    except (SignError, _SignError, OSError):
+        for stale in (tmp, tmp + ".sig"):
             if os.path.exists(stale):
                 os.unlink(stale)
         raise
+    if os.path.exists(p + ".sig"):
+        os.unlink(p + ".sig")          # 内嵌签名已就位，旁挂的那份是冗余
     return p
+
+
+SIGNATURE_FIELD = "signature"
+SIGN_NAMESPACE = "open-problem-lab"
+
+
+def canonical_bytes(rec: dict) -> bytes:
+    """记录里**被签名覆盖**的那部分字节：去掉 `signature` 之后的规范序列化。
+
+    签**规范序列化**而不是文件的原始字节，是为了让「整体切换」成为可能：签名可以在
+    写盘之前算出来，于是「写入 + 签名」可以合成**一次** `os.replace`（见
+    `opl_ledger.save`）。代价是「只改空白/键序」的改动不再被签名看见——那不是语义变化，
+    可接受；任何**语义**改动都会改变这里的字节。
+    """
+    payload = {k: v for k, v in rec.items() if k != SIGNATURE_FIELD}
+    return (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
+
+
+SIGNATURE_FORMAT = "sshsig-embedded"
+
+
+def embed_signature(rec: dict) -> dict:
+    """给记录算一个**内嵌**签名：返回带 `signature` 字段的新记录（不改入参）。
+
+    为什么内嵌而不是旁挂一个 `.sig`：旁挂是两个文件，而两个文件**没法一起原子替换**。
+    实测过后果——签名失败时正式路径上已经是新内容、旧记录没了，而记录变成「签名核不过」。
+    内嵌之后，记录与它的签名在同一个文件里，提交就是一次 `os.replace`：
+
+        * 签名失败 → 暂存文件删掉，正式路径**一个字节都没动**；
+        * 提交失败 → 同上；
+        * 不存在「新记录配旧签名」这种中间态。
+    """
+    from opl_sign import SignError, sign_bytes
+
+    payload = canonical_bytes(rec)
+    try:
+        blob = sign_bytes(payload)
+    except SignError as exc:
+        raise SignError(f"记录签名失败，未写入任何东西：{exc}") from exc
+    out = {k: v for k, v in rec.items() if k != SIGNATURE_FIELD}
+    out[SIGNATURE_FIELD] = {"format": SIGNATURE_FORMAT, "namespace": SIGN_NAMESPACE,
+                            "value": blob}
+    return out
+
+
+def verify_embedded(rec: dict) -> tuple[bool, str]:
+    """核对内嵌签名。返回 (是否可信, 理由)。"""
+    from opl_sign import verify_bytes
+
+    sig = rec.get(SIGNATURE_FIELD)
+    if not isinstance(sig, dict) or not sig.get("value"):
+        return False, "记录里没有内嵌签名"
+    if sig.get("format") != SIGNATURE_FORMAT:
+        return False, f"不认识的签名格式：{sig.get('format')!r}"
+    return verify_bytes(str(sig["value"]), canonical_bytes(rec))
 
 
 def record_provenance(cid: str, lab: str | None = None) -> tuple[bool, str]:
