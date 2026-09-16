@@ -57,7 +57,7 @@
 
 === 当前实现状态
 
-同步状态：截至插件 `0.6.0`，里程碑 M0–M4 已实现并纳入回归，M5（`opl-stat` + `opl-benchmark`）与 M6（`opl-report`）未实现；命令 12 个、技能 5 个，`plugin/scripts/regress.sh` 166 项全通过（无 Lean 时 150 通过 / 16 跳过）、`plugin/scripts/verify-zip.sh` 52 项。
+同步状态：截至插件 `0.6.0`，里程碑 M0–M4 已实现并纳入回归，M5（`opl-stat` + `opl-benchmark`）与 M6（`opl-report`）未实现；命令 12 个、技能 5 个，`plugin/scripts/regress.sh` 167 项全通过（无 Lean 时 151 通过 / 16 跳过）、`plugin/scripts/verify-zip.sh` 56 项。
 
 M0 的垂直切片全部通过实测，用来验证组合契约本身成立：
 

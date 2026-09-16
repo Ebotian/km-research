@@ -471,7 +471,7 @@ per-run cgroup**（内存/进程数限额 + 收口 + OOM 归因）。三条实�
 
 
 ```bash
-plugin/scripts/build-zip.sh      # -> plugin/dist/open-problem-lab-<版本>.zip（约 758 KB）
+plugin/scripts/build-zip.sh      # -> plugin/dist/open-problem-lab-<版本>.zip（约 762 KB）
 plugin/scripts/verify-zip.sh     # 解压到干净目录并跑通两条链（反例侧 + 证明侧）
 ```
 
@@ -521,15 +521,15 @@ doc/
 一切都靠实跑，不靠声明：
 
 ```bash
-plugin/scripts/regress.sh        # 166 项退出码契约回归，夹具自包含
+plugin/scripts/regress.sh        # 167 项退出码契约回归，夹具自包含
 plugin/scripts/typecheck.sh      # mypy + pyright + ty
 plugin/scripts/verify-zip.sh     # 56 项：解压到干净目录并跑通两条链
 plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 ```
 
 回归里有两处**跳过**的路数，刻意与「通过」分开计数：Lean 相关的那几项在没有
-`lake` 或没有定点项目时**不跑**（`regress.sh` 那时报 `150 通过 / 0 失败 / 16 跳过`，
-环境齐备时报 `166 通过 / 0 失败 / 0 跳过`），`verify-zip.sh` 在同样情形下报
+`lake` 或没有定点项目时**不跑**（`regress.sh` 那时报 `151 通过 / 0 失败 / 16 跳过`，
+环境齐备时报 `167 通过 / 0 失败 / 0 跳过`），`verify-zip.sh` 在同样情形下报
 `50 通过 / 0 失败 / 5 跳过`，环境齐备时报 `56 通过 / 0 失败 / 0 跳过`。
 跳过与通过是两件事——把没跑的算成通过，正是这个项目最想防的那类错误。
 
@@ -571,7 +571,7 @@ plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 
 ## 状态
 
-**版本 `0.6.2`**（清单里的 `version` 是真源，压缩包名跟着它走）：
+**版本 `0.6.3`**（清单里的 `version` 是真源，压缩包名跟着它走）：
 
 | 版本 | 覆盖 | 破坏性改动 |
 |---|---|---|
@@ -585,6 +585,7 @@ plugin/scripts/install-hooks.sh  # 挂成提交前钩子
 | `0.6.0` | 修掉两处**归属缺口**。**成绩跟着产生它的那次评估走**：`programs` 多一列 `metrics_evaluation_id`（`add_evaluation()` 写指标时把来源一起更新，不会出现「成绩来自 A、身份写着 B」），`best()` 比的是**那一次运行**的实验定义 sha256 + 评估器 sha256，不再是最近一次运行——失败运行只追加运行史，指标与来源两处都不动，于是「一次超时补测把旧定义的成绩洗成新定义」这条路被堵死；成绩说不清来源的（旧库没回填上、或被手工改过）被排除并单独计数，`opl-evolve-show --id` 指出当前成绩来自哪一次运行。**旧库的绝对运行索引在归档前一次性迁移**：`init_lab` 在搬迁之前把属于该实验目录的绝对索引改成相对形式，无法归属的只计数、原样保留并标记（读接口因此多一个 `run_dir_exists`） | 两处：`programs` 直接多出一列 `metrics_evaluation_id`（直接读 SQL 的下游要注意）；**`best()` 会把来源不明的成绩排除在比较之外**（以前会拿别的运行的指纹顶），所以有些查询会从「有结果」变成空 |
 | `0.6.1` | 随设计文档同步更新两处**表述**：`lib/opl_common.py` 的退出码说明把 `0` 的含义收窄为「这一步完成了它那一步」（原文写着「且已被独立复核」，与四个候选实验侧的实际契约不符），并写明 `4 MISSING` 现在也含「没有签名器」；`kimi.plugin.json` 的 `interface.longDescription` 同步这两处措辞，`doc/` 各章补「同步状态」 | 无——行为、接口与产物结构都没变，改的是说明文字 |
 | `0.6.2` | 压缩包**内容**变了：随包带上 `README.md`（包内入口说明）与 `doc/` 的 Typst 源，并给打包脚本加了一条自检「包里不许出现 PDF」 | 无——插件行为没变，改的是包里装什么 |
+| `0.6.3` | 修掉一处**系统卫生**问题：沙箱内存探针用的是 transient `scope`，而`systemd-run` 不带 `--collect` 时，**被限额杀掉的单元会以 `failed` 永久留在用户的 systemd 里**——实测一天下来堆了 136 个 `opl-probe-mem-*.scope`（cgroup 早已释放、内存没漏，但单元一直挂着，`systemctl stop` 也不清 `failed` 状态）。现在：带 `--collect`（探测支持才带）、收口补一句 `reset-failed` 兜底，并加了一条回归用例（先断言限额**真的开火**，再按 pid 只查本次的单元，免得历史残留把用例永久弄红） | 无——插件行为未变 |
 
 0.x 里破坏性改动走 minor，所以是 `0.1.0 → 0.2.0`、`0.2.0 → 0.3.0`、`0.3.0 → 0.4.0`、
 `0.4.0 → 0.5.0`、`0.5.0 → 0.6.0`；`0.2.1` 与 `0.2.2` 都是 patch。

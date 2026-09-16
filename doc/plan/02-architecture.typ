@@ -1,6 +1,6 @@
 = 架构
 
-*同步状态*（插件 `0.6.0`）：命令 12 个、技能 5 个，M0–M4 已交付并有回归覆盖（`scripts/regress.sh` 166 项全通过），M5（`opl-stat` + `opl-benchmark` 技能）与 M6（`opl-report`）未开始。命令数与原计划不同——原计划 13 个能力，实际 12 个且集合不同：多出实现期新增的 `opl-sign`，少了 `opl-stat` 与 `opl-report`。下文 `[已实现]` 与 `[未实现]` 即按此标注。
+*同步状态*（插件 `0.6.0`）：命令 12 个、技能 5 个，M0–M4 已交付并有回归覆盖（`scripts/regress.sh` 167 项全通过），M5（`opl-stat` + `opl-benchmark` 技能）与 M6（`opl-report`）未开始。命令数与原计划不同——原计划 13 个能力，实际 12 个且集合不同：多出实现期新增的 `opl-sign`，少了 `opl-stat` 与 `opl-report`。下文 `[已实现]` 与 `[未实现]` 即按此标注。
 
 == 四个组件与一条边界
 
@@ -66,7 +66,7 @@
   [`skills/<name>/SKILL.md`], [技能正文；深材料与脚本放同级 `references/`、`scripts/`。`[已实现]`：5 个技能目录，同级那两个目录目前为空],
   [`bin/opl-*`], [单一职责命令集，零第三方依赖（Python 标准库 + POSIX shell）。`[已实现]`：12 个命令；随包分发的校验器二进制（`drat-trim`、`lrat-check`、`cake_lpr` 等）另放 `bin/third-party/`，它们是外部工具而非 Python 依赖],
   [`lib/`], [共享契约与实现的所在地。`[已实现]`：12 个模块 5,743 行。`opl_common.py` 定退出码常量与流约定，命令本体是薄壳；其余按域切分（`opl_ledger` 台账、`opl_sign` 签名、`opl_evolve` 进化、`opl_run` 运行、`opl_sandbox` 沙箱、`opl_probe` 探测）],
-  [`scripts/` 与 `hooks/`], [`[已实现]`：回归与打包脚本（`regress.sh` 166 项、`verify-zip.sh` 52 项）与一条 `pre-commit` 钩子。这两处是设计外新增的目录，不承担业务判断],
+  [`scripts/` 与 `hooks/`], [`[已实现]`：回归与打包脚本（`regress.sh` 167 项、`verify-zip.sh` 56 项）与一条 `pre-commit` 钩子。这两处是设计外新增的目录，不承担业务判断],
   [`tests/fixtures/`], [功能探测用的小样本（如 `tiny.clrat` 用于验证 `decompress` 是否可用）],
   [`lab/conjectures/<id>.json`], [猜想台账，一题一文件，记录内嵌 `signature`],
   [`lab/evidence/<id>.json`], [证据记录：后端、格式、SHA-256、解析完整性、耗时。路径由 `--evidence-out` 显式给出，一次写出、不许覆盖，并旁挂 `<path>.sig`],
