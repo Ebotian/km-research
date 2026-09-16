@@ -508,6 +508,49 @@ buf = bytearray(192 * 1024 * 1024)
 for i in range(0, len(buf), 4096):
     buf[i] = 1
 print('WROTE')"
+# 被限额杀掉的 scope **不许留在 systemd 里**。修之前实测堆了 136 个
+# `opl-probe-mem-*.scope`：cgroup 早释放了、内存没漏，但单元一直以 failed 挂着
+# （`systemctl stop` 不清 failed 状态；`systemd-run --collect` 才会跑完即卸）。
+# 断言分两步，**先证明这条链真跑了**（限额确实开火）再查残留——否则「什么都没有」
+# 与「清理干净了」看起来一模一样。
+if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+  chk "限额开火后不留失败的 scope 单元" 0 python3 -c "
+import os, subprocess, sys, time
+sys.path.insert(0, '$plugin/lib')
+import opl_probe
+why = []
+# **只查本次进程建的那几个单元**：探针的命名里带自己的 pid
+# （`opl-probe-mem-<pid>-z.scope`）。查「有没有任何 opl-probe-mem 单元」是不隔离的——
+# 历史残留会把这条用例永久弄红，那不是被测代码的错（实测踩过：注入后恢复代码，用例
+# 仍然红，因为上一轮注入留下的两个单元还在）。
+me = os.getpid()
+mine = 'opl-probe-mem-%d-' % me
+res = opl_probe.probe_sandbox()
+fires = res.get('mem_limit_fires') or {}
+swap_case = fires.get('MemoryMax + MemorySwapMax=0') or {}
+if not swap_case.get('killed'):
+    why.append('这条链没跑起来或限额没开火（%r）——那「没残留」说明不了清理' % (swap_case,))
+# --collect 是异步卸载：轮询几秒，别拿「立刻查一次」当判据（实测会误判）
+left = []
+deadline = time.monotonic() + 6
+while time.monotonic() < deadline:
+    q = subprocess.run(['systemctl', '--user', 'list-units', '--type=scope', '--all'],
+                       capture_output=True, text=True)
+    left = [ln.split()[0] for ln in q.stdout.splitlines() if mine in ln]
+    if not left:
+        break
+    time.sleep(0.2)
+if left:
+    why.append('被限额杀掉之后本次的单元仍留着：%s' % left[:4])
+    for u in left:
+        subprocess.run(['systemctl', '--user', 'reset-failed', u], capture_output=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+else
+  skip=$((skip + 1))
+  printf '  skip  %-46s 没有可用的 systemd 用户会话\n' "限额开火后不留失败的 scope 单元"
+fi
 # 这条**两种环境都有断言**：cgroup 可用时必须给出内核记账；不可用时快照必须
 # 明确写出「限额未生效」。没有「什么都不查也算过」的分支。
 chk "四份快照齐全、来源可追、归因如实" 0 python3 -c "

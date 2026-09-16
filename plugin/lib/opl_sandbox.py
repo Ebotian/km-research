@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from typing import Any
 
 # 只读绑定的系统路径。这份清单是**实测过能跑通 python3** 的最小集合，不要凭直觉加：
@@ -116,6 +117,34 @@ def bwrap_python_argv(python: str, code: str, **kw: Any) -> list[str]:
     return bwrap_argv([python, "-c", code], **kw)
 
 
+def _supports_collect() -> bool:
+    """`systemd-run --collect` 在不在（systemd 248+）。**探测而不是假设**。
+
+    它管的是「跑完（哪怕失败）就把 transient unit 卸掉」。没有它的时候，一个被限额
+    杀掉的 scope 会以 `failed` 状态**永久留在用户管理器里**——实测本机堆了 136 个
+    `opl-probe-mem-*.scope`（内存早就释放了，但单元一直在）。老 systemd 上退回到
+    `reset_failed_argv()` 那条路（见 `mem_case` 的收口）。
+    """
+    global _COLLECT
+    if _COLLECT is None:
+        try:
+            out = subprocess.run([SYSTEMD_RUN, "--help"], capture_output=True,
+                                 text=True, timeout=10)
+            _COLLECT = "--collect" in (out.stdout + out.stderr)
+        except (OSError, subprocess.SubprocessError):
+            _COLLECT = False
+    return _COLLECT
+
+
+_COLLECT: bool | None = None
+
+
+def reset_failed_argv(unit: str) -> list[str]:
+    """清掉一个单元的 `failed` 状态。`stop` 不会清它——被 OOM 杀掉的 scope 就是这么
+    一个个堆起来的。"""
+    return [SYSTEMCTL, "--user", "reset-failed", unit]
+
+
 def scope_argv(argv: list[str], *, unit: str, mem_max_mb: int | None = None,
                swap_max_mb: int = 0, cpu_quota_percent: int | None = None,
                pids_max: int | None = None) -> list[str]:
@@ -130,6 +159,8 @@ def scope_argv(argv: list[str], *, unit: str, mem_max_mb: int | None = None,
     if not unit.endswith(".scope"):
         raise ValueError(f"unit 必须以 .scope 结尾：{unit!r}")
     out = [SYSTEMD_RUN, "--user", "--scope", "--quiet", f"--unit={unit}"]
+    if _supports_collect():
+        out.append("--collect")          # 跑完就卸掉单元，失败也不留 failed 残留
     if mem_max_mb is not None:
         out += ["-p", f"MemoryMax={mem_max_mb}M", "-p", f"MemorySwapMax={swap_max_mb}M"]
     if cpu_quota_percent is not None:

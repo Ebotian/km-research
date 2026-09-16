@@ -402,6 +402,10 @@ def probe_sandbox(timeout: float = 20.0) -> dict[str, Any]:
                 swap_max_mb=0 if swap_zero else 1024 * 1024)
             rc, msg = _run_rc(argv, timeout)
             subprocess.run(sandbox.stop_unit_argv(unit), capture_output=True)
+            # `stop` 不清 `failed` 状态：被 OOM 杀掉的 scope 会以 failed 永久留在用户
+            # 管理器里（实测堆到 136 个）。`--collect` 正常情况下已把它卸掉，这一句是
+            # 老 systemd 上的兜底，也让「跑完不留单元」这件事不依赖探测结果。
+            subprocess.run(sandbox.reset_failed_argv(unit), capture_output=True)
             # 被杀（负退出码 / 137）才算限额开火；退出 0 说明它写完了，限额没用
             return {"exit": rc, "killed": rc is not None and rc != 0, "detail": msg}
 
