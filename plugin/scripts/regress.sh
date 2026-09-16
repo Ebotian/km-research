@@ -531,11 +531,21 @@ for name in ('cmd', 'env', 'capabilities', 'metrics'):
     load('T3', name)
 
 # ---- 判据 1：metrics 的每个字段能追到具体产物文件 ----
+# 来源写成**相对运行目录**的路径（第六轮改的）：绝对路径会把主机布局焊进产物，实验目录
+# 一搬家（init_lab 就是先建暂存、再整体切换）来源全变死链。所以这里按相对解析，并且
+# **反过来断言产物里不许出现绝对路径**——那正是「搬完还能追」的前提。
 m = load('T3', 'metrics') or {}
 src = m.get('sources') or {}
 arts = m.get('artifacts') or {}
 for k, v in list(src.items()) + list(arts.items()):
-    if isinstance(v, str) and v.startswith('/') and not os.path.exists(v):
+    if not isinstance(v, str) or not v:
+        continue
+    if v.startswith('/'):
+        why.append('metrics.%s 是绝对路径（%s）——搬个地方就成死链' % (k, v))
+        continue
+    if k in ('wall_ms', 'payload_exit_code') or v.startswith('（'):
+        continue                      # 说明性文字，不是路径
+    if not os.path.exists(os.path.join(R, 'T3', v)):
         why.append('metrics.%s 指向不存在的路径：%s' % (k, v))
 for need in ('stdout', 'stderr', 'workdir', 'runner_dir'):
     if need not in arts:
@@ -1359,10 +1369,29 @@ for r in runs:
         mp = os.path.join(sd, 'metrics.json')
         if os.path.isfile(mp):
             m = json.load(open(mp))
+            # `sources` 里只有这几个键装的是**路径**；`wall_ms` 与 `payload_exit_code`
+            # 按契约是人话（「runner 墙钟」之类），不该拿它们去 open()。
+            PATH_KEYS = ('stdout_bytes', 'stderr_bytes', 'peak_mem_bytes', 'oom_kill')
             for k, v in (m.get('sources') or {}).items():
-                if isinstance(v, str) and v.startswith('/') and not os.path.exists(v):
+                if k not in PATH_KEYS or not isinstance(v, str) or not v:
+                    continue
+                if v.startswith('（'):
+                    continue      # cgroup 不可用时这里写的是人话，不是路径
+                if v.startswith('/'):
+                    why.append('运行 #%s/%s 的 sources[%s] 是绝对路径（%s）——'
+                               '搬个地方就成死链' % (r['id'], st, k, v))
+                elif not os.path.exists(os.path.join(sd, v)):
                     why.append('运行 #%s/%s 的 metrics.sources[%s] 指向不存在的路径'
                                % (r['id'], st, k))
+            for k, v in (m.get('artifacts') or {}).items():
+                if not isinstance(v, str) or not v:
+                    continue
+                if v.startswith('/'):
+                    why.append('运行 #%s/%s 的 artifacts[%s] 是绝对路径（%s）'
+                               % (r['id'], st, k, v))
+                elif not os.path.exists(os.path.join(sd, v)):
+                    why.append('运行 #%s/%s 的 artifacts[%s] 指不到：%s'
+                               % (r['id'], st, k, v))
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
@@ -1685,8 +1714,13 @@ sys.exit(0)
     problem(999)                       # 换了题目参数（同一份代码，另一个问题）
     res = E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py',
                      problem_src=d + '/problem.json', force=True)
-    if not res.archived_db or not os.path.exists(res.archived_db):
-        why.append('--force 没有归档旧库（archived_db=%r）' % res.archived_db)
+    if not res.archived_dir or not os.path.isdir(res.archived_dir):
+        why.append('--force 没有归档旧实验（archived_dir=%r）' % res.archived_dir)
+    else:
+        # 归档必须是**整个实验**：只留库会让成绩与骨架对不上
+        for need in ('skeleton.py', 'evaluator.py', 'problem.json', 'programs.sqlite'):
+            if not os.path.isfile(os.path.join(res.archived_dir, need)):
+                why.append('归档里缺 %s' % need)
     with E.ProgramLibrary(db) as lib:
         if lib.count() != 1:
             why.append('重建后库里还有 %d 条（应为 1 条新基线）' % lib.count())
@@ -1866,9 +1900,19 @@ sys.exit(0)
     # 丙：同一秒里连续两次成功重建 —— 两份备份都要在（覆盖式 os.replace 会吃掉一份）
     E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py', problem_src=d + '/problem.json', force=True)
     E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py', problem_src=d + '/problem.json', force=True)
-    baks = sorted(x for x in os.listdir(d + '/lab/evolve') if '.bak-' in x)
+    baks = sorted(x for x in os.listdir(d + '/lab') if x.startswith('.evolve-bak-'))
     if len(baks) != 2:
         why.append('同一秒两次重建只留下 %d 份备份（应为 2）：%s' % (len(baks), baks))
+    for b in baks:
+        # 每份备份都得是**完整**的旧实验：只恢复库、不恢复骨架，等于留下一个新旧混合的
+        # 实验（库里的成绩是配旧骨架的）。这是本轮 F2 的正面断言。
+        for need in ('skeleton.py', 'evaluator.py', 'problem.json', 'programs.sqlite'):
+            if not os.path.isfile(os.path.join(d + '/lab', b, need)):
+                why.append('备份 %s 里缺 %s——回滚回去也是个残实验' % (b, need))
+    for junk in ('.evolve-new-',):
+        left = [x for x in os.listdir(d + '/lab') if x.startswith(junk)]
+        if left:
+            why.append('留下了暂存目录：%s' % left)
 finally:
     shutil.rmtree(d, ignore_errors=True)
 if why:
@@ -1993,8 +2037,10 @@ else:
     if f.get('formal_status') != 'open':
         why.append('收编把手工改出来的 %r 原样留下了——人签字只该负责内容，'
                    '不该替撑不住的结论背书' % f.get('formal_status'))
-    if not os.path.exists(p + '.sig'):
-        why.append('收编之后没有重新签名')
+    v = subprocess.run(['$BIN/opl-sign', 'verify', p], capture_output=True, text=True, env=env)
+    if v.returncode != 0:
+        why.append('收编之后记录仍不可信：签名没跟上（内嵌签名）——%s'
+                   % (v.stderr.strip()[-120:]))
 b = subprocess.run(['$BIN/opl-conj', 'set', 'N-2', '--add-bound', 'n>=2@hand'],
                    capture_output=True, text=True, env=env)
 if b.returncode != 0:
@@ -2025,6 +2071,208 @@ if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
 export OPL_LAB="$work/lab"
+# ---- N7/R6：第六轮审阅的两条事务缺口 ----
+#   N7 签名失败时**旧记录必须原样还在**（旧写法是「先写正式文件、再签名」，签名一失败
+#      正式路径上已经是新内容，旧记录没了，而新记录没有可用签名）
+#   R6 重建在**任何**阶段失败之后，活实验必须一个字节都没动；切换之后运行史还得指得准
+chk "N7-1 签名失败：旧记录原样，且不提交半个新版本" 0 python3 -c "
+import json, os, sys
+sys.path.insert(0, '$plugin/lib')
+import opl_ledger as L, opl_sign as S
+why = []
+# 类身份：曾经有两个同名不同类的 SignError，于是壳里的 except 从来抓不到
+if L.SignError is not S.SignError:
+    why.append('台账与签名器的 SignError 不是同一个类——壳里的 except 接不住')
+lab = '$work/n7lab'
+os.makedirs(lab, exist_ok=True)
+# 密钥放**自己的子目录**：`allowed_signers` 与密钥同目录，谁把密钥放在 $work 根下，
+# 谁的 init 就会把主密钥的验签清单覆盖掉（实测踩过：N 段之后一路「签名核不过」）。
+os.environ['OPL_SIGNING_KEY'] = '$work/n7/key'
+if not os.path.isfile('$work/n7/key'):
+    S.init_key()
+rec = L.new_record(cid='K-1', statement='第一版')
+p = L.save(rec, lab)
+before = open(p, 'rb').read()
+if not S.verify_file(p)[0]:
+    why.append('前置条件没建立：第一版没签上')
+real = S.sign_bytes
+def boom(_data):
+    raise S.SignError('注入：签名失败')
+S.sign_bytes = boom
+raised = None
+try:
+    rec2 = json.loads(json.dumps(rec)); rec2['statement_nl'] = '第二版'
+    L.save(rec2, lab)
+except Exception as exc:                       # noqa: BLE001
+    raised = exc
+finally:
+    S.sign_bytes = real
+if raised is None:
+    why.append('签名失败竟然没抛错')
+elif not isinstance(raised, S.SignError):
+    why.append('抛的是 %r，壳里只认 SignError' % type(raised).__name__)
+if open(p, 'rb').read() != before:
+    why.append('正式路径上已经不是旧记录了——**旧版本丢了**')
+if not S.verify_file(p)[0]:
+    why.append('旧记录不再可信（签名被这次失败写坏了）')
+left = [x for x in os.listdir(os.path.join(lab, 'conjectures')) if x.endswith('.tmp')]
+if left:
+    why.append('留下了暂存文件：%s' % left)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "N7-2 没有签名器时连写都不写（旧记录不动）" 0 python3 -c "
+import os, subprocess, sys
+# 自己一把密钥、自己一个目录，**用完删掉**：不能借主密钥，也不能动别人的清单
+key = '$work/n7b/key'
+lab = '$work/n7b/lab'
+os.makedirs('$work/n7b', exist_ok=True)
+env0 = dict(os.environ, OPL_SIGNING_KEY=key, OPL_LAB=lab)
+subprocess.run(['$BIN/opl-sign', 'init'], capture_output=True, env=env0)
+subprocess.run(['$BIN/opl-conj', 'add', '--id', 'K-2', '--statement', 'x'],
+               capture_output=True, env=env0)
+p = lab + '/conjectures/K-2.json'
+why = []
+if not os.path.isfile(p):
+    print('  前置条件没建立：记录没写出来', file=sys.stderr)
+    raise SystemExit(1)
+before = open(p, 'rb').read()
+os.unlink(key)                                 # 密钥没了 = 签名器不可用
+r = subprocess.run(['$BIN/opl-conj', 'set', 'K-2', '--add-bound', 'n>=2@hand'],
+                   capture_output=True, text=True, env=env0)
+why = []
+if r.returncode != 4:
+    why.append('退出码 %d（应为 4 MISSING）' % r.returncode)
+if open(p, 'rb').read() != before:
+    why.append('没有签名器却动了旧记录')
+if 'K-2' in open(p, 'rb').read().decode() and r.returncode == 0:
+    why.append('没有签名器却报成功')
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "R6-1 复制阶段失败：活实验一个字节都没动" 0 python3 -c "
+import json, os, shutil, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+d = tempfile.mkdtemp(prefix='opl-r6.')
+why = []
+try:
+    open(d + '/skel.py', 'w').write('# EVOLVE-BLOCK-START\ndef f(x):\n    return 1\n# EVOLVE-BLOCK-END\n')
+    open(d + '/ev.py', 'w').write('''
+import argparse, json, os, sys
+ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest='stage', required=True)
+e = sub.add_parser('extract'); e.add_argument('--problem'); e.add_argument('--candidate'); e.add_argument('--artifacts')
+v = sub.add_parser('verify'); v.add_argument('--problem'); v.add_argument('--artifacts'); v.add_argument('--metrics-out')
+a = ap.parse_args()
+if a.stage == 'extract':
+    os.makedirs(a.artifacts, exist_ok=True)
+    open(os.path.join(a.artifacts, 'a.json'), 'w').write('{}')
+    sys.exit(0)
+m = {'schema': 'opl.evolve.metrics/1', 'ok': True, 'score': 1}
+if a.metrics_out: json.dump(m, open(a.metrics_out, 'w'))
+sys.exit(0)
+''')
+    json.dump({'schema': 'opl.evolve.problem/1', 'params': {},
+               'metrics': {'feasible': {'field': 'ok', 'equals': True},
+                           'objective': {'field': 'score', 'minimize': True},
+                           'required': {'ok': 'bool', 'score': 'number'}}},
+              open(d + '/problem.json', 'w'))
+    E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py', problem_src=d + '/problem.json')
+    ev = d + '/lab/evolve'
+    # 记住活实验的每一个字节
+    before = {n: open(os.path.join(ev, n), 'rb').read()
+              for n in ('skeleton.py', 'evaluator.py', 'problem.json', 'programs.sqlite')}
+    # 新骨架复制成功、新评估器复制失败
+    open(d + '/skel2.py', 'w').write('# EVOLVE-BLOCK-START\ndef f(x):\n    return 2\n# EVOLVE-BLOCK-END\n')
+    open(d + '/ev2.py', 'w').write(open(d + '/ev.py').read())
+    real = shutil.copyfile
+    def flaky(src, dst, **kw):
+        if src.endswith('ev2.py'):
+            raise OSError('注入：复制评估器失败')
+        return real(src, dst, **kw)
+    E.shutil.copyfile = flaky
+    raised = None
+    try:
+        E.init_lab(d + '/lab', d + '/skel2.py', d + '/ev2.py',
+                   problem_src=d + '/problem.json', force=True)
+    except Exception as exc:                   # noqa: BLE001
+        raised = exc
+    finally:
+        E.shutil.copyfile = real
+    if raised is None:
+        why.append('复制失败竟然没抛错')
+    for n, want in before.items():
+        got = open(os.path.join(ev, n), 'rb').read()
+        if got != want:
+            why.append('%s 被改动了——失败的重建留下了新旧混合的实验' % n)
+    junk = [x for x in os.listdir(d + '/lab') if x.startswith('.evolve-new-')]
+    if junk:
+        why.append('留下了暂存目录：%s' % junk)
+    if raised is not None and '一个字节都没动' not in str(raised):
+        why.append('错误信息没说清活实验没被动过：%r' % str(raised)[:80])
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+cat > "$work/r6-ev.py" <<'PYEOF'
+import argparse, json, os, sys
+ap = argparse.ArgumentParser(); sub = ap.add_subparsers(dest='stage', required=True)
+e = sub.add_parser('extract'); e.add_argument('--problem'); e.add_argument('--candidate'); e.add_argument('--artifacts')
+v = sub.add_parser('verify'); v.add_argument('--problem'); v.add_argument('--artifacts'); v.add_argument('--metrics-out')
+a = ap.parse_args()
+if a.stage == 'extract':
+    os.makedirs(a.artifacts, exist_ok=True)
+    open(os.path.join(a.artifacts, 'a.json'), 'w').write('{}')
+    sys.exit(0)
+m = {'schema': 'opl.evolve.metrics/1', 'ok': True, 'score': 1}
+if a.metrics_out: json.dump(m, open(a.metrics_out, 'w'))
+sys.exit(0)
+PYEOF
+cat > "$work/r6-problem.json" <<'JSONEOF'
+{"schema": "opl.evolve.problem/1", "params": {},
+ "metrics": {"feasible": {"field": "ok", "equals": true},
+             "objective": {"field": "score", "minimize": true},
+             "required": {"ok": "bool", "score": "number"}}}
+JSONEOF
+chk "R6-2 切换之后运行史与快照来源仍指得准" 0 python3 -c "
+import json, os, shutil, sqlite3, sys, tempfile
+sys.path.insert(0, '$plugin/lib')
+import opl_evolve as E
+d = tempfile.mkdtemp(prefix='opl-r6b.')
+why = []
+try:
+    open(d + '/skel.py', 'w').write('# EVOLVE-BLOCK-START\ndef f(x):\n    return 1\n# EVOLVE-BLOCK-END\n')
+    shutil.copyfile('$work/r6-ev.py', d + '/ev.py')
+    shutil.copyfile('$work/r6-problem.json', d + '/problem.json')
+    E.init_lab(d + '/lab', d + '/skel.py', d + '/ev.py', problem_src=d + '/problem.json')
+    con = sqlite3.connect(d + '/lab/evolve/programs.sqlite')
+    rows = [dict(zip([c[0] for c in con.execute('SELECT * FROM evaluations').description], r))
+            for r in con.execute('SELECT * FROM evaluations')]
+    con.close()
+    if not rows:
+        why.append('运行史是空的')
+    for r in rows:
+        rd = r['run_dir']
+        if not rd or not os.path.isdir(rd):
+            why.append('运行 %s 的 run_dir 指不到（%r）——搬家没把门牌换掉' % (r['id'], rd))
+            continue
+        if '.evolve-new-' in rd:
+            why.append('run_dir 还写着暂存目录：%r' % rd)
+        for st in ('extract', 'verify'):
+            sd = os.path.join(rd, st)
+            if not os.path.isdir(sd):
+                continue
+            m = json.load(open(os.path.join(sd, 'metrics.json')))
+            for k, v in (m.get('artifacts') or {}).items():
+                if isinstance(v, str) and v and not v.startswith('（') \
+                        and not os.path.exists(os.path.join(sd, v)):
+                    why.append('快照来源指不到：%s/%s = %r' % (st, k, v))
+finally:
+    shutil.rmtree(d, ignore_errors=True)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
 # ---- suggest + 技能（判据 7/13 的收口）----
 # `suggest` 的核心不是「输出点什么」，而是**亲本必须有理由、且最好的那条真的是最好的**。
 # 这里刻意先放一条更差的候选再问：排序方向写反过一次（把 comparators=6 当成了「当前
