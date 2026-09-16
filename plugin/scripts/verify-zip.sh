@@ -72,6 +72,19 @@ chk "排序网络夹具在位" 0 test -f "$root/tests/fixtures/sortnet/evaluator
     -f "$root/tests/fixtures/sortnet/candidate-opt5.py" -a \
     -f "$root/tests/fixtures/sortnet/problem.json"
 chk "第三方许可声明在位" 0 test -f "$root/THIRD-PARTY-NOTICES.md"
+# 包内入口说明与设计文档源：拿到 zip 的人得知道这是什么、怎么装、缺什么
+chk "包内入口说明在位" 0 test -f "$root/README.md"
+chk "设计文档源在位"  0 test -f "$root/doc/main.typ" -a -f "$root/doc/plan/09-gaps.typ" \
+    -a -f "$root/doc/sections/01-kimi-plugin-spec.typ"
+# 只带源、不带编译产物：PDF 是 5 MB 级的可重生成物，混进包里说明打包逻辑坏了
+chk "包里没有 PDF"    0 test -z "$(find "$root" -name '*.pdf' -print -quit)"
+# 包内那份文档能不能编译——**能编才算随包带的是源而不是一堆碎片**。
+if command -v typst >/dev/null 2>&1; then
+  chk "包内文档可编译" 0 typst compile "$root/doc/main.typ" "$work/doc-check.pdf"
+else
+  skip=$((skip + 1))
+  printf '  skip  %-40s 没装 typst，无法判定\n' "包内文档可编译"
+fi
 chk "声明含 drat-trim 条款" 0 grep -qF "Permission is hereby granted, free of charge" "$root/THIRD-PARTY-NOTICES.md"
 chk "opl-sign 在包里且可执行"     0 test -x "$root/bin/opl-sign"
 chk "声明含 cake_lpr 条款" 0 grep -qF "CakeML is free software" "$root/THIRD-PARTY-NOTICES.md"

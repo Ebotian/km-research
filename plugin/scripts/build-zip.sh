@@ -47,12 +47,27 @@ mkdir -p "$root"
 echo "打包 $name v$ver -> $out_dir"
 
 # ---- 随包文件（不含 bin/third-party 与 lean）
-for item in kimi.plugin.json THIRD-PARTY-NOTICES.md skills lib tests scripts hooks; do
+for item in kimi.plugin.json README.md THIRD-PARTY-NOTICES.md skills lib tests scripts hooks; do
   [ -e "$item" ] || continue
   cp -r "$item" "$root/"
   echo "  + $item"
 done
 find "$root" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+
+# ---- 设计文档：**只带 Typst 源**，不带 doc/build 里编译出来的 PDF（5 MB 级，且可随时重编）
+# `doc/` 是插件的兄弟目录（仓库根在 `$plugin` 的上一层），所以单独拷。
+repo=$(dirname "$plugin")
+if [ -f "$repo/doc/main.typ" ]; then
+  mkdir -p "$root/doc"
+  cp -r "$repo"/doc/*.typ "$root/doc/"
+  for sub in plan sections; do
+    [ -d "$repo/doc/$sub" ] && cp -r "$repo/doc/$sub" "$root/doc/"
+  done
+  rm -rf "$root/doc/build"
+  echo "  + doc/（Typst 源，不含 build/）"
+else
+  echo "  ! 找不到 $repo/doc/main.typ：这次出包不含设计文档" >&2
+fi
 
 # ---- 第三方二进制：把符号链接换成真文件
 mkdir -p "$root/bin/third-party"
@@ -88,6 +103,12 @@ fi
 # 运行时代理依赖检查：能力探测要读它
 if [ ! -f "$root/tests/fixtures/tiny.clrat" ]; then
   echo "打包失败：缺 tests/fixtures/tiny.clrat —— 能力探测会静默退化" >&2
+  exit 1
+fi
+# 设计文档只带源：带上编译产物（PDF）说明上面的拷贝逻辑被改坏了，别默默出包。
+if find "$root/doc" -name '*.pdf' 2>/dev/null | grep -q .; then
+  echo "打包失败：包里出现了 PDF——设计文档只带 Typst 源" >&2
+  find "$root/doc" -name '*.pdf' >&2
   exit 1
 fi
 # 许可合规：包里有第三方二进制（含 cake_lpr/BSD-3 与 drat-trim/MIT），
