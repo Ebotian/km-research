@@ -30,6 +30,11 @@ fail=0
 # 跳过与通过是两件事：缺 Lean 项目时那几项*没跑*，不该显得像通过。
 skip=0
 
+# 签名密钥走临时文件（`OPL_SIGNING_KEY`）：回归**不碰**本机 `~/.config` 里那把真密钥，
+# 也就顺带证明了「密钥位置可覆盖」这条契约。没有签名器时台账与证据产出都会拒绝动作，
+# 所以这一行是后面所有用例的前提——它自己也应当被测（见 N1）。
+export OPL_SIGNING_KEY="$work/signing-key"
+
 chk() {
   local name=$1 want=$2
   shift 2
@@ -46,6 +51,9 @@ chk() {
 }
 
 # ---------------------------------------------------------------- 现造篡改样本
+# 密钥先生成好：没有签名器时台账与证据产出都会拒绝动作（这正是设计），
+# 后面所有用例都以此为前提。
+chk "N0 生成临时签名密钥" 0 "$BIN/opl-sign" init
 python3 - "$FIX" "$work" <<'PY'
 import sys, pathlib
 fix, work = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
@@ -1866,6 +1874,157 @@ finally:
 if why:
     print('  ' + '；'.join(why), file=sys.stderr)
 sys.exit(0 if not why else 1)"
+# ---- N：签名——「这份证据/这条记录是**谁写的**」----
+#
+# 台账已经能查「记录自洽」与「输入现在的内容」，两层都查不出**手写一份自洽的假证据**：
+# 哈希是自证的（写文件的人同时写了被引用文件），`verdict` 只是文件里的一行字。实测过
+# 那条路能一路走到 `refuted` / `exact_certificate`。签名补的就是这一层。
+NL="$work/nlab"
+export OPL_LAB="$NL"
+mkdir -p "$NL"
+chk "N1 没有签名器时不写台账，且不留半个文件" 0 python3 -c "
+import os, subprocess, sys
+env = dict(os.environ, OPL_SIGNING_KEY='$work/没有这把密钥', OPL_LAB='$NL')
+r = subprocess.run(['$BIN/opl-conj', 'add', '--id', 'N-1', '--statement', 'x'],
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 4:
+    why.append('退出码 %d（应为 4 MISSING：这是「去配密钥」，不是「参数写错」）' % r.returncode)
+if os.path.exists('$NL/conjectures/N-1.json'):
+    why.append('盘上留下了没签名的记录——半个承诺比没有承诺更坏')
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+$BIN/opl-conj add --id N-2 --statement "签名演示" >/dev/null 2>&1
+chk "N2 手写的自洽假证据 -> 2（哈希全对也不行）" 0 python3 -c "
+import hashlib, json, os, subprocess, sys
+env = dict(os.environ)
+def sha(p): return hashlib.sha256(open(p, 'rb').read()).hexdigest()
+w = '$work/N2-witness.json'
+json.dump({'y00': 1, 'y01': 1, 'y02': 1, 'y10': 1, 'y11': 1, 'y12': 1}, open(w, 'w'))
+spec = os.path.abspath('$FIX/spec-pc23.json')
+ev = '$work/N2-evidence.json'
+# 结构全对、方向对、对象对、哈希全对——**就是没有签名**
+json.dump({'schema': 'opl.evidence/1', 'kind': 'witness_eval', 'subject': 'N-2',
+           'verdict': 'VERIFIED', 'witness': os.path.abspath(w),
+           'witness_sha256': sha(w), 'spec': spec, 'spec_sha256': sha(spec)},
+          open(ev, 'w'))
+r = subprocess.run(['$BIN/opl-conj', 'set', 'N-2', '--formal-status', 'refuted',
+                    '--evidence', ev], capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 2:
+    why.append('退出码 %d（应为 2）' % r.returncode)
+if '签名' not in (r.stderr + r.stdout):
+    why.append('理由没点出签名：%r' % r.stderr.strip()[-120:])
+f = json.load(open('$NL/conjectures/N-2.json'))
+if f.get('formal_status') != 'open':
+    why.append('被拒之后结论变成了 %r' % f.get('formal_status'))
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "N3 真证据被改一个字节 -> 签名核不过" 0 python3 -c "
+import json, os, shutil, subprocess, sys
+env = dict(os.environ)
+shutil.copyfile('$work/ev-wit.json', '$work/N3.json')
+shutil.copyfile('$work/ev-wit.json.sig', '$work/N3.json.sig')
+raw = json.load(open('$work/N3.json'))
+raw['subject'] = 'N-2'                      # 对象对上，把「签名」那一层逼出来
+raw['n_assignments'] = 999                  # 改掉一个字节
+json.dump(raw, open('$work/N3.json', 'w'))
+r = subprocess.run(['$BIN/opl-conj', 'set', 'N-2', '--formal-status', 'refuted',
+                    '--evidence', '$work/N3.json'], capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 2:
+    why.append('退出码 %d（应为 2）' % r.returncode)
+if '签名' not in (r.stderr + r.stdout):
+    why.append('理由没点出签名：%r' % r.stderr.strip()[-120:])
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+# 这条锁住一个**退出码 0 的静默失败**：`ssh-keygen -Y sign` 在目标 .sig 已存在时会
+# 交互式问 "Overwrite (y/n)?"，非交互场景读到 EOF 就什么都不做，而**退出码仍是 0**。
+# 于是「签名成功」其实是上一版内容的旧签名，改完之后记录立刻变成「签名核不过」。
+chk "N4 同一路径改内容后再签，签名必须跟着更新" 0 python3 -c "
+import sys
+sys.path.insert(0, '$plugin/lib')
+from opl_sign import sign_file, verify_file
+p = '$work/N4.txt'
+for i, text in enumerate(('第一版', '第二版', '第三版')):
+    open(p, 'w').write(text)
+    sign_file(p)
+    ok, why = verify_file(p)
+    if not ok:
+        print('  第 %d 次签名之后验不过：%s' % (i + 1, why), file=sys.stderr)
+        raise SystemExit(1)
+open(p, 'w').write('偷偷改一下')
+ok, _ = verify_file(p)
+sys.exit(0 if not ok else 1)"
+chk "N5 手改记录：拒改 + 如实标注 + 可人工收编" 0 python3 -c "
+import json, os, subprocess, sys
+env = dict(os.environ)
+p = '$NL/conjectures/N-2.json'
+raw = json.load(open(p))
+raw['formal_status'] = 'refuted'            # 手工改出来的结论
+json.dump(raw, open(p, 'w'), ensure_ascii=False, indent=2)
+why = []
+r = subprocess.run(['$BIN/opl-conj', 'set', 'N-2', '--formal-status', 'proved',
+                    '--evidence', '$work/ev-wit.json'], capture_output=True, text=True, env=env)
+if r.returncode != 2 or '签名' not in (r.stderr + r.stdout):
+    why.append('手改之后改写没有被拦：rc=%d' % r.returncode)
+g = subprocess.run(['$BIN/opl-conj', 'get', 'N-2'], capture_output=True, text=True, env=env)
+if '\"signed\": false' not in g.stdout:
+    why.append('get 没有如实标注未经证实')
+l = subprocess.run(['$BIN/opl-conj', 'list'], capture_output=True, text=True, env=env)
+if '未签名' not in l.stdout and '签名核不过' not in l.stderr:
+    why.append('list 没有标出来')
+# 收编：人签字负责这份内容；撑不住的结论要被降下来，而不是照单全收
+a = subprocess.run(['$BIN/opl-conj', 'set', 'N-2', '--adopt', '--confirmed-by', 'EBT'],
+                   capture_output=True, text=True, env=env)
+if a.returncode != 0:
+    why.append('收编失败 rc=%d：%s' % (a.returncode, a.stderr[-140:]))
+else:
+    f = json.load(open(p))
+    conf = [h for h in f.get('human_confirmations', [])
+            if h.get('what') == 'adopt-unsigned-record']
+    if not conf:
+        why.append('收编没留下人工确认')
+    elif '哈希是' not in conf[-1].get('note', ''):
+        why.append('人工确认里没记下收编时看的是哪一份')
+    if f.get('formal_status') != 'open':
+        why.append('收编把手工改出来的 %r 原样留下了——人签字只该负责内容，'
+                   '不该替撑不住的结论背书' % f.get('formal_status'))
+    if not os.path.exists(p + '.sig'):
+        why.append('收编之后没有重新签名')
+b = subprocess.run(['$BIN/opl-conj', 'set', 'N-2', '--add-bound', 'n>=2@hand'],
+                   capture_output=True, text=True, env=env)
+if b.returncode != 0:
+    why.append('收编之后仍不能正常改写 rc=%d' % b.returncode)
+c = subprocess.run(['$BIN/opl-conj', 'set', 'N-2', '--adopt', '--add-bound', 'n>=3@hand'],
+                   capture_output=True, text=True, env=env)
+if c.returncode != 2:
+    why.append('签名正常时 --adopt 应被拒（静默忽略一个开关会让人以为做过什么），得到 %d'
+               % c.returncode)
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+chk "N6 没有签名器时证据产出命令也不留无签名的证据" 0 python3 -c "
+import os, subprocess, sys
+env = dict(os.environ, OPL_SIGNING_KEY='$work/没有这把密钥')
+out = '$work/N6-evidence.json'
+if os.path.exists(out):
+    os.unlink(out)
+r = subprocess.run(['$BIN/opl-encode', '--spec', '$FIX/spec-pc23.json', '--eval-witness',
+                    '$FIX/spec-pc23-witness.json', '--evidence-out', out, '--subject', 'N-2'],
+                   capture_output=True, text=True, env=env)
+why = []
+if r.returncode != 4:
+    why.append('退出码 %d（应为 4 MISSING）' % r.returncode)
+if os.path.exists(out) or os.path.exists(out + '.sig'):
+    why.append('留下了没有签名的证据文件')
+if why:
+    print('  ' + '；'.join(why), file=sys.stderr)
+sys.exit(0 if not why else 1)"
+export OPL_LAB="$work/lab"
 # ---- suggest + 技能（判据 7/13 的收口）----
 # `suggest` 的核心不是「输出点什么」，而是**亲本必须有理由、且最好的那条真的是最好的**。
 # 这里刻意先放一条更差的候选再问：排序方向写反过一次（把 comparators=6 当成了「当前

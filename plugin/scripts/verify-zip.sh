@@ -73,6 +73,7 @@ chk "排序网络夹具在位" 0 test -f "$root/tests/fixtures/sortnet/evaluator
     -f "$root/tests/fixtures/sortnet/problem.json"
 chk "第三方许可声明在位" 0 test -f "$root/THIRD-PARTY-NOTICES.md"
 chk "声明含 drat-trim 条款" 0 grep -qF "Permission is hereby granted, free of charge" "$root/THIRD-PARTY-NOTICES.md"
+chk "opl-sign 在包里且可执行"     0 test -x "$root/bin/opl-sign"
 chk "声明含 cake_lpr 条款" 0 grep -qF "CakeML is free software" "$root/THIRD-PARTY-NOTICES.md"
 
 echo "包内第三方后端（不设 OPL_BINDIR，靠插件根解析）"
@@ -81,6 +82,13 @@ for b in drat-trim lrat-check; do
 done
 
 echo "干净目录里的端到端五步"
+# 签名密钥走临时文件：包里跑也不碰本机的 ~/.config。台账与证据产出都要求签名器，
+# 所以这一步是后面所有用例的前提（它自己也断言了「没有密钥就什么都不写」）。
+export OPL_SIGNING_KEY="$work/signing-key"
+chk "0 生成签名密钥"  0 "$root/bin/opl-sign" init
+chk "0b 没有密钥时不写台账" 4 env OPL_SIGNING_KEY="$work/缺密钥" \
+    "$root/bin/opl-conj" add --id 不应存在 --statement x
+chk "0c 没留下没签名的记录" 1 test -f "$work/lab/conjectures/不应存在.json"
 export OPL_LAB="$work/lab"
 F="$root/tests/fixtures"
 chk "1 登记"          0 "$root/bin/opl-conj" add --id Z-1 --title "PC(2,3)" \
