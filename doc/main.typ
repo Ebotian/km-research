@@ -18,6 +18,8 @@
     各章保留了写下时的计划口径，并在章首或章末标注*同步状态*（截至插件 0.6.0）：
     M0–M4 已交付并有回归覆盖，M5（`opl-stat` + `opl-benchmark`）与 M6（`opl-report`）尚未开始；
     命令 12 个、技能 5 个，与原计划的 13 个 / 7 个差在「多出签名层 `opl-sign`，少了统计与报告」。
+    没有实现的计划项、以及实现与计划不一致的地方，*逐条记在最后一章*——计划文字照原样留着，
+    差异不藏在正文里。
     所有环境相关的结论均来自本机实测，实测状态与降级路径集中在风险章。
   ],
 )
@@ -30,6 +32,7 @@
 #include "plan/06-verification.typ"
 #include "plan/07-roadmap.typ"
 #include "plan/08-risks.typ"
+#include "plan/09-gaps.typ"
 
 = 调研附录
 
