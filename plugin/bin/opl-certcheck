@@ -29,7 +29,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
-from opl_common import PASS, REJECT, UNKNOWN, MISSING, USAGE, c, out_json, s  # noqa: E402
+from opl_common import (PASS, REJECT, UNKNOWN, MISSING, USAGE, c, out_json,  # noqa: E402
+                        refuse_overwrite, s)
 from opl_certcheck import (FAIL_FORMATS, CertError, build_record,  # noqa: E402
                            check_certificate)
 from opl_sign import SignError, discard, sign_file  # noqa: E402
@@ -110,6 +111,11 @@ def main() -> int:
     record = build_record(res=res, formula=formula, cert=cert,
                           subject=args.subject, vrange=args.vrange)
     if args.evidence_out:
+        why_existing = refuse_overwrite(args.evidence_out)
+        if why_existing:
+            c(why_existing)
+            s("USAGE", "输出路径已存在")
+            return USAGE
         out_json(record, args.evidence_out)
         try:
             sig = sign_file(args.evidence_out)

@@ -35,7 +35,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
 from opl_common import (PASS, REJECT, UNKNOWN, MISSING, USAGE,  # noqa: E402
-                        c, out_json, s)
+                        c, out_json, refuse_overwrite, s)
 from opl_lean import (AXIOM_WHITELIST, FAILED, PROVED, SORRY_AX, UNPROVED_AXIOMS,  # noqa: E402
                       LeanError, ToolchainUnpinned, audit, describe)
 from opl_sign import SignError, discard, sign_file  # noqa: E402
@@ -122,6 +122,11 @@ def main() -> int:
         record |= {"verdict": "UNKNOWN", "reason": "timeout",
                    "verification_level": "none"}
         if args.evidence_out:
+            why_existing = refuse_overwrite(args.evidence_out)
+            if why_existing:
+                c(why_existing)
+                s("USAGE", "输出路径已存在")
+                return USAGE
             out_json(record, args.evidence_out)
             try:
                 sig = sign_file(args.evidence_out)
@@ -143,6 +148,11 @@ def main() -> int:
         record["verification_level"] = "none"
 
     if args.evidence_out:
+        why_existing = refuse_overwrite(args.evidence_out)
+        if why_existing:
+            c(why_existing)
+            s("USAGE", "输出路径已存在")
+            return USAGE
         out_json(record, args.evidence_out)
         try:
             sig = sign_file(args.evidence_out)

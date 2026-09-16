@@ -28,8 +28,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
-from opl_common import (PASS, REJECT, UNKNOWN, MISSING, USAGE,  # noqa: E402
-                        MissingBackend, c, ensure_modules, out_json, s)
+from opl_common import (PASS, MISSING, REJECT, UNKNOWN, USAGE,  # noqa: E402
+                        MissingBackend, c, ensure_modules, out_json, refuse_overwrite, s)
 from opl_ledger import sha256_file  # noqa: E402
 from opl_spec import Spec, SpecError, load_witness  # noqa: E402
 import opl_encode  # noqa: E402
@@ -145,6 +145,11 @@ def do_eval_witness(spec: Spec, args) -> int:
             "detail": None if ok else (why or ""),
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
+        why_existing = refuse_overwrite(args.evidence_out)
+        if why_existing:
+            c(why_existing)
+            s("USAGE", "输出路径已存在")
+            return USAGE
         out_json(rec, args.evidence_out)
         try:
             sig = sign_file(args.evidence_out)

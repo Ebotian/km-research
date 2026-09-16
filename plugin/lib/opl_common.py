@@ -59,6 +59,26 @@ def die(code: int, msg: str, **extra) -> Never:
     sys.exit(code)
 
 
+def refuse_overwrite(path: str, *, what: str = "证据") -> str | None:
+    """产出物已存在就返回**拒绝覆盖的理由**；可以写则返回 None。
+
+    为什么证据不许覆盖（第七轮审阅 F1）：产出流程是「先写正式文件、再签名」，而签名
+    失败时会 `discard()` 那份文件——于是**用同一个路径写第二次、而签名器恰好不可用**
+    就会把先前那份**有效**证据连同它的签名一起删掉。实测：第一次 rc=0 有签名，第二次
+    rc=4，原证据与原签名都没了。
+
+    更根本的理由不是那个失败窗口：**台账记录按哈希引用证据**。悄悄把同一路径上的证据
+    换成另一份，那条记录的 `evidence.sha256` 就对不上了，记录会直接变成「核不过」。
+    所以证据是**一次写出的产物**，要重做就显式删掉它——那个 `rm` 就是「我知道旧的那份
+    将被丢弃」的确认动作。
+    """
+    if os.path.exists(path) or os.path.exists(path + ".sig"):
+        return (f"{what}输出路径已存在：{path}（或它的 .sig）。证据是一次写出的产物，"
+                f"覆盖它会让已经引用它的台账记录失效——要重做就先删掉旧的那份，"
+                f"或换一个路径。")
+    return None
+
+
 def out_json(obj, path: str | None = None) -> None:
     text = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
     if path:
