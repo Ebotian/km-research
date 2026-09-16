@@ -578,9 +578,28 @@ def capabilities_snapshot(*, deep: bool = False) -> dict[str, Any]:
 
 
 def metrics_snapshot(spec: RunSpec, res: RunResult) -> dict[str, Any]:
-    """`metrics` 里的每个值都带**来源**——这是「能追到具体产物文件」的可检查形式。"""
-    out_p = os.path.join(spec.runner_dir or spec.workdir, "stdout.txt")
-    err_p = os.path.join(spec.runner_dir or spec.workdir, "stderr.txt")
+    """`metrics` 里的每个值都带**来源**——这是「能追到具体产物文件」的可检查形式。
+
+    == 来源一律写成**相对运行目录**的路径 ==
+
+    原先写的是主机绝对路径，于是**把实验目录搬个地方**（`init_lab` 就是先建在暂存目录、
+    再整体切换）之后，`sources` / `artifacts` 全指向已经不存在的路径，「这个数字哪来的」
+    当场断掉。第六轮审阅正好撞上这一点：重建之后运行的快照**看起来**还在，来源却全是死链。
+
+    路径是给人顺着找文件的，写相对的就是自足的：把整个实验目录搬到任何地方，这份
+    `metrics.json` 依旧指得准。数据库里的 `evaluations.run_dir` 仍存**绝对**路径——那是
+    索引，得能从库里直接导航；搬家时由 `init_lab` 负责把它改到新位置。
+    """
+    base = spec.runner_dir or spec.workdir
+    out_p = os.path.join(base, "stdout.txt")
+    err_p = os.path.join(base, "stderr.txt")
+
+    def rel(p: Any) -> Any:
+        """运行目录里的路径写成相对形式；不是路径的值（说明性文字）原样留下。"""
+        if not isinstance(p, str) or not p:
+            return p
+        return os.path.relpath(p, base)
+
     return {
         "schema": "opl.run.metrics/1",
         "verdict": res.kind,
@@ -593,18 +612,18 @@ def metrics_snapshot(spec: RunSpec, res: RunResult) -> dict[str, Any]:
         "oom_kill": res.cgroup.get("oom_kill"),
         "sources": {
             "wall_ms": "runner 墙钟（time.monotonic）",
-            "stdout_bytes": out_p,
-            "stderr_bytes": err_p,
-            "peak_mem_bytes": (res.cgroup.get("evidence") or {}).get("memory.peak")
+            "stdout_bytes": rel(out_p),
+            "stderr_bytes": rel(err_p),
+            "peak_mem_bytes": rel((res.cgroup.get("evidence") or {}).get("memory.peak"))
                               or "（无 cgroup 证词）",
-            "oom_kill": (res.cgroup.get("evidence") or {}).get("memory.events")
+            "oom_kill": rel((res.cgroup.get("evidence") or {}).get("memory.events"))
                         or "（无 cgroup 证词）",
             "payload_exit_code": "子进程退出码；被信号杀时为 null",
         },
         "artifacts": {
-            "stdout": out_p, "stderr": err_p,
-            "workdir": spec.workdir,
-            "runner_dir": spec.runner_dir or spec.workdir,
+            "stdout": rel(out_p), "stderr": rel(err_p),
+            "workdir": rel(spec.workdir),
+            "runner_dir": rel(base),
         },
     }
 
