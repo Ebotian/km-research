@@ -36,18 +36,29 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
 
-from opl_common import PASS, USAGE, EMPTY, c  # noqa: E402
+from opl_common import PASS, MISSING, USAGE, EMPTY, c  # noqa: E402
 from opl_ledger import (FORMALIZATION, FORMAL_STATUSES, LEVELS, STATUSES,  # noqa: E402
-                        Conjecture, LedgerError, apply_changes, derive_status,
-                        list_records, load, new_record, save)
+                        Conjecture, LedgerError, SignError, adopt_unsupported,
+                        apply_changes, derive_status, list_records, load, new_record,
+                        record_path, record_provenance, save, sha256_file)
 
 JSONL_KEYS = ("id", "title", "status", "formalization_status",
               "falsifiable", "decidable", "verification_level")
 
 
 def emit(rec: Conjecture, args) -> int:
-    """打印记录。`status` 是派生字段，按设计不落盘，只在输出时加上。"""
+    """打印记录。`status` 是派生字段，按设计不落盘，只在输出时加上。
+
+    顺带说清**这份记录可不可信**：签名核不过（或没有签名）时，下面这些字段可能不是
+    工具写出来的，这一句必须出现在输出里，而不是等着读的人自己去查。
+    """
     rec["status"] = derive_status(rec)
+    ok, why = record_provenance(rec["id"], args.lab)
+    if not ok:
+        rec["provenance"] = {"signed": False, "detail": why}
+        print(f"c 注意：{why}", file=sys.stderr)
+        print("c   下面这些字段因此**未经证实**——改状态前先处理签名"
+              "（`opl-sign init` 或 `--adopt --confirmed-by`）", file=sys.stderr)
     print(json.dumps(rec, ensure_ascii=False, indent=2))
     return PASS
 
@@ -77,11 +88,22 @@ def cmd_list(args) -> int:
     if not rows:
         c(f"无匹配记录（扫描 {scanned} 条）")
         return EMPTY
+    unsigned = 0
     for rec in rows:
+        ok, why = record_provenance(rec["id"], args.lab)
         if args.jsonl:
-            print(json.dumps({k: rec.get(k) for k in JSONL_KEYS}, ensure_ascii=False))
+            row = {k: rec.get(k) for k in JSONL_KEYS}
+            row["signed"] = ok
+            print(json.dumps(row, ensure_ascii=False))
         else:
-            print(f"{rec.get('id', '?'):<10} {rec.get('status', '?'):<28} {rec.get('title', '')}")
+            mark = "" if ok else "（未签名/签名核不过）"
+            print(f"{rec.get('id', '?'):<10} {rec.get('status', '?'):<28} "
+                  f"{rec.get('title', '')}{mark}")
+        unsigned += 0 if ok else 1
+    if unsigned:
+        # 一条汇总就够，别把 stderr 刷成没人看的样子；理由在 `opl-conj get` 里有全文。
+        c(f"注意：{unsigned} 条记录的签名核不过——它们的字段未经证实，"
+          f"改状态会被拒（`opl-conj get <id>` 有理由，`--adopt --confirmed-by` 可收编）")
     return PASS
 
 
@@ -90,6 +112,37 @@ def cmd_set(args) -> int:
     if rec is None:
         c(f"无此记录：{args.id}")
         return EMPTY
+    # == 改写之前先问一句：这条记录是谁写的 ==
+    #
+    # 记录由 `save()` 写出时签名，所以「签名核不过」只有三种来路：手写的、被工具之外
+    # 的东西改过、从别处拷来的。任何一种都不该被顺手改成一条**看起来像工具产出**的
+    # 记录——那正好是「把假的东西洗成真的」。要收编就得有人签字，并留下他当时看的是
+    # 哪一份（哈希）。
+    ok, why = record_provenance(args.id, args.lab)
+    if ok and args.adopt:
+        # 签名正常时 `--adopt` 什么都不做——**静默忽略一个用户明确给的开关**，会让他以为
+        # 自己刚收编了点什么。收编只在签名核不过时才有意义。
+        c("--adopt 只在记录签名核不过时才有意义；这条记录的签名是好的，无需收编。")
+        return USAGE
+    if not ok and not args.adopt:
+        c(f"拒绝改写：{why}")
+        c("  本插件的记录由工具写出时签名。核不过说明这份文件不是工具写的，或被改过。")
+        c("  两条出路：① 配好签名器后重跑（`opl-sign init`）；"
+          "② 人工确认内容无误后收编：")
+        c(f"     opl-conj set {args.id} … --adopt --confirmed-by <你>")
+        return USAGE
+    if not ok:
+        # 收编不是「把假的东西洗成真的」：人签字负责**这份内容**，同时把撑不住的声称
+        # 逐级降下来（档位 → 结论 → 复核章）。每一步都进 history，`human_confirmations`
+        # 里留下是谁收编的、以及他当时看的是哪一份（哈希）。
+        rec, adopted = adopt_unsupported(
+            rec, confirmed_by=args.confirmed_by,
+            note=(f"签名核不过（{why}）；收编时这份文件的哈希是 "
+                  f"{sha256_file(record_path(args.id, args.lab))[:16]}…"
+                  + (f"；{args.confirmation_note}" if args.confirmation_note else "")))
+        c(f"收编：{args.confirmed_by} 确认了这份内容（记录里留下人工确认与当时的哈希）")
+        for w in adopted:
+            c(f"降级：{w}")
     rec, warnings = apply_changes(
         rec, evidence=args.evidence, run_id=args.run_id,
         formal_status=args.formal_status, informal_status=args.informal_status,
@@ -149,11 +202,19 @@ def main() -> int:
                         "human_peer_reviewed 时必须给——机器判决不能替代人的复核")
     t.add_argument("--confirmation-note")
     t.add_argument("--run-id")
+    t.add_argument("--adopt", action="store_true",
+                   help="这条记录的签名核不过时，人工确认内容无误后收编它"
+                        "（必须同时给 --confirmed-by；会在记录里留下人工确认"
+                        "与收编时那份文件的哈希）")
     t.set_defaults(func=cmd_set)
 
     args = ap.parse_args()
     try:
         return args.func(args)
+    except SignError as exc:
+        # 没有签名器 ≠ 参数写错了：这是「去配密钥」，与 USAGE 分开。
+        c(str(exc))
+        return MISSING
     except LedgerError as exc:
         c(str(exc))
         return USAGE

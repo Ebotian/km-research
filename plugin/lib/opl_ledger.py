@@ -113,6 +113,15 @@ class LedgerError(Exception):
     """记录或参数不合法。调用方翻成 USAGE（退出码 2）。"""
 
 
+class SignError(RuntimeError):
+    """签名器不可用，或签名/验签失败。调用方翻成 MISSING（退出码 4）。
+
+    单独一个异常类型而不是复用 `LedgerError`：这两件事的出路不同——「记录不自洽」要
+    去修记录，「没有签名器」要去配密钥（或换台机器）。把它们并成一个码，用户会在一件
+    与参数无关的事情上来回改参数。
+    """
+
+
 @dataclass
 class Evidence:
     """一份校验过的证据记录。`sha256` 是**文件本身**的哈希，进 history 供事后比对。"""
@@ -261,8 +270,88 @@ def load_evidence(path: str | None, *, required_level: str | None = None,
             raise LedgerError(
                 f"证据与文件对不上{who}：{f}\n  记录写的是 {h[:16]}…，实际是 {got[:16]}…\n"
                 f"  记录过期或被改过——旧记录不该继续给新文件背书。")
+    # == 最后一道：这份证据是**谁写的** ==
+    #
+    # 前面所有检查加起来证明的是「这份文件自洽」：字段齐全、方向对、哈希与它引用的
+    # 文件对得上。而哈希是**自证**的——写文件的人同时写了被引用的文件，于是手写一份
+    # 自洽的假证据可以全部通过（实测：手写的 `{"kind":"witness_eval","verdict":
+    # "VERIFIED",…}` 曾被台账全盘接受，把猜想定成 refuted / exact_certificate）。
+    # `verdict` 只是文件里的一行字，没有任何东西验过它；签名才是「这句话是谁说的」。
+    #
+    # 放在**最后**而不是最前：结构性问题更常见、更好修，理由也更具体；先把「字段缺了」
+    # 说清楚，比先甩一句「没签名」有用。顺序不影响强度——签名不过照样拒。
+    from opl_sign import verify_file
+
+    ok, why = verify_file(path)
+    if not ok:
+        raise LedgerError(
+            f"这份证据没有可信的签名{who}：{why}\n"
+            f"  证据必须由产出它的命令（opl-certcheck / opl-encode --eval-witness / "
+            f"opl-leancheck）写盘时签出；手写的 JSON 与工具写出的 JSON 在这里必须分得开。\n"
+            f"  本机还没有密钥就跑 `opl-sign init`；证据来自别的机器，就把那边的公钥"
+            f"用 `opl-sign trust` 加进验签清单。")
     return Evidence(path=path, sha256=sha256_file(path), verdict=str(verdict),
                     level=rec.get("verification_level"), kind=kind, record=rec)
+
+
+def adopt_unsupported(rec: Conjecture, *, confirmed_by: str | None,
+                      note: str | None = None) -> tuple[Conjecture, list[str]]:
+    """收编一条**签名核不过**的记录：保住事实，**降掉撑不住的结论**。
+
+    为什么要能收编：记录由 `save()` 写出时签名，所以「签名核不过」只有三种来路——
+    手写的、被工具之外的东西改过、从别处拷来的。没有出路的话，用户会去手改文件，
+    而那正是最该避免的动作；或者他会另建一条记录，于是原来那条的边界、反例、历史
+    全丢。收编给的是第三条路：**人签字负责这份内容，同时把无法支持的声称降下来**。
+
+    降级是级联的，每一步都记进 history，且每一步之后重新校验：
+
+    1. 档位压回 `empirical`；
+    2. 还不行就把结论退回 `open`（结论是「声称一个事实」，撑不住就不能留）；
+    3. 还不行就把**核不过的复核章**降成 `UNVERIFIED`。
+
+    三条走完仍不自洽就如实抛错——那是别的问题，收编不该替它兜底。
+    """
+    import copy
+
+    cand: Conjecture = copy.deepcopy(rec)
+    warnings: list[str] = []
+    conf = require_human(confirmed_by, "adopt-unsigned-record")
+    conf["note"] = note or "签名核不过，人工确认内容后收编"
+    cand.setdefault("human_confirmations", []).append(conf)
+
+    if not validate_record(cand):
+        return cand, warnings
+
+    lvl = cand.get("verification_level")
+    if lvl not in (None, "empirical"):
+        _touch(cand, "verification_level", lvl, "empirical", evidence=None, run_id=None)
+        cand["verification_level"] = "empirical"
+        warnings.append(f"收编时档位从 {lvl!r} 压回 'empirical'——核不过的依据撑不起档位")
+    if not validate_record(cand):
+        return cand, warnings
+
+    st = cand.get("formal_status")
+    if st not in (None, "open"):
+        _touch(cand, "formal_status", st, "open", evidence=None, run_id=None)
+        cand["formal_status"] = "open"
+        warnings.append(f"收编时结论从 {st!r} 退回 'open'——"
+                        f"拿不到可信签名的依据，就不能继续声称这个结论")
+    if not validate_record(cand):
+        return cand, warnings
+
+    stamped = [c for c in cand.get("counterexamples") or []
+               if c.get("verified_by") == "independent"]
+    for c in stamped:
+        c["verified_by"] = "UNVERIFIED"
+        c["verification_level"] = "empirical"
+    if stamped:
+        warnings.append(f"收编时 {len(stamped)} 个复核章降成 UNVERIFIED——"
+                        f"它们引用的证据现在验不过，章就立不住")
+    problems = validate_record(cand)
+    if problems:
+        raise LedgerError("这条记录收编之后仍然不自洽，请先修好它：\n  - "
+                          + "\n  - ".join(problems))
+    return cand, warnings
 
 
 def require_human(confirmed_by: str | None, what: str) -> dict[str, Any]:
@@ -303,7 +392,17 @@ def load(cid: str, lab: str | None = None) -> Conjecture | None:
 
 
 def save(rec: Conjecture, lab: str | None = None) -> str:
-    """原子写入：先写 .tmp 再 replace，避免半个文件留在盘上。"""
+    """原子写入 + **签名**：先写 `.tmp` 再 replace，然后给记录签一份 `<path>.sig`。
+
+    为什么写在库层而不是命令层：签名是「这份记录是工具写的」这个判据的唯一来源，
+    绕过它的入口一个都不该有。签名器不可用就**不写**（抛 `SignError`）——半个承诺比
+    没有承诺更坏：盘上留着一份没签名的记录，读的时候分不出它和手写的 JSON。
+    """
+    from opl_sign import sign_file, signer_state
+
+    state, why = signer_state()
+    if state != "ready":
+        raise SignError(f"没有可用的签名器，拒绝写台账：{why}")
     d = conj_dir(lab)
     os.makedirs(d, exist_ok=True)
     p = record_path(rec["id"], lab)
@@ -312,7 +411,31 @@ def save(rec: Conjecture, lab: str | None = None) -> str:
         json.dump(rec, fh, ensure_ascii=False, indent=2)
         fh.write("\n")
     os.replace(tmp, p)
+    try:
+        sign_file(p)
+    except SignError:
+        # 写成了但没签上：把这份半成品清掉，连同可能遗留的旧签名（否则盘上会留下一份
+        # 「有签名、但签名不是这份内容」的记录，读的人会以为它可信）。
+        for stale in (p, p + ".sig"):
+            if os.path.exists(stale):
+                os.unlink(stale)
+        raise
     return p
+
+
+def record_provenance(cid: str, lab: str | None = None) -> tuple[bool, str]:
+    """这条记录的签名可信吗？返回 (是否可信, 理由)。
+
+    **没有签名也是「不可信」**：本插件的记录由 `save()` 写、写完即签；盘上一条没有
+    签名的记录，只可能是手写的、从别处拷来的、或者被外部程序改过。读的人有权知道
+    自己看的是一份「工具写的」还是「来历不明的」文件。
+    """
+    from opl_sign import verify_file
+
+    p = record_path(cid, lab)
+    if not os.path.isfile(p):
+        return False, f"记录不存在：{p}"
+    return verify_file(p)
 
 
 def list_records(lab: str | None = None, *, status: str | None = None,
