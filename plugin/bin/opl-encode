@@ -11,7 +11,8 @@
     opl-encode --spec S.json --eval-witness W.json        # 不需求解器
 
 退出码：0 成功 / 1 结论矛盾或见证不成立 / 2 规格或参数错、编码代价超限 /
-        3 后端 unknown / 4 缺求解器库。详见 lib/opl_common.py 的契约说明。
+        3 后端 unknown / 4 缺求解器库；或没有签名器（找不到 ssh-keygen 或还没有
+        本机密钥）——不产出无签名的证据。详见 lib/opl_common.py 的契约说明。
 
 `--to cnf` 与 `--eval-witness` 不碰求解器，因此在缺 pysat/ortools 的解释器下
 也能跑——需要求解器的路径才触发解释器解析与重执行。
@@ -33,6 +34,7 @@ from opl_ledger import sha256_file  # noqa: E402
 from opl_spec import Spec, SpecError, load_witness  # noqa: E402
 import opl_encode  # noqa: E402
 from opl_encode import EncodeError, SolverMissing  # noqa: E402
+from opl_sign import SignError, discard, sign_file  # noqa: E402
 
 
 def main() -> int:
@@ -144,6 +146,16 @@ def do_eval_witness(spec: Spec, args) -> int:
             "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
         out_json(rec, args.evidence_out)
+        try:
+            sig = sign_file(args.evidence_out)
+        except SignError as exc:
+            # 不产出无签名的证据：刚写下的那份删掉，然后如实报「没有签名器」。
+            # 没签的东西不许冒充成能验的——与「找不到 bwrap 就不降级到裸跑」同一条纪律。
+            discard(args.evidence_out)
+            c(str(exc))
+            s("MISSING", "signer")
+            return MISSING
+        c(f"已签名：{sig}")
     if ok:
         s("WITNESS_OK", f"{len(assign)} 个变量全部满足 {len(spec.constraints)} 条约束")
         return PASS

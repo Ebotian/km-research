@@ -19,7 +19,8 @@
                          公理（如 native_decide 生成的）、或编译不过，都属此列
     2  USAGE             参数错误、文件不存在、或 toolchain 未定点（拒绝运行）
     3  UNKNOWN           超时：本次没有结论。*不要*据此认为 Lean 不可用
-    4  MISSING           找不到 lake（Lean 工具链未安装）
+    4  MISSING           找不到 lake（Lean 工具链未安装）；或没有签名器
+                         （找不到 ssh-keygen 或还没有本机密钥）——不产出无签名的证据
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ from opl_common import (PASS, REJECT, UNKNOWN, MISSING, USAGE,  # noqa: E402
                         c, out_json, s)
 from opl_lean import (AXIOM_WHITELIST, FAILED, PROVED, SORRY_AX, UNPROVED_AXIOMS,  # noqa: E402
                       LeanError, ToolchainUnpinned, audit, describe)
+from opl_sign import SignError, discard, sign_file  # noqa: E402
 
 VERDICT_LINE = {
     PROVED: "PROVED",
@@ -121,6 +123,15 @@ def main() -> int:
                    "verification_level": "none"}
         if args.evidence_out:
             out_json(record, args.evidence_out)
+            try:
+                sig = sign_file(args.evidence_out)
+            except SignError as exc:
+                # 不产出无签名的证据：刚写下的那份删掉，然后如实报「没有签名器」。
+                discard(args.evidence_out)
+                c(str(exc))
+                s("MISSING", "signer")
+                return MISSING
+            c(f"已签名：{sig}")
         if args.json:
             out_json(record)
         s("UNKNOWN", f"超时（{args.timeout}s）。这是暂不可用，不是 Lean 不可用")
@@ -133,6 +144,15 @@ def main() -> int:
 
     if args.evidence_out:
         out_json(record, args.evidence_out)
+        try:
+            sig = sign_file(args.evidence_out)
+        except SignError as exc:
+            # 不产出无签名的证据：刚写下的那份删掉，然后如实报「没有签名器」。
+            discard(args.evidence_out)
+            c(str(exc))
+            s("MISSING", "signer")
+            return MISSING
+        c(f"已签名：{sig}")
 
     if args.json:
         out_json(record)

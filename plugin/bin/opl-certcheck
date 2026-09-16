@@ -12,7 +12,7 @@
     0 PASS     校验器报告 VERIFIED
     1 REJECT   校验器报告 NOT VERIFIED，且证据表明证书被完整解析
     3 UNKNOWN  无法判定：格式未识别 / 解析不完整 / 超时 / 解压器坏了
-    4 MISSING  所需校验器不存在
+    4 MISSING  所需校验器不存在；或没有签名器——不产出无签名的证据
     2 USAGE    参数错误
 
 本工具最不能犯的错，是把「我读不懂这份证书」报成「这份证书是错的」——那是伪证。
@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from opl_common import PASS, REJECT, UNKNOWN, MISSING, USAGE, c, out_json, s  # noqa: E402
 from opl_certcheck import (FAIL_FORMATS, CertError, build_record,  # noqa: E402
                            check_certificate)
+from opl_sign import SignError, discard, sign_file  # noqa: E402
 
 EXIT_OF = {"VERIFIED": PASS, "NOT VERIFIED": REJECT, "UNKNOWN": UNKNOWN}
 
@@ -110,6 +111,16 @@ def main() -> int:
                           subject=args.subject, vrange=args.vrange)
     if args.evidence_out:
         out_json(record, args.evidence_out)
+        try:
+            sig = sign_file(args.evidence_out)
+        except SignError as exc:
+            # 不产出无签名的证据：刚写下的那份删掉，然后如实报「没有签名器」。
+            # 没签的东西不许冒充成能验的——与「找不到 bwrap 就不降级到裸跑」同一条纪律。
+            discard(args.evidence_out)
+            c(str(exc))
+            s("MISSING", "signer")
+            return MISSING
+        c(f"已签名：{sig}")
 
     verdict = record["verdict"]
     if args.json and not args.quiet:
